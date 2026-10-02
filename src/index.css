@@ -1,0 +1,16 @@
+@import "tailwindcss";
+
+@layer base {
+  html, body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+    letter-spacing: -0.011em;
+  }
+
+  /* Consistent tabular alignment for numbers, values, and codes in tables */
+  table, .tabular-nums, [data-tabular="true"] {
+    font-variant-numeric: tabular-nums;
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Painel Financeiro - FES/SESAP",
+  "description": "Painel para consolidação e análise das três etapas de relatórios (PPs Prontas, Liq. Obedece e Liq. Não Obedece) da FES/SESAP.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
