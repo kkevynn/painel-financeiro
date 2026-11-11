@@ -314,8 +314,8 @@ export function subscribeToAtendimentos(callback: () => void): () => void {
   const handler = (e?: Event) => {
     if (e && 'key' in e) {
       const storageEvent = e as StorageEvent;
-      // Ignore storage events from other unrelated keys (e.g. app state, toast alerts, etc.)
-      if (storageEvent.key && storageEvent.key !== STORAGE_KEY) {
+      // Strictly ignore storage events from other unrelated keys (e.g. app state, toast alerts, etc.)
+      if (storageEvent.key !== STORAGE_KEY) {
         return;
       }
     }

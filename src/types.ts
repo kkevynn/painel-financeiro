@@ -1,4 +1,4 @@
-export type StageKey = 'base_pps' | 'obedece' | 'nao_obedece' | 'outros' | 'pp_prontas';
+export type StageKey = 'base_pps' | 'obedece' | 'nao_obedece' | 'outros' | 'pp_prontas' | 'natureza_despesa' | 'ordem_bancaria' | 'publicacao';
 
 export interface StageInfo {
   id: StageKey;
@@ -13,6 +13,17 @@ export interface StageInfo {
 }
 
 export const STAGES_CONFIG: Record<StageKey, StageInfo> = {
+  ordem_bancaria: {
+    id: 'ordem_bancaria',
+    label: 'Detalhamento de Pagamentos (Listar OB)',
+    shortLabel: 'Pagamentos / OB',
+    badgeBg: 'bg-teal-600',
+    badgeText: 'bg-teal-100 text-teal-900 border-teal-300',
+    border: 'border-teal-300 hover:border-teal-500',
+    text: 'text-teal-950',
+    bgLight: 'bg-teal-50/70',
+    description: '',
+  },
   base_pps: {
     id: 'base_pps',
     label: 'Arquivo Base de PPs (Relatório SIGEF)',
@@ -22,7 +33,7 @@ export const STAGES_CONFIG: Record<StageKey, StageInfo> = {
     border: 'border-emerald-300 hover:border-emerald-500',
     text: 'text-emerald-950',
     bgLight: 'bg-emerald-50/70',
-    description: 'Arquivo base contendo todas as informações das PPs (ex: Relatorio_*.xls do SIGEF).',
+    description: '',
   },
   pp_prontas: {
     id: 'pp_prontas',
@@ -33,7 +44,7 @@ export const STAGES_CONFIG: Record<StageKey, StageInfo> = {
     border: 'border-emerald-300 hover:border-emerald-500',
     text: 'text-emerald-950',
     bgLight: 'bg-emerald-50/70',
-    description: 'Arquivo base contendo todas as informações das PPs (ex: Relatorio_*.xls do SIGEF).',
+    description: '',
   },
   obedece: {
     id: 'obedece',
@@ -44,7 +55,7 @@ export const STAGES_CONFIG: Record<StageKey, StageInfo> = {
     border: 'border-blue-300 hover:border-blue-500',
     text: 'text-blue-950',
     bgLight: 'bg-blue-50/70',
-    description: 'Upload de liquidações que obedecem à ordem cronológica',
+    description: '',
   },
   nao_obedece: {
     id: 'nao_obedece',
@@ -55,7 +66,29 @@ export const STAGES_CONFIG: Record<StageKey, StageInfo> = {
     border: 'border-amber-300 hover:border-amber-500',
     text: 'text-amber-950',
     bgLight: 'bg-amber-50/70',
-    description: 'Upload de liquidações com exceção à ordem cronológica',
+    description: '',
+  },
+  natureza_despesa: {
+    id: 'natureza_despesa',
+    label: 'Natureza da Despesa (Empenhos)',
+    shortLabel: 'Natureza Despesa',
+    badgeBg: 'bg-violet-500',
+    badgeText: 'bg-violet-100 text-violet-900 border-violet-300',
+    border: 'border-violet-300 hover:border-violet-500',
+    text: 'text-violet-950',
+    bgLight: 'bg-violet-50/70',
+    description: '',
+  },
+  publicacao: {
+    id: 'publicacao',
+    label: 'NLs para Publicação (Controle DOE / Publicação)',
+    shortLabel: 'Para Publicação',
+    badgeBg: 'bg-indigo-600',
+    badgeText: 'bg-indigo-100 text-indigo-900 border-indigo-300',
+    border: 'border-indigo-300 hover:border-indigo-500',
+    text: 'text-indigo-950',
+    bgLight: 'bg-indigo-50/70',
+    description: 'NLs enviadas para publicação com verificação de saída de Obedece e equivalência com PP/OB',
   },
   outros: {
     id: 'outros',
@@ -66,9 +99,36 @@ export const STAGES_CONFIG: Record<StageKey, StageInfo> = {
     border: 'border-slate-300 hover:border-slate-500',
     text: 'text-slate-950',
     bgLight: 'bg-slate-50/70',
-    description: 'Planilhas financeiras de credores gerais',
+    description: '',
   },
 };
+
+export type PublicacaoStatus = 'concluido' | 'pendente';
+
+export interface PublicacaoItem {
+  id: string;
+  nlNumero: string;
+  fornecedor: string;
+  cnpj: string;
+  valorNL: number;
+  valorPublicacao?: number;
+  fonteRecurso?: string;
+  observacao?: string;
+  processo?: string;
+  dataNL?: string;
+  diaPublicacao?: string;
+  status: PublicacaoStatus;
+  statusDetalhe: string;
+  sumiuObedece: boolean;
+  pendenteEmObedece?: boolean;
+  equivalentePP?: string;
+  equivalenteOB?: string;
+  valorEquivalente?: number;
+  situacaoEquivalente?: string;
+  diferencaValor?: number;
+  percentualRetencao?: number;
+  fileName?: string;
+}
 
 export interface FileData {
   id: string;
@@ -79,6 +139,7 @@ export interface FileData {
   detectedValorCol: string;
   detectedCnpjCol?: string;
   detectedSituacaoCol?: string;
+  detectedSituacaoObCol?: string;
   detectedPpCol?: string;
   detectedObCol?: string;
   detectedNumeroCol?: string;
@@ -86,6 +147,8 @@ export interface FileData {
   detectedFavorecidoNECol?: string;
   detectedProcessoCol?: string;
   detectedFonteCol?: string;
+  detectedNaturezaCol?: string;
+  detectedDataCol?: string;
   stage?: StageKey;
   totalCount?: number;
 }
@@ -96,12 +159,15 @@ export interface ColumnMappingConfig {
   stage?: StageKey;
   cnpjCol?: string;
   situacaoCol?: string;
+  situacaoObCol?: string;
   numeroCol?: string;
   obCol?: string;
   notaEmpenhoCol?: string;
   favorecidoNECol?: string;
   processoCol?: string;
   fonteCol?: string;
+  naturezaCol?: string;
+  dataCol?: string;
 }
 
 export interface ConsolidatedSupplier {
@@ -126,6 +192,7 @@ export interface ConsolidatedSupplier {
   notasEmpenho?: string[];
   favorecidoNE?: string;
   hasFullSigefFields?: boolean;
+  naturezasDespesa?: string[];
 }
 
 export interface CategoryDefinition {
@@ -283,7 +350,7 @@ export interface QuebraOrdemResult {
 // ----------------------------------------------------
 // Toast Alert Notification System
 // ----------------------------------------------------
-export type ToastAlertType = 'sucesso' | 'critico' | 'info';
+export type ToastAlertType = 'sucesso' | 'critico' | 'info' | 'aviso';
 
 export interface ToastAlert {
   id: string;
@@ -295,15 +362,22 @@ export interface ToastAlert {
   pp?: string;
   ob?: string;
   ne?: string;
+  nl?: string;
+  valorNL?: number;
   fileName?: string;
   valor?: number;
   situacaoAnterior?: string;
   situacaoNova?: string;
+  fonteRecurso?: string;
+  isFonte600?: boolean;
+  etapaOrigem?: string;
   observacao?: string;
   dataHora: Date;
   dataReferencia?: string;
   read?: boolean;
   resolvido?: boolean;
+  requerValidacao?: boolean;
+  inferenceMatchId?: string;
 }
 
 // ----------------------------------------------------
@@ -328,6 +402,8 @@ export interface InferredPaymentMatch {
   motivo: string;
   baseOrigem: 'obedece' | 'nao_obedece' | 'pp_prontas';
   automaticamenteConfirmado?: boolean;
+  isFonte600?: boolean;
+  fonteRecurso?: string;
 }
 
 export interface LearnedCreditorPattern {
@@ -343,7 +419,7 @@ export interface LearnedCreditorPattern {
 
 export interface AuditRowItem {
   id: string;
-  sourceType: 'base_pps' | 'pp_prontas' | 'obedece' | 'nao_obedece' | 'outros' | 'status_banco' | 'pagamentos_emitidos';
+  sourceType: StageKey | 'status_banco' | 'pagamentos_emitidos';
   sourceLabel: string;
   sourceFileName: string;
   documentNumber: string;
@@ -375,6 +451,9 @@ export interface CompanyAuditSummary {
   liqNaoObedeceCount: number;
   bancoRecordsCount: number;
   bancoConfirmedCount: number;
+  bancoConfirmedValue?: number;
+  bancoPendingAOCount?: number;
+  bancoPendingAOValue?: number;
   quebraOrdemCount: number;
   quebraOrdemValue: number;
   allRows: AuditRowItem[];

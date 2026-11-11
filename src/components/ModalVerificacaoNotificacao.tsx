@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import { ToastAlert, FileData } from '../types';
 import { formatBRL } from '../utils/excelParser';
+import { toastAlertService } from '../utils/toastAlertService';
 
 interface ModalVerificacaoNotificacaoProps {
   toast: ToastAlert | null;
@@ -88,13 +89,23 @@ export const ModalVerificacaoNotificacao: React.FC<ModalVerificacaoNotificacaoPr
     }
   };
 
+  // Lock background scroll when open
+  useEffect(() => {
+    if (!isOpen) return;
+    const orig = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = orig;
+    };
+  }, [isOpen]);
+
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-xs animate-in fade-in duration-150"
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-xs overscroll-contain animate-in fade-in duration-150"
       onClick={onClose}
     >
       <div
-        className="bg-white rounded-2xl shadow-xl border border-slate-200 w-full max-w-lg overflow-hidden animate-in zoom-in-95 duration-150"
+        className="bg-white rounded-2xl shadow-xl border border-slate-200 w-full max-w-lg overflow-hidden overscroll-contain animate-in zoom-in-95 duration-150"
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"
@@ -133,6 +144,75 @@ export const ModalVerificacaoNotificacao: React.FC<ModalVerificacaoNotificacaoPr
         {/* Body */}
         <div className="p-5 space-y-4 text-slate-800 text-xs">
           
+          {/* Caixa Especial: Auditoria IA - Confirmação da Transição NL -> PP/OB */}
+          {(toast.requerValidacao || toast.nl || toast.isFonte600) && (
+            <div className="bg-gradient-to-br from-indigo-50 to-amber-50/60 rounded-xl p-4 border border-indigo-200/90 space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-extrabold text-indigo-950 flex items-center gap-1.5 text-xs">
+                  <span>🤖</span>
+                  <span>Auditoria com Inteligência Artificial</span>
+                </span>
+                {toast.isFonte600 && (
+                  <span className="text-[10px] font-black uppercase px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-950 border border-emerald-300">
+                    Fonte 600 ({toast.fonteRecurso || '0.6.00'})
+                  </span>
+                )}
+              </div>
+
+              <div className="text-[11px] text-slate-700 leading-relaxed">
+                A IA identificou a transição da <strong className="text-slate-900 font-mono">NL {toast.nl || 'S/N'}</strong> (Fase: {toast.etapaOrigem === 'obedece' ? 'Obedece' : toast.etapaOrigem === 'nao_obedece' ? 'Não Obedece' : 'Liquidação'}) para <strong className="text-slate-900 font-mono">PP {toast.pp || 'S/N'}{toast.ob ? ` / OB ${toast.ob}` : ''}</strong>.
+              </div>
+
+              <div className="bg-white/80 rounded-lg p-2.5 border border-indigo-100 text-xs space-y-1">
+                <div className="flex justify-between items-center text-slate-600">
+                  <span>Valor na Liquidação (NL):</span>
+                  <span className="font-mono font-bold text-slate-800">
+                    {toast.valorNL !== undefined ? formatBRL(toast.valorNL) : toast.valor !== undefined ? formatBRL(toast.valor) : '-'}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center text-slate-600">
+                  <span>Valor a Pagar / Pago (PP/OB):</span>
+                  <span className="font-mono font-bold text-emerald-700">
+                    {toast.valor !== undefined ? formatBRL(toast.valor) : '-'}
+                  </span>
+                </div>
+              </div>
+
+              <div className="pt-1 flex flex-col sm:flex-row items-center justify-between gap-2">
+                <span className="text-[11px] font-bold text-indigo-950">
+                  Esta conversão está correta?
+                </span>
+                <div className="flex items-center gap-2 w-full sm:w-auto">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      toastAlertService.confirmTransition(toast.id);
+                      setIsSaved(true);
+                      setTimeout(() => {
+                        setIsSaved(false);
+                        onClose();
+                      }, 500);
+                    }}
+                    className="flex-1 sm:flex-none px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-bold transition cursor-pointer shadow-xs active:scale-95 flex items-center justify-center gap-1"
+                  >
+                    <Check className="w-3.5 h-3.5" />
+                    <span>Sim, está correto</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      toastAlertService.rejectTransition(toast.id);
+                      onClose();
+                    }}
+                    className="flex-1 sm:flex-none px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-300 rounded-lg text-xs font-bold transition cursor-pointer active:scale-95"
+                  >
+                    <span>Não, rejeitar</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Informações Principais */}
           <div className="bg-slate-50 rounded-xl p-3.5 border border-slate-200/80 space-y-2.5">
             <div className="flex items-start justify-between gap-2">

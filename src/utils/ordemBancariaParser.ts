@@ -1,4 +1,88 @@
-import { parseCurrencyValue, parseFavorecidoField, isSituacaoConclusivaPagamento, readSpreadsheetAsMatrix } from './excelParser';
+import { parseCurrencyValue, parseFavorecidoField, isSituacaoConclusivaPagamento, readSpreadsheetAsMatrix, isTotalizadorRow, isFonteHeader, isFonteString } from './excelParser';
+import { FileData } from '../types';
+
+/**
+ * Checks if a filename indicates an Ordem Bancária (OB) spreadsheet
+ */
+export function isObFileName(fileName: string): boolean {
+  if (!fileName) return false;
+  const norm = fileName
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, ' ')
+    .trim();
+
+  return (
+    norm.includes('ordem bancaria') ||
+    norm.includes('ordens bancarias') ||
+    norm.includes('listar ordem') ||
+    norm.includes('listar ob') ||
+    norm.includes('relacao de ob') ||
+    norm.includes('relatorio ob') ||
+    norm.includes('relatorio de ob') ||
+    norm.includes('planilha ob') ||
+    norm.includes('planilha de ob') ||
+    ((norm.includes('obs') || norm.includes('ob')) && norm.includes('principal')) ||
+    /\bobs?\b/.test(norm)
+  );
+}
+
+/**
+ * Detects if a Fonte de Recursos is F600 or any of its derivatives
+ * (e.g. 0.6.00.000600, 0.6.00, 0.6.02..., 0.6.20..., 0.6.xx, 600, F600, etc.)
+ */
+export function isFonte600OuDerivada(fonteRaw: any): boolean {
+  if (fonteRaw === null || fonteRaw === undefined) return false;
+  const str = String(fonteRaw)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toUpperCase();
+  if (!str || str === '-' || str === '0') return false;
+
+  // Direct check
+  if (str.includes('F600') || str.includes('F.600') || str.includes('FONTE 600') || str.includes('FONTE600') || str.includes('FONTE_600')) {
+    return true;
+  }
+
+  // Dot format: 0.6.00, 0.6.02, 0.6.20, etc.
+  if (str.includes('0.6.') || str.includes('0. 6.') || str.includes('.600') || str.includes('0.600')) {
+    return true;
+  }
+
+  // Exact 600 or starting with 600
+  if (str === '600' || str.startsWith('600 ') || str.startsWith('600-') || str.startsWith('600.')) {
+    return true;
+  }
+
+  // Numbers only analysis: 0600, 600, 000600...
+  const digits = str.replace(/\D/g, '');
+  if (digits === '600' || digits === '0600' || digits.startsWith('0600') || digits.startsWith('06') || digits.endsWith('000600') || digits.endsWith('600')) {
+    if (digits.length <= 12) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Searches a row for any cell that looks like a Fonte de Recurso
+ */
+export function findFonteRecursoInRow(row: any[]): string {
+  if (!Array.isArray(row)) return '';
+  for (const cell of row) {
+    if (cell === null || cell === undefined) continue;
+    const s = String(cell).trim().toUpperCase();
+    if (!s || s === '-' || s === '0') continue;
+    if (isFonte600OuDerivada(s)) return s;
+    if (/\d\s*\.\s*\d\s*\.\s*\d{2}\s*\.\s*\d{6}/.test(s)) return s;
+    if (/^[012]\s*\.\s*[567]\b/.test(s)) return s;
+    if (/^FONTE\s+\d+/i.test(s) || /^F\d+/i.test(s)) return s;
+  }
+  return '';
+}
 
 export interface OrdemBancariaItem {
   id: string;
@@ -63,12 +147,15 @@ export function parseDateToMonthInfo(rawDate: any): {
 
   const str = String(rawDate).trim();
 
-  // Pattern DD/MM/YYYY or DD-MM-YYYY
-  const brMatch = str.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+  // Pattern DD/MM/YYYY or DD-MM-YYYY or DD/MM/YY
+  const brMatch = str.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
   if (brMatch) {
     const day = parseInt(brMatch[1], 10);
     const month = parseInt(brMatch[2], 10);
-    const year = parseInt(brMatch[3], 10);
+    let year = parseInt(brMatch[3], 10);
+    if (year < 100) {
+      year = year >= 50 ? 1900 + year : 2000 + year;
+    }
     if (month >= 1 && month <= 12 && year >= 2000 && year <= 2100) {
       const monthStr = String(month).padStart(2, '0');
       const dayStr = String(day).padStart(2, '0');
@@ -98,238 +185,668 @@ export function parseDateToMonthInfo(rawDate: any): {
 
 /**
  * Checks if a string looks like an Ordem Bancária (OB) number,
- * e.g., 2026OB001251, 2025OB..., OB123456, etc.
+ * e.g., 2026OB001251, 2025OB..., OB123456, 2026-OB-001251, etc.
  */
-function isObNumber(val: any): boolean {
+export function isObNumber(val: any): boolean {
   if (!val) return false;
   const str = String(val).trim().toUpperCase();
-  return /\b\d{4}OB\d+\b/i.test(str) || /\bOB\d{4,}\b/i.test(str);
+  const clean = str.replace(/[\s\.\-\/]/g, '');
+  return (
+    /\b\d{4}OB\d+\b/i.test(clean) ||
+    /\bOB\d{3,}\b/i.test(clean) ||
+    /^\d{4}[A-Z]{2}\d{3,}$/.test(clean) ||
+    /^OB[\s\-_]?\d+/i.test(str)
+  );
 }
 
 /**
- * Parses the "Listar Ordem Bancária" SIGEF report where each record spans two consecutive rows:
- *
- * Linha 1: Coluna A (Número = OB, ex: 2026OB001251), Coluna B (Data Referência, ex: 21/01/2026),
- *          Coluna G (Valor, ex: 1620.37), Coluna H (Situação, ex: CB).
- * Linha 2 (logo abaixo): Coluna B (Preparação Pagamento = PP), Coluna C (Fonte Recurso, ex: 0.6.00.000600),
- *          Coluna D (Favorecido, ex: 30.386.911/0001-60 NOME DA EMPRESA).
- *
- * Filters to keep only conclusive situations (e.g. CB, PPCB, CONFIRMADA BANCO, etc.)
+ * Checks if a situation string is explicitly rejected or cancelled.
+ * All other non-rejected statuses in an OB spreadsheet represent valid payments.
  */
-export function parseListarOrdemBancariaMatrix(matrix: any[][]): OrdemBancariaItem[] {
-  if (!matrix || matrix.length < 2) return [];
+function isRejectedOb(sitRaw: any): boolean {
+  const str = String(sitRaw ?? '').trim().toUpperCase();
+  if (!str) return false;
+  return (
+    str.startsWith('RJ') ||
+    str.startsWith('PPRJ') ||
+    str.includes('CANCEL') ||
+    str.includes('REJEIT') ||
+    str.includes('ESTORN') ||
+    str.includes('DEVOLV') ||
+    str === 'CBNC'
+  );
+}
 
+/**
+ * Extracts OrdemBancariaItem[] directly from an uploaded FileData.
+ */
+export function extractOrdensBancariasFromFileData(file: FileData): OrdemBancariaItem[] {
+  if (!file || !file.rows || file.rows.length === 0) return [];
   const items: OrdemBancariaItem[] = [];
 
-  // Determine if there is a header or if rows start directly.
-  // We scan line by line looking for Linha 1 indicators (an OB pattern in Col A or Col 0).
-  for (let r = 0; r < matrix.length - 1; r++) {
-    const row1 = matrix[r];
-    const row2 = matrix[r + 1];
+  const headers = Object.keys(file.rows[0] || {});
+  const obCol =
+    file.detectedObCol ||
+    headers.find((k) => {
+      const lk = k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+      return lk.includes('ordem') || lk.includes('ob') || lk.includes('documento');
+    });
 
-    if (!Array.isArray(row1) || !Array.isArray(row2)) continue;
+  const fonteCol =
+    file.detectedFonteCol ||
+    headers.find((k) => isFonteHeader(k) || k.toLowerCase().includes('fonte'));
 
-    // Check Col A (index 0) or nearby column for OB code (e.g. 2026OB001251)
-    let obVal = String(row1[0] ?? '').trim();
-    let colOffset = 0;
+  const valCol =
+    (file.detectedValorCol && !isFonteHeader(file.detectedValorCol) && file.detectedValorCol !== fonteCol ? file.detectedValorCol : null) ||
+    headers.find((k) => {
+      if (isFonteHeader(k) || k === fonteCol) return false;
+      const lk = k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+      return lk.includes('valor') || lk.includes('pago') || lk.includes('vlr');
+    });
 
-    // Sometimes there might be a leading empty column
-    if (!isObNumber(obVal) && row1.length > 1 && isObNumber(row1[1])) {
-      obVal = String(row1[1]).trim();
-      colOffset = 1;
-    }
+  const favCol =
+    file.detectedFavorecidoCol ||
+    headers.find((k) => {
+      const lk = k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+      return lk.includes('favorecido') || lk.includes('credor') || lk.includes('fornecedor');
+    });
+  const cnpjCol =
+    file.detectedCnpjCol ||
+    headers.find((k) => {
+      const lk = k.toLowerCase();
+      return lk.includes('cnpj') || lk.includes('cpf');
+    });
+  const sitCol =
+    file.detectedSituacaoCol ||
+    headers.find((k) => {
+      const lk = k.toLowerCase();
+      return lk.includes('situacao') || lk.includes('status');
+    });
+  const ppCol =
+    file.detectedPpCol ||
+    file.detectedNumeroCol ||
+    headers.find((k) => {
+      const lk = k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+      return lk === 'pp' || lk.includes('proposta') || lk.includes('preparacao') || lk.includes('num pp') || lk.includes('no pp') || lk.includes('num. pp');
+    });
 
-    if (!isObNumber(obVal)) {
+  // Prioritize Payment/OB/Confirmation date column over Emission/Proposal date column
+  const paymentDateKeywords = [
+    'data pagamento', 'dt pagamento', 'data do pagamento', 'data pgto', 'dt pgto',
+    'data ob', 'data da ob', 'dt ob', 'data confirmacao', 'data confirmacao banco',
+    'data situacao', 'data da situacao', 'dt situacao', 'data movimento', 'data baixa', 'data efetivacao'
+  ];
+
+  const paymentDateCol = headers.find((k) => {
+    const lk = k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+    return paymentDateKeywords.some((kw) => lk.includes(kw));
+  });
+
+  const generalDateCol =
+    paymentDateCol ||
+    file.detectedDataCol ||
+    headers.find((k) => {
+      const lk = k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+      return lk.includes('data') || lk.includes('dt');
+    });
+
+  for (let idx = 0; idx < file.rows.length; idx++) {
+    const row = file.rows[idx];
+    const rawOb = obCol ? String(row[obCol] || '').trim() : '';
+
+    if (isTotalizadorRow(row, favCol ? row[favCol] : undefined, rawOb)) {
       continue;
     }
 
-    // Linha 1:
-    // Col A (0): OB
-    // Col B (1): Data Referência
-    // Col G (6): Valor
-    // Col H (7): Situação
-    const dataRefRaw = row1[colOffset + 1] ?? '';
+    const cleanOb = rawOb.toUpperCase().replace(/[\s\.\-\/]/g, '');
+    if (!cleanOb || cleanOb === '-' || cleanOb === '0') continue;
 
-    // Valor in Col G (index 6 + offset), with fallback scanning in row1 if shifted
-    let valorRaw = row1[colOffset + 6];
-    let sitRaw = row1[colOffset + 7];
-
-    // If Col G doesn't have a parseable value, look across row1 cells for currency value
-    if (parseCurrencyValue(valorRaw) === 0) {
-      for (let c = colOffset + 2; c < row1.length; c++) {
-        const testVal = parseCurrencyValue(row1[c]);
-        if (testVal > 0) {
-          valorRaw = row1[c];
-          // next column is likely situation
-          if (row1[c + 1] !== undefined) {
-            sitRaw = row1[c + 1];
+    let rawVal = valCol ? row[valCol] : 0;
+    if (
+      isFonteString(rawVal) ||
+      (fonteCol && rawVal === row[fonteCol]) ||
+      (typeof rawVal === 'number' && (rawVal === 600 || rawVal === 500 || rawVal === 1500 || rawVal === 1600 || rawVal === 0.6 || rawVal === 0.5))
+    ) {
+      rawVal = 0;
+    }
+    if (typeof rawVal === 'string' && (/\b\d{3}\s+\d{4,5}[-\s]|\b\d{3}\s+\d{5}/.test(rawVal) || /^\d{4,}[-\s]\w$/.test(rawVal))) {
+      rawVal = 0;
+    }
+    let valor = typeof rawVal === 'number' ? rawVal : parseCurrencyValue(rawVal);
+    if (valor >= 1e11 || isFonteString(valor) || valor === 600 || valor === 500 || valor === 1500 || valor === 1600 || valor === 0.6 || valor === 0.5) {
+      // Re-scan other columns to find true monetary value if rawVal was a fonte code or empty
+      let realVal = 0;
+      for (const [k, v] of Object.entries(row)) {
+        if (!v || isFonteHeader(k) || k === fonteCol || k === valCol || isFonteString(v)) continue;
+        const lk = k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+        if (lk.includes('valor') || lk.includes('pago') || lk.includes('liquid') || lk.includes('total')) {
+          const pv = parseCurrencyValue(v);
+          if (pv > 0 && pv < 1e11 && !isFonteString(v) && pv !== 600 && pv !== 500 && pv !== 1500 && pv !== 1600 && pv !== 0.6 && pv !== 0.5) {
+            realVal = pv;
+            break;
           }
-          break;
+        }
+      }
+      valor = realVal;
+    }
+
+    const rawSit = sitCol ? String(row[sitCol] || '').trim().toUpperCase() : 'CB';
+
+    // Prioritize payment date column, then general date column, then find the most recent valid date in row
+    let rawData = paymentDateCol ? row[paymentDateCol] : (generalDateCol ? row[generalDateCol] : '');
+    let dateInfo = parseDateToMonthInfo(rawData);
+
+    for (const [k, v] of Object.entries(row)) {
+      if (!v) continue;
+      const lk = k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+      if (lk.includes('data') || lk.includes('dt') || lk.includes('emiss') || lk.includes('pagamento') || lk.includes('ob')) {
+        const cand = parseDateToMonthInfo(v);
+        if (cand.dateIso) {
+          if (!dateInfo.dateIso || cand.dateIso > dateInfo.dateIso) {
+            dateInfo = cand;
+            rawData = v;
+          }
         }
       }
     }
 
-    const valor = parseCurrencyValue(valorRaw);
-    const situacao = String(sitRaw ?? '').trim().toUpperCase();
+    let rawFonte = fonteCol ? String(row[fonteCol] || '').trim() : '';
+    let rawFav = favCol ? String(row[favCol] || '').trim() : '';
+    let finalCnpj = cnpjCol ? String(row[cnpjCol] || '').trim() : '';
+    let ppVal = ppCol ? String(row[ppCol] || '').trim() : '';
 
-    // Verify conclusive payment situation (e.g. CB, PPCB, etc.)
-    const isConclusivo = isSituacaoConclusivaPagamento(situacao) || situacao === 'CB';
-    if (!isConclusivo) {
-      // Per user prompt: "Considere como pagamento apenas as Situações conclusivas (ex: CB)."
-      // Skip this record if not conclusive
-      continue;
-    }
-
-    // Linha 2 (logo abaixo):
-    // Col B (1): Preparação Pagamento = PP
-    // Col C (2): Fonte Recurso
-    // Col D (3): Favorecido
-    let ppRaw = String(row2[colOffset + 1] ?? '').trim();
-    let fonteRaw = String(row2[colOffset + 2] ?? '').trim();
-    let favorecidoRaw = String(row2[colOffset + 3] ?? '').trim();
-
-    // Fallback if columns in row2 are slightly shifted:
-    // If favorecidoRaw doesn't contain letters/numbers, search row2 for the creditor field
-    if (!favorecidoRaw || favorecidoRaw.length < 3) {
-      for (let c = colOffset + 1; c < row2.length; c++) {
-        const cellStr = String(row2[c] ?? '').trim();
-        // Favorecido usually contains a CNPJ/CPF pattern or is a company name
-        if (/\d{2}\.?\d{3}\.?\d{3}\/?\d{4}-?\d{2}|\b\d{14}\b/.test(cellStr) || cellStr.length > 15) {
-          favorecidoRaw = cellStr;
-          break;
+    // Only if 2-row block structure and current row lacks Favorecido or Fonte, check next row
+    const isSingleRowComplete = (rawFav && rawFav.length >= 3) && (rawFonte && rawFonte !== '-' && rawFonte !== '0');
+    if (!isSingleRowComplete) {
+      const nextRow = idx + 1 < file.rows.length ? file.rows[idx + 1] : null;
+      const nextRowHasOb = nextRow && obCol && isObNumber(nextRow[obCol]);
+      if (!nextRowHasOb && nextRow) {
+        if (!rawFonte || rawFonte === '-' || rawFonte === '0' || rawFonte === 'OUTRAS') {
+          const nFonte = fonteCol ? String(nextRow[fonteCol] || '').trim() : '';
+          if (nFonte && nFonte !== '-' && nFonte !== '0') {
+            rawFonte = nFonte;
+          }
         }
+        if (!rawFav || rawFav.length < 3) {
+          const nFav = favCol ? String(nextRow[favCol] || '').trim() : '';
+          if (nFav && nFav.length >= 3) {
+            rawFav = nFav;
+          }
+        }
+        if (!ppVal && ppCol && nextRow[ppCol]) {
+          ppVal = String(nextRow[ppCol]).trim();
+        }
+        idx++; // Consume row 2 of the block
       }
     }
 
-    // Extract CNPJ and clean company name from Favorecido
-    const { cnpj, name } = parseFavorecidoField(favorecidoRaw);
-    const dateInfo = parseDateToMonthInfo(dataRefRaw);
+    const { cnpj: parsedCnpj, name: parsedName } = parseFavorecidoField(rawFav);
+    finalCnpj = finalCnpj || parsedCnpj || 'N/I';
+    const finalName = parsedName || rawFav || 'NÃO INFORMADO';
 
     items.push({
-      id: `ob_${obVal}_${r}`,
-      ob: obVal,
-      dataReferencia: String(dataRefRaw).trim(),
+      id: `${file.id}_ob_${idx}_${cleanOb}`,
+      ob: cleanOb,
+      dataReferencia: dateInfo.dateIso || String(rawData || '').trim(),
       dataIso: dateInfo.dateIso,
       mesAnoKey: dateInfo.mesAnoKey,
       mesAnoLabel: dateInfo.mesAnoLabel,
       valor,
-      situacao,
-      pp: ppRaw,
-      fonteRecurso: fonteRaw || 'OUTRAS',
-      favorecidoRaw,
-      favorecidoCnpj: cnpj,
-      favorecidoName: name || favorecidoRaw || 'NÃO INFORMADO',
-      linhaOrigem: r + 1,
+      situacao: rawSit || 'CB',
+      pp: ppVal,
+      fonteRecurso: (rawFonte || 'OUTRAS').trim(),
+      favorecidoRaw: rawFav,
+      favorecidoCnpj: finalCnpj,
+      favorecidoName: finalName,
+      linhaOrigem: idx + 1,
     });
-
-    // Advance loop index if row2 was consumed
-    r++;
   }
 
   return items;
 }
 
 /**
- * Asynchronous chunked parser for large spreadsheets.
- * Yields periodically to the event loop using setTimeout/requestAnimationFrame
- * so the browser UI never freezes or shows "Página Não Responde".
+ * Universal parser for "Listar Ordem Bancária" using strict Regex text patterns and 2-row blocks.
+ * Implements exact line 1 (OB, Data, Situação, Valor) and line 2 (PP, Fonte, Favorecido) reading.
+ */
+export function parseListarOrdemBancariaMatrix(matrix: any[][]): OrdemBancariaItem[] {
+  if (!matrix || matrix.length < 1) return [];
+
+  const items: OrdemBancariaItem[] = [];
+
+  for (let i = 0; i < matrix.length; i++) {
+    const row1 = matrix[i];
+    if (!Array.isArray(row1)) continue;
+
+    // Verifique se row1 contém uma string que case com o Regex de OB (/\b\d{4}OB\d+\b/i). Se NÃO contiver, faça continue (pule a linha).
+    let ob = '';
+    for (let c = 0; c < row1.length; c++) {
+      const cell = row1[c];
+      if (cell !== null && cell !== undefined) {
+        const s = String(cell).trim();
+        const m = s.match(/\b\d{4}OB\d+\b/i);
+        if (m) {
+          ob = m[0].toUpperCase();
+          break;
+        }
+      }
+    }
+    if (!ob) continue;
+
+    // Se achou a OB, sabemos que estamos na "Linha 1". Extraia da row1:
+    // OB: A string que deu match no regex \d{4}OB\d+. (já em `ob`)
+
+    // Data: A string que der match no regex \d{2}\/\d{2}\/\d{4}.
+    let dataReferencia = '';
+    for (let c = 0; c < row1.length; c++) {
+      const cell = row1[c];
+      if (cell !== null && cell !== undefined) {
+        const s = String(cell).trim();
+        const m = s.match(/\b\d{2}\/\d{2}\/\d{4}\b/);
+        if (m) {
+          dataReferencia = m[0];
+          break;
+        }
+      }
+    }
+    const dateInfo = parseDateToMonthInfo(dataReferencia);
+
+    // Situação: A string que der match em \b(CB|RJ|PPCB|PPRJ|AO|C|PAGA)\b. Se não achar, assuma 'CB'.
+    let situacao = 'CB';
+    for (let c = 0; c < row1.length; c++) {
+      const cell = row1[c];
+      if (cell !== null && cell !== undefined) {
+        const s = String(cell).trim().toUpperCase();
+        const m = s.match(/\b(CB|RJ|PPCB|PPNC|PPRJ|AO|C|PAGA|LIQUIDADA)\b/);
+        if (m) {
+          situacao = m[1];
+          break;
+        }
+      }
+    }
+
+    // Valor: Filtre a row1 buscando o maior valor numérico válido com parseCurrencyValue().
+    let valor = 0;
+    for (let c = 0; c < row1.length; c++) {
+      const cell = row1[c];
+      if (cell === null || cell === undefined) continue;
+      const s = String(cell).trim();
+      if (!s) continue;
+      // Rejeita células que sejam a própria OB ou Data
+      if (/\b\d{4}OB\d+\b/i.test(s)) continue;
+      if (/\b\d{2}\/\d{2}\/\d{4}\b/.test(s)) continue;
+      // Rejeita domicílio bancário (ex: 001 03795-8 000011655-6) para evitar parsing indevido
+      if (/\b\d{3}\s+\d{4,5}[-\s]|\b\d{3}\s+\d{5}/.test(s) || /^\d{4,}[-\s]\w$/.test(s)) continue;
+      // Rejeita expressamente códigos de Fonte de Recursos para não confundir com o valor monetário da despesa
+      if (isFonteString(s) || isFonteString(cell) || isFonte600OuDerivada(s)) continue;
+
+      if (typeof cell === 'number') {
+        if (cell === 600 || cell === 500 || cell === 1500 || cell === 1600 || cell === 0.6 || cell === 0.5) continue;
+        if (cell > 0 && cell < 1e11 && cell > valor) {
+          valor = cell;
+        }
+        continue;
+      }
+      const valParsed = parseCurrencyValue(cell);
+      if (valParsed === 600 || valParsed === 500 || valParsed === 1500 || valParsed === 1600 || valParsed === 0.6 || valParsed === 0.5) continue;
+      if (valParsed > 0 && valParsed < 1e11 && valParsed > valor) {
+        valor = valParsed;
+      }
+    }
+
+    // Capture a linha de baixo: const row2 = matrix[i + 1]. Verifique se ela existe.
+    let pp = '';
+    // Check row1 for PP as well
+    for (let c = 0; c < row1.length; c++) {
+      const cell = row1[c];
+      if (cell !== null && cell !== undefined) {
+        const s = String(cell).trim();
+        const m = s.match(/\b\d{4}PP\d+\b/i);
+        if (m) {
+          pp = m[0].toUpperCase();
+          break;
+        }
+      }
+    }
+
+    let fonteRecurso = '';
+    let favorecidoRaw = '';
+
+    const row2 = i + 1 < matrix.length ? matrix[i + 1] : null;
+    if (row2 && Array.isArray(row2)) {
+      // Extraia da row2 se não achou na row1:
+      if (!pp) {
+        for (let c = 0; c < row2.length; c++) {
+          const cell = row2[c];
+          if (cell !== null && cell !== undefined) {
+            const s = String(cell).trim();
+            const m = s.match(/\b\d{4}PP\d+\b/i);
+            if (m) {
+              pp = m[0].toUpperCase();
+              break;
+            }
+          }
+        }
+      }
+
+      // Fonte de Recurso: A string que contenha pontos no formato de fonte (ex: .6. ou .5. ou match /\b\d\.\s?\d\.\d{2}\.\d{6}\b/).
+      for (let c = 0; c < row2.length; c++) {
+        const cell = row2[c];
+        if (cell === null || cell === undefined) continue;
+        const s = String(cell).trim();
+        if (!s || s === '-' || s === '0') continue;
+        if (/\b\d\.\s?\d\.\d{2}\.\d{6}\b/.test(s)) {
+          fonteRecurso = s;
+          break;
+        }
+        if (isFonte600OuDerivada(s)) {
+          fonteRecurso = s;
+          break;
+        }
+        if ((s.includes('.6.') || s.includes('.5.')) && s.includes('.')) {
+          fonteRecurso = s;
+          break;
+        }
+      }
+      if (!fonteRecurso) {
+        const f = findFonteRecursoInRow(row2);
+        if (f) fonteRecurso = f;
+      }
+
+      // Favorecido: Procure na row2 uma string que contenha um CNPJ /\d{2}\.\d{3}\.\d{3}\/\d{4}\-\d{2}/
+      // OU que seja um texto com mais de 10 caracteres, que contenha letras, e que NÃO seja um Domicílio Bancário (rejeite se der match em /\b\d{3}\s\d{5}\-\d\b/).
+      for (let c = 0; c < row2.length; c++) {
+        const cell = row2[c];
+        if (cell === null || cell === undefined) continue;
+        const s = String(cell).trim();
+        if (/\d{2}\.\d{3}\.\d{3}\/\d{4}\-\d{2}/.test(s)) {
+          favorecidoRaw = s;
+          break;
+        }
+      }
+      if (!favorecidoRaw) {
+        for (let c = 0; c < row2.length; c++) {
+          const cell = row2[c];
+          if (cell === null || cell === undefined) continue;
+          const s = String(cell).trim();
+          if (/\b\d{3}\s+\d{4,5}[-\s]\w\b/i.test(s) || /\b\d{3}\s\d{5}\-\d\b/i.test(s)) continue;
+          if (/\b\d{4}PP\d+\b/i.test(s)) continue;
+          if (/\b\d\.\s?\d\.\d{2}\.\d{6}\b/.test(s) || isFonte600OuDerivada(s)) continue;
+          if (s.length > 10 && /[A-Za-z]/.test(s)) {
+            favorecidoRaw = s;
+            break;
+          }
+        }
+      }
+
+      // Se valor não foi encontrado em row1, confere row2
+      if (valor <= 0) {
+        for (let c = 0; c < row2.length; c++) {
+          const cell = row2[c];
+          if (cell === null || cell === undefined) continue;
+          const s = String(cell).trim();
+          if (!s) continue;
+          if (/\b\d{4}PP\d+\b/i.test(s)) continue;
+          if (/\b\d{3}\s+\d{4,5}/.test(s) || /^\d{4,}[-\s]\w$/.test(s)) continue;
+          if (/\d{2}\.\d{3}\.\d{3}\/\d{4}\-\d{2}/.test(s)) continue;
+          if (typeof cell === 'number') {
+            if (cell > 0 && cell < 1e11 && cell > valor) valor = cell;
+            continue;
+          }
+          const valParsed = parseCurrencyValue(cell);
+          if (valParsed > 0 && valParsed < 1e11 && valParsed > valor) valor = valParsed;
+        }
+      }
+
+      // CRÍTICO: Faça i++ no final do escopo deste if para "pular" a row2 no loop principal e não lê-la de novo por acidente.
+      i++;
+    }
+
+    // Limpe as strings, valide se o valor > 0, e faça o .push() no array items.
+    if (valor > 0) {
+      const { cnpj: parsedCnpj, name: parsedName } = parseFavorecidoField(favorecidoRaw);
+      const cnpjMatch = favorecidoRaw.match(/\d{2}\.\d{3}\.\d{3}\/\d{4}\-\d{2}/);
+      const finalCnpj = parsedCnpj || cnpjMatch?.[0] || 'N/I';
+      const finalName = (parsedName || (cnpjMatch ? favorecidoRaw.replace(cnpjMatch[0], '').trim() : favorecidoRaw) || 'NÃO INFORMADO').trim();
+
+      items.push({
+        id: `ob_${ob}_${i}`,
+        ob,
+        dataReferencia: dateInfo.dateIso || dataReferencia,
+        dataIso: dateInfo.dateIso,
+        mesAnoKey: dateInfo.mesAnoKey,
+        mesAnoLabel: dateInfo.mesAnoLabel,
+        valor,
+        situacao,
+        pp,
+        fonteRecurso: (fonteRecurso || 'Fonte Não Identificada').trim(),
+        favorecidoRaw: favorecidoRaw.trim(),
+        favorecidoCnpj: finalCnpj,
+        favorecidoName: finalName,
+        linhaOrigem: i + 1,
+      });
+    }
+  }
+
+  return items;
+}
+
+/**
+ * Asynchronous chunked parser for large spreadsheets using the exact same strict regex logic.
+ * Iterates in chunks of 1000 rows and pauses with setTimeout(0) between chunks
+ * so the browser main thread breathes and never freezes or crashes.
  */
 export async function parseListarOrdemBancariaMatrixAsync(
   matrix: any[][],
   onProgress?: (percent: number) => void
 ): Promise<OrdemBancariaItem[]> {
-  if (!matrix || matrix.length < 2) return [];
+  if (!matrix || matrix.length < 1) return [];
 
   const items: OrdemBancariaItem[] = [];
-  const totalRows = matrix.length;
-  const CHUNK_SIZE = 500;
+  const total = matrix.length;
+  const CHUNK_SIZE = 1000;
 
-  for (let r = 0; r < totalRows - 1; r++) {
-    // Periodically yield execution to allow UI repaints and user interactions
-    if (r > 0 && r % CHUNK_SIZE === 0) {
-      if (onProgress) {
-        onProgress(Math.min(99, Math.round((r / totalRows) * 100)));
+  for (let i = 0; i < total; i++) {
+    if (i > 0 && i % CHUNK_SIZE === 0) {
+      if (onProgress) onProgress(Math.min(99, Math.round((i / total) * 100)));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+
+    const row1 = matrix[i];
+    if (!Array.isArray(row1)) continue;
+
+    let ob = '';
+    for (let c = 0; c < row1.length; c++) {
+      const cell = row1[c];
+      if (cell !== null && cell !== undefined) {
+        const s = String(cell).trim();
+        const m = s.match(/\b\d{4}OB\d+\b/i);
+        if (m) {
+          ob = m[0].toUpperCase();
+          break;
+        }
       }
-      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    if (!ob) continue;
+
+    let dataReferencia = '';
+    for (let c = 0; c < row1.length; c++) {
+      const cell = row1[c];
+      if (cell !== null && cell !== undefined) {
+        const s = String(cell).trim();
+        const m = s.match(/\b\d{2}\/\d{2}\/\d{4}\b/);
+        if (m) {
+          dataReferencia = m[0];
+          break;
+        }
+      }
+    }
+    const dateInfo = parseDateToMonthInfo(dataReferencia);
+
+    let situacao = 'CB';
+    for (let c = 0; c < row1.length; c++) {
+      const cell = row1[c];
+      if (cell !== null && cell !== undefined) {
+        const s = String(cell).trim().toUpperCase();
+        const m = s.match(/\b(CB|RJ|PPCB|PPNC|PPRJ|AO|C|PAGA|LIQUIDADA)\b/);
+        if (m) {
+          situacao = m[1];
+          break;
+        }
+      }
     }
 
-    const row1 = matrix[r];
-    const row2 = matrix[r + 1];
+    let valor = 0;
+    for (let c = 0; c < row1.length; c++) {
+      const cell = row1[c];
+      if (cell === null || cell === undefined) continue;
+      const s = String(cell).trim();
+      if (!s) continue;
+      if (/\b\d{4}OB\d+\b/i.test(s)) continue;
+      if (/\b\d{2}\/\d{2}\/\d{4}\b/.test(s)) continue;
+      if (/\b\d{3}\s+\d{4,5}[-\s]|\b\d{3}\s+\d{5}/.test(s) || /^\d{4,}[-\s]\w$/.test(s)) continue;
+      // Rejeita expressamente códigos de Fonte de Recursos para não confundir com o valor monetário da despesa
+      if (isFonteString(s) || isFonteString(cell) || isFonte600OuDerivada(s)) continue;
 
-    if (!Array.isArray(row1) || !Array.isArray(row2)) continue;
-
-    let obVal = String(row1[0] ?? '').trim();
-    let colOffset = 0;
-
-    if (!isObNumber(obVal) && row1.length > 1 && isObNumber(row1[1])) {
-      obVal = String(row1[1]).trim();
-      colOffset = 1;
+      if (typeof cell === 'number') {
+        if (cell === 600 || cell === 500 || cell === 1500 || cell === 1600 || cell === 0.6 || cell === 0.5) continue;
+        if (cell > 0 && cell < 1e11 && cell > valor) {
+          valor = cell;
+        }
+        continue;
+      }
+      const valParsed = parseCurrencyValue(cell);
+      if (valParsed === 600 || valParsed === 500 || valParsed === 1500 || valParsed === 1600 || valParsed === 0.6 || valParsed === 0.5) continue;
+      if (valParsed > 0 && valParsed < 1e11 && valParsed > valor) {
+        valor = valParsed;
+      }
     }
 
-    if (!isObNumber(obVal)) {
-      continue;
+    let pp = '';
+    // Check row1 for PP as well
+    for (let c = 0; c < row1.length; c++) {
+      const cell = row1[c];
+      if (cell !== null && cell !== undefined) {
+        const s = String(cell).trim();
+        const m = s.match(/\b\d{4}PP\d+\b/i);
+        if (m) {
+          pp = m[0].toUpperCase();
+          break;
+        }
+      }
     }
 
-    const dataRefRaw = row1[colOffset + 1] ?? '';
-    let valorRaw = row1[colOffset + 6];
-    let sitRaw = row1[colOffset + 7];
+    let fonteRecurso = '';
+    let favorecidoRaw = '';
 
-    if (parseCurrencyValue(valorRaw) === 0) {
-      for (let c = colOffset + 2; c < row1.length; c++) {
-        const testVal = parseCurrencyValue(row1[c]);
-        if (testVal > 0) {
-          valorRaw = row1[c];
-          if (row1[c + 1] !== undefined) {
-            sitRaw = row1[c + 1];
+    const row2 = i + 1 < total ? matrix[i + 1] : null;
+    if (row2 && Array.isArray(row2)) {
+      if (!pp) {
+        for (let c = 0; c < row2.length; c++) {
+          const cell = row2[c];
+          if (cell !== null && cell !== undefined) {
+            const s = String(cell).trim();
+            const m = s.match(/\b\d{4}PP\d+\b/i);
+            if (m) {
+              pp = m[0].toUpperCase();
+              break;
+            }
           }
+        }
+      }
+
+      for (let c = 0; c < row2.length; c++) {
+        const cell = row2[c];
+        if (cell === null || cell === undefined) continue;
+        const s = String(cell).trim();
+        if (!s || s === '-' || s === '0') continue;
+        if (/\b\d\.\s?\d\.\d{2}\.\d{6}\b/.test(s)) {
+          fonteRecurso = s;
+          break;
+        }
+        if (isFonte600OuDerivada(s)) {
+          fonteRecurso = s;
+          break;
+        }
+        if ((s.includes('.6.') || s.includes('.5.')) && s.includes('.')) {
+          fonteRecurso = s;
           break;
         }
       }
-    }
+      if (!fonteRecurso) {
+        const f = findFonteRecursoInRow(row2);
+        if (f) fonteRecurso = f;
+      }
 
-    const valor = parseCurrencyValue(valorRaw);
-    const situacao = String(sitRaw ?? '').trim().toUpperCase();
-
-    const isConclusivo = isSituacaoConclusivaPagamento(situacao) || situacao === 'CB';
-    if (!isConclusivo) {
-      continue;
-    }
-
-    let ppRaw = String(row2[colOffset + 1] ?? '').trim();
-    let fonteRaw = String(row2[colOffset + 2] ?? '').trim();
-    let favorecidoRaw = String(row2[colOffset + 3] ?? '').trim();
-
-    if (!favorecidoRaw || favorecidoRaw.length < 3) {
-      for (let c = colOffset + 1; c < row2.length; c++) {
-        const cellStr = String(row2[c] ?? '').trim();
-        if (/\d{2}\.?\d{3}\.?\d{3}\/?\d{4}-?\d{2}|\b\d{14}\b/.test(cellStr) || cellStr.length > 15) {
-          favorecidoRaw = cellStr;
-          break;
+      for (let c = 0; c < row2.length; c++) {
+        const cell = row2[c];
+        if (cell !== null && cell !== undefined) {
+          const s = String(cell).trim();
+          if (/\d{2}\.\d{3}\.\d{3}\/\d{4}\-\d{2}/.test(s)) {
+            favorecidoRaw = s;
+            break;
+          }
         }
       }
+      if (!favorecidoRaw) {
+        for (let c = 0; c < row2.length; c++) {
+          const cell = row2[c];
+          if (cell === null || cell === undefined) continue;
+          const s = String(cell).trim();
+          if (/\b\d{3}\s+\d{4,5}[-\s]\w\b/i.test(s) || /\b\d{3}\s\d{5}\-\d\b/i.test(s)) continue;
+          if (/\b\d{4}PP\d+\b/i.test(s)) continue;
+          if (/\b\d\.\s?\d\.\d{2}\.\d{6}\b/.test(s) || isFonte600OuDerivada(s)) continue;
+          if (s.length > 10 && /[A-Za-z]/.test(s)) {
+            favorecidoRaw = s;
+            break;
+          }
+        }
+      }
+
+      if (valor <= 0) {
+        for (let c = 0; c < row2.length; c++) {
+          const cell = row2[c];
+          if (cell === null || cell === undefined) continue;
+          const s = String(cell).trim();
+          if (!s) continue;
+          if (/\b\d{4}PP\d+\b/i.test(s)) continue;
+          if (/\b\d{3}\s+\d{4,5}/.test(s) || /^\d{4,}[-\s]\w$/.test(s)) continue;
+          if (/\d{2}\.\d{3}\.\d{3}\/\d{4}\-\d{2}/.test(s)) continue;
+          if (typeof cell === 'number') {
+            if (cell > 0 && cell < 1e11 && cell > valor) valor = cell;
+            continue;
+          }
+          const valParsed = parseCurrencyValue(cell);
+          if (valParsed > 0 && valParsed < 1e11 && valParsed > valor) valor = valParsed;
+        }
+      }
+
+      i++;
     }
 
-    const { cnpj, name } = parseFavorecidoField(favorecidoRaw);
-    const dateInfo = parseDateToMonthInfo(dataRefRaw);
+    if (valor > 0) {
+      const { cnpj: parsedCnpj, name: parsedName } = parseFavorecidoField(favorecidoRaw);
+      const cnpjMatch = favorecidoRaw.match(/\d{2}\.\d{3}\.\d{3}\/\d{4}\-\d{2}/);
+      const finalCnpj = parsedCnpj || cnpjMatch?.[0] || 'N/I';
+      const finalName = (parsedName || (cnpjMatch ? favorecidoRaw.replace(cnpjMatch[0], '').trim() : favorecidoRaw) || 'NÃO INFORMADO').trim();
 
-    items.push({
-      id: `ob_${obVal}_${r}`,
-      ob: obVal,
-      dataReferencia: String(dataRefRaw).trim(),
-      dataIso: dateInfo.dateIso,
-      mesAnoKey: dateInfo.mesAnoKey,
-      mesAnoLabel: dateInfo.mesAnoLabel,
-      valor,
-      situacao,
-      pp: ppRaw,
-      fonteRecurso: fonteRaw || 'OUTRAS',
-      favorecidoRaw,
-      favorecidoCnpj: cnpj,
-      favorecidoName: name || favorecidoRaw || 'NÃO INFORMADO',
-      linhaOrigem: r + 1,
-    });
-
-    r++;
+      items.push({
+        id: `ob_${ob}_${i}`,
+        ob,
+        dataReferencia: dateInfo.dateIso || dataReferencia,
+        dataIso: dateInfo.dateIso,
+        mesAnoKey: dateInfo.mesAnoKey,
+        mesAnoLabel: dateInfo.mesAnoLabel,
+        valor,
+        situacao,
+        pp,
+        fonteRecurso: (fonteRecurso || 'Fonte Não Identificada').trim(),
+        favorecidoRaw: favorecidoRaw.trim(),
+        favorecidoCnpj: finalCnpj,
+        favorecidoName: finalName,
+        linhaOrigem: i + 1,
+      });
+    }
   }
 
   if (onProgress) onProgress(100);
@@ -351,21 +868,36 @@ let memoryCachedOBItems: OrdemBancariaItem[] | null = null;
 let memoryCachedOBFileName: string = '';
 
 function openOBDatabase(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    if (typeof window === 'undefined' || !window.indexedDB) {
-      reject(new Error('IndexedDB indisponível.'));
-      return;
-    }
-    const request = indexedDB.open(DB_NAME_OB, DB_VERSION_OB);
-    request.onupgradeneeded = (e) => {
-      const db = (e.target as IDBOpenDBRequest).result;
-      if (!db.objectStoreNames.contains(STORE_NAME_OB)) {
-        db.createObjectStore(STORE_NAME_OB);
+  const dbPromise = new Promise<IDBDatabase>((resolve, reject) => {
+    try {
+      if (typeof window === 'undefined' || !window.indexedDB) {
+        reject(new Error('IndexedDB indisponível.'));
+        return;
       }
-    };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+      const request = indexedDB.open(DB_NAME_OB, DB_VERSION_OB);
+      request.onupgradeneeded = (e) => {
+        try {
+          const db = (e.target as IDBOpenDBRequest).result;
+          if (!db.objectStoreNames.contains(STORE_NAME_OB)) {
+            db.createObjectStore(STORE_NAME_OB);
+          }
+        } catch (err) {
+          reject(err);
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error('Falha ao abrir IndexedDB OB'));
+      request.onblocked = () => reject(new Error('IndexedDB OB bloqueado'));
+    } catch (err) {
+      reject(err);
+    }
   });
+
+  const timeoutPromise = new Promise<IDBDatabase>((_, reject) => {
+    setTimeout(() => reject(new Error('Timeout ao conectar com IndexedDB OB')), 7000);
+  });
+
+  return Promise.race([dbPromise, timeoutPromise]);
 }
 
 async function saveOBToIndexedDB(items: OrdemBancariaItem[] | null, fileName: string): Promise<void> {
@@ -481,12 +1013,16 @@ export function loadOrdensBancariasFromStorage(): { items: OrdemBancariaItem[] |
 }
 
 export async function loadOrdensBancariasAsync(): Promise<{ items: OrdemBancariaItem[] | null; fileName: string }> {
-  // 1. Try IndexedDB first (most complete source)
-  const idbData = await loadOBFromIndexedDB();
-  if (idbData && idbData.items && idbData.items.length > 0) {
-    memoryCachedOBItems = idbData.items;
-    memoryCachedOBFileName = idbData.fileName;
-    return idbData;
+  try {
+    // 1. Try IndexedDB first (most complete source)
+    const idbData = await loadOBFromIndexedDB();
+    if (idbData && idbData.items && idbData.items.length > 0) {
+      memoryCachedOBItems = idbData.items;
+      memoryCachedOBFileName = idbData.fileName;
+      return idbData;
+    }
+  } catch (err) {
+    console.warn('Erro ao carregar OBs do IndexedDB, usando fallback:', err);
   }
 
   // 2. Fallback to synchronous load
@@ -580,15 +1116,13 @@ export function enrichSuppliersWithOrdensBancarias(
   const obByCnpj = new Map<string, OrdemBancariaItem[]>();
   const obByCnpjRoot = new Map<string, OrdemBancariaItem[]>();
   const obByName = new Map<string, OrdemBancariaItem[]>();
-  const allOBNormalized: Array<{ item: OrdemBancariaItem; cnpjDigits: string; cnpjRoot: string; normName: string }> = [];
+  const obByNamePrefix = new Map<string, OrdemBancariaItem[]>();
 
   for (let i = 0; i < obItems.length; i++) {
     const item = obItems[i];
     const cnpjDigits = extractDigits(item.favorecidoCnpj);
     const cnpjRoot = cnpjDigits.length === 14 ? cnpjDigits.substring(0, 8) : '';
     const normName = normalizeText(item.favorecidoName);
-
-    allOBNormalized.push({ item, cnpjDigits, cnpjRoot, normName });
 
     if (cnpjDigits.length >= 11) {
       const arr = obByCnpj.get(cnpjDigits);
@@ -606,6 +1140,13 @@ export function enrichSuppliersWithOrdensBancarias(
       const arr = obByName.get(normName);
       if (arr) arr.push(item);
       else obByName.set(normName, [item]);
+
+      if (normName.length >= 8) {
+        const prefix = normName.substring(0, 14);
+        const pArr = obByNamePrefix.get(prefix);
+        if (pArr) pArr.push(item);
+        else obByNamePrefix.set(prefix, [item]);
+      }
     }
   }
 
@@ -630,21 +1171,11 @@ export function enrichSuppliersWithOrdensBancarias(
     else if (suppNorm && obByName.has(suppNorm)) {
       matchedItems = obByName.get(suppNorm);
     }
-    // D. Partial name fallback (only if supplier has distinct name)
-    else if (suppNorm && suppNorm.length >= 7) {
-      const fuzzyMatches: OrdemBancariaItem[] = [];
-      for (let j = 0; j < allOBNormalized.length; j++) {
-        const obEntry = allOBNormalized[j];
-        if (
-          obEntry.normName &&
-          obEntry.normName.length >= 6 &&
-          (suppNorm.includes(obEntry.normName) || obEntry.normName.includes(suppNorm))
-        ) {
-          fuzzyMatches.push(obEntry.item);
-        }
-      }
-      if (fuzzyMatches.length > 0) {
-        matchedItems = fuzzyMatches;
+    // D. Prefix name match O(1)
+    else if (suppNorm && suppNorm.length >= 8) {
+      const prefix = suppNorm.substring(0, 14);
+      if (obByNamePrefix.has(prefix)) {
+        matchedItems = obByNamePrefix.get(prefix);
       }
     }
 

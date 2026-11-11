@@ -1,7 +1,6 @@
 import * as XLSX from 'xlsx';
 import { LiberacaoItem, LiberacaoCrossResult, SituacaoCategory } from '../types';
-import { parseCurrencyValue, readSpreadsheetAsMatrix } from './excelParser';
-import { isSituacaoAO, isSituacaoEnviadaBanco } from './quebraOrdemParser';
+import { parseCurrencyValue, readSpreadsheetAsMatrix, isSituacaoAO, isSituacaoEnviadaBanco } from './excelParser';
 
 export { isSituacaoAO, isSituacaoEnviadaBanco, readSpreadsheetAsMatrix };
 

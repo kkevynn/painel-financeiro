@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   X,
   Check,
@@ -10,9 +10,11 @@ import {
   UserCheck,
   DollarSign,
   PieChart,
+  Layers,
+  Calendar,
 } from 'lucide-react';
 import { FileData, StageKey, ColumnMappingConfig } from '../types';
-import { formatBRL, parseCurrencyValue } from '../utils/excelParser';
+import { formatBRL, parseCurrencyValue, analyzeColumnsForStage } from '../utils/excelParser';
 
 interface ColumnMappingModalProps {
   fileData: FileData | null;
@@ -84,19 +86,21 @@ export const ColumnMappingModal: React.FC<ColumnMappingModalProps> = ({
   const [selectedSituacao, setSelectedSituacao] = useState<string>(
     fileData.detectedSituacaoCol || ''
   );
+  const [selectedNatureza, setSelectedNatureza] = useState<string>(
+    fileData.detectedNaturezaCol || ''
+  );
+  const [selectedFonte, setSelectedFonte] = useState<string>(
+    fileData.detectedFonteCol || ''
+  );
+  const [selectedData, setSelectedData] = useState<string>(() => {
+    if (fileData.detectedDataCol) return fileData.detectedDataCol;
+    const found = fileData.headers.find((h) => {
+      const norm = h.toLowerCase().trim();
+      return norm.includes('data') || norm.includes('dt');
+    });
+    return found || '';
+  });
 
-  // Helper to get sample non-empty value from rows for a given header
-  const getHeaderSampleValue = (headerName: string): string => {
-    if (!headerName || !fileData.rows || fileData.rows.length === 0) return '';
-    for (let i = 0; i < Math.min(fileData.rows.length, 10); i++) {
-      const row = fileData.rows[i];
-      const val = row?.[headerName];
-      if (val !== null && val !== undefined && String(val).trim() !== '') {
-        return String(val).trim();
-      }
-    }
-    return '';
-  };
 
   const previewRow = useMemo(() => {
     if (!fileData.rows || fileData.rows.length === 0) return null;
@@ -113,6 +117,8 @@ export const ColumnMappingModal: React.FC<ColumnMappingModalProps> = ({
       valor: parsedVal,
       cnpj: selectedCnpj ? String(row[selectedCnpj] || '-') : '-',
       situacao: selectedSituacao ? String(row[selectedSituacao] || '-') : '-',
+      fonte: selectedFonte ? String(row[selectedFonte] || '-') : '-',
+      data: selectedData ? String(row[selectedData] || '-') : '-',
     };
   }, [
     fileData.rows,
@@ -124,7 +130,32 @@ export const ColumnMappingModal: React.FC<ColumnMappingModalProps> = ({
     selectedValor,
     selectedCnpj,
     selectedSituacao,
+    selectedNatureza,
+    selectedFonte,
+    selectedData,
   ]);
+
+  const handleStageChange = (newStage: StageKey) => {
+    setSelectedStage(newStage);
+
+    // Dynamic analysis of file contents (rows & headers) for the newly selected stage
+    const analyzed = analyzeColumnsForStage(fileData.headers, fileData.rows, newStage);
+    if (analyzed.numeroCol !== undefined) setSelectedNumero(analyzed.numeroCol);
+    if (analyzed.obCol !== undefined) setSelectedOb(analyzed.obCol);
+    if (analyzed.favorecidoCol) setSelectedFavorecido(analyzed.favorecidoCol);
+    if (analyzed.valorCol) setSelectedValor(analyzed.valorCol);
+    if (analyzed.notaEmpenhoCol !== undefined) setSelectedNotaEmpenho(analyzed.notaEmpenhoCol);
+    if (analyzed.favorecidoNECol !== undefined) setSelectedFavorecidoNE(analyzed.favorecidoNECol);
+    if (analyzed.cnpjCol !== undefined) setSelectedCnpj(analyzed.cnpjCol);
+    if (analyzed.situacaoObCol !== undefined) {
+      setSelectedSituacao(analyzed.situacaoObCol);
+    } else if (analyzed.situacaoCol !== undefined) {
+      setSelectedSituacao(analyzed.situacaoCol);
+    }
+    if (analyzed.naturezaCol !== undefined) setSelectedNatureza(analyzed.naturezaCol);
+    if (analyzed.fonteCol !== undefined) setSelectedFonte(analyzed.fonteCol);
+    if (analyzed.dataCol !== undefined) setSelectedData(analyzed.dataCol);
+  };
 
   const handleSave = () => {
     onSaveMapping(fileData.id, {
@@ -137,13 +168,26 @@ export const ColumnMappingModal: React.FC<ColumnMappingModalProps> = ({
       favorecidoNECol: selectedFavorecidoNE || undefined,
       cnpjCol: selectedCnpj || undefined,
       situacaoCol: selectedSituacao || undefined,
+      situacaoObCol: fileData.detectedSituacaoObCol || undefined,
+      naturezaCol: selectedNatureza || undefined,
+      fonteCol: selectedFonte || undefined,
+      dataCol: selectedData || undefined,
     });
     onClose();
   };
 
+  // Lock background scroll when open
+  useEffect(() => {
+    const orig = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = orig;
+    };
+  }, []);
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-900/60 backdrop-blur-xs animate-in fade-in duration-200">
-      <div className="bg-white rounded-2xl max-w-3xl w-full max-h-[92vh] shadow-2xl border border-slate-200 overflow-hidden flex flex-col">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-900/60 backdrop-blur-xs overscroll-contain animate-in fade-in duration-200">
+      <div className="bg-white rounded-2xl max-w-3xl w-full max-h-[92vh] shadow-2xl border border-slate-200 overflow-hidden flex flex-col overscroll-contain">
         
         {/* Modal Header */}
         <div className="p-4 sm:p-5 bg-slate-50 border-b border-slate-200 flex items-center justify-between shrink-0">
@@ -177,10 +221,10 @@ export const ColumnMappingModal: React.FC<ColumnMappingModalProps> = ({
             <label className="block font-bold text-slate-900 text-xs">
               Classificação no Painel:
             </label>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
               <button
                 type="button"
-                onClick={() => setSelectedStage('nao_obedece')}
+                onClick={() => handleStageChange('nao_obedece')}
                 className={`py-2 px-3 rounded-xl border text-xs font-bold transition flex items-center gap-2 cursor-pointer ${
                   selectedStage === 'nao_obedece'
                     ? 'border-amber-500 bg-amber-50 text-amber-950 ring-2 ring-amber-400/30'
@@ -193,7 +237,7 @@ export const ColumnMappingModal: React.FC<ColumnMappingModalProps> = ({
 
               <button
                 type="button"
-                onClick={() => setSelectedStage('obedece')}
+                onClick={() => handleStageChange('obedece')}
                 className={`py-2 px-3 rounded-xl border text-xs font-bold transition flex items-center gap-2 cursor-pointer ${
                   selectedStage === 'obedece'
                     ? 'border-blue-500 bg-blue-50 text-blue-950 ring-2 ring-blue-400/30'
@@ -206,7 +250,7 @@ export const ColumnMappingModal: React.FC<ColumnMappingModalProps> = ({
 
               <button
                 type="button"
-                onClick={() => setSelectedStage('base_pps')}
+                onClick={() => handleStageChange('base_pps')}
                 className={`py-2 px-3 rounded-xl border text-xs font-bold transition flex items-center gap-2 cursor-pointer ${
                   selectedStage === 'base_pps' || selectedStage === 'pp_prontas'
                     ? 'border-emerald-500 bg-emerald-50 text-emerald-950 ring-2 ring-emerald-400/30'
@@ -219,7 +263,46 @@ export const ColumnMappingModal: React.FC<ColumnMappingModalProps> = ({
 
               <button
                 type="button"
-                onClick={() => setSelectedStage('outros')}
+                onClick={() => handleStageChange('ordem_bancaria')}
+                className={`py-2 px-3 rounded-xl border text-xs font-bold transition flex items-center gap-2 cursor-pointer ${
+                  selectedStage === 'ordem_bancaria'
+                    ? 'border-teal-500 bg-teal-50 text-teal-950 ring-2 ring-teal-400/30'
+                    : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-slate-100'
+                }`}
+              >
+                <span className="w-2.5 h-2.5 rounded-full bg-teal-500 shrink-0" />
+                <span className="truncate">Detalhamento de Pagamentos (OB)</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleStageChange('natureza_despesa')}
+                className={`py-2 px-3 rounded-xl border text-xs font-bold transition flex items-center gap-2 cursor-pointer ${
+                  selectedStage === 'natureza_despesa'
+                    ? 'border-violet-500 bg-violet-50 text-violet-950 ring-2 ring-violet-400/30'
+                    : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-slate-100'
+                }`}
+              >
+                <span className="w-2.5 h-2.5 rounded-full bg-violet-500 shrink-0" />
+                <span className="truncate">Natureza Despesa</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleStageChange('publicacao')}
+                className={`py-2 px-3 rounded-xl border text-xs font-bold transition flex items-center gap-2 cursor-pointer ${
+                  selectedStage === 'publicacao'
+                    ? 'border-indigo-500 bg-indigo-50 text-indigo-950 ring-2 ring-indigo-400/30'
+                    : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-slate-100'
+                }`}
+              >
+                <span className="w-2.5 h-2.5 rounded-full bg-indigo-500 shrink-0" />
+                <span className="truncate">Para Publicação</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleStageChange('outros')}
                 className={`py-2 px-3 rounded-xl border text-xs font-bold transition flex items-center gap-2 cursor-pointer ${
                   selectedStage === 'outros'
                     ? 'border-slate-500 bg-slate-100 text-slate-900 ring-2 ring-slate-400/30'
@@ -251,15 +334,12 @@ export const ColumnMappingModal: React.FC<ColumnMappingModalProps> = ({
                   onChange={(e) => setSelectedNumero(e.target.value)}
                   className="w-full p-2 bg-slate-50 border border-slate-300 rounded-xl font-medium text-xs text-slate-900 focus:bg-white focus:outline-hidden focus:border-emerald-500"
                 >
-                  <option value="">(Não mapeada)</option>
-                  {fileData.headers.map((h) => {
-                    const sample = getHeaderSampleValue(h);
-                    return (
-                      <option key={h} value={h}>
-                        {h} {sample ? `(ex: ${sample.substring(0, 20)})` : ''}
-                      </option>
-                    );
-                  })}
+                  <option value="">Não mapeada</option>
+                  {fileData.headers.map((h) => (
+                    <option key={h} value={h}>
+                      {h}
+                    </option>
+                  ))}
                 </select>
               </div>
 
@@ -274,15 +354,12 @@ export const ColumnMappingModal: React.FC<ColumnMappingModalProps> = ({
                   onChange={(e) => setSelectedOb(e.target.value)}
                   className="w-full p-2 bg-slate-50 border border-slate-300 rounded-xl font-medium text-xs text-slate-900 focus:bg-white focus:outline-hidden focus:border-emerald-500"
                 >
-                  <option value="">(Não mapeada)</option>
-                  {fileData.headers.map((h) => {
-                    const sample = getHeaderSampleValue(h);
-                    return (
-                      <option key={h} value={h}>
-                        {h} {sample ? `(ex: ${sample.substring(0, 20)})` : ''}
-                      </option>
-                    );
-                  })}
+                  <option value="">Não mapeada</option>
+                  {fileData.headers.map((h) => (
+                    <option key={h} value={h}>
+                      {h}
+                    </option>
+                  ))}
                 </select>
               </div>
 
@@ -297,14 +374,12 @@ export const ColumnMappingModal: React.FC<ColumnMappingModalProps> = ({
                   onChange={(e) => setSelectedFavorecido(e.target.value)}
                   className="w-full p-2 bg-slate-50 border border-slate-300 rounded-xl font-medium text-xs text-slate-900 focus:bg-white focus:outline-hidden focus:border-emerald-500"
                 >
-                  {fileData.headers.map((h) => {
-                    const sample = getHeaderSampleValue(h);
-                    return (
-                      <option key={h} value={h}>
-                        {h} {sample ? `(ex: ${sample.substring(0, 20)})` : ''}
-                      </option>
-                    );
-                  })}
+                  <option value="">Não mapeada</option>
+                  {fileData.headers.map((h) => (
+                    <option key={h} value={h}>
+                      {h}
+                    </option>
+                  ))}
                 </select>
               </div>
 
@@ -319,15 +394,12 @@ export const ColumnMappingModal: React.FC<ColumnMappingModalProps> = ({
                   onChange={(e) => setSelectedNotaEmpenho(e.target.value)}
                   className="w-full p-2 bg-slate-50 border border-slate-300 rounded-xl font-medium text-xs text-slate-900 focus:bg-white focus:outline-hidden focus:border-emerald-500"
                 >
-                  <option value="">(Não mapeada)</option>
-                  {fileData.headers.map((h) => {
-                    const sample = getHeaderSampleValue(h);
-                    return (
-                      <option key={h} value={h}>
-                        {h} {sample ? `(ex: ${sample.substring(0, 20)})` : ''}
-                      </option>
-                    );
-                  })}
+                  <option value="">Não mapeada</option>
+                  {fileData.headers.map((h) => (
+                    <option key={h} value={h}>
+                      {h}
+                    </option>
+                  ))}
                 </select>
               </div>
 
@@ -342,15 +414,12 @@ export const ColumnMappingModal: React.FC<ColumnMappingModalProps> = ({
                   onChange={(e) => setSelectedFavorecidoNE(e.target.value)}
                   className="w-full p-2 bg-slate-50 border border-slate-300 rounded-xl font-medium text-xs text-slate-900 focus:bg-white focus:outline-hidden focus:border-emerald-500"
                 >
-                  <option value="">(Não mapeada)</option>
-                  {fileData.headers.map((h) => {
-                    const sample = getHeaderSampleValue(h);
-                    return (
-                      <option key={h} value={h}>
-                        {h} {sample ? `(ex: ${sample.substring(0, 20)})` : ''}
-                      </option>
-                    );
-                  })}
+                  <option value="">Não mapeada</option>
+                  {fileData.headers.map((h) => (
+                    <option key={h} value={h}>
+                      {h}
+                    </option>
+                  ))}
                 </select>
               </div>
 
@@ -365,60 +434,112 @@ export const ColumnMappingModal: React.FC<ColumnMappingModalProps> = ({
                   onChange={(e) => setSelectedValor(e.target.value)}
                   className="w-full p-2 bg-slate-50 border border-slate-300 rounded-xl font-medium text-xs text-slate-900 focus:bg-white focus:outline-hidden focus:border-emerald-500"
                 >
-                  {fileData.headers.map((h) => {
-                    const sample = getHeaderSampleValue(h);
-                    return (
-                      <option key={h} value={h}>
-                        {h} {sample ? `(ex: ${sample.substring(0, 20)})` : ''}
-                      </option>
-                    );
-                  })}
+                  <option value="">Não mapeada</option>
+                  {fileData.headers.map((h) => (
+                    <option key={h} value={h}>
+                      {h}
+                    </option>
+                  ))}
                 </select>
               </div>
 
-              {/* CNPJ (opcional) */}
+              {/* CNPJ */}
               <div className="space-y-1">
                 <label className="block font-semibold text-slate-700 text-[11px] flex items-center gap-1.5">
                   <Building2 className="w-3 h-3 text-slate-400" />
-                  CNPJ (opcional)
+                  CNPJ
                 </label>
                 <select
                   value={selectedCnpj}
                   onChange={(e) => setSelectedCnpj(e.target.value)}
                   className="w-full p-2 bg-slate-50 border border-slate-300 rounded-xl font-medium text-xs text-slate-900 focus:bg-white focus:outline-hidden focus:border-emerald-500"
                 >
-                  <option value="">(Automático pelo Favorecido)</option>
-                  {fileData.headers.map((h) => {
-                    const sample = getHeaderSampleValue(h);
-                    return (
-                      <option key={h} value={h}>
-                        {h} {sample ? `(ex: ${sample.substring(0, 20)})` : ''}
-                      </option>
-                    );
-                  })}
+                  <option value="">Não mapeada</option>
+                  {fileData.headers.map((h) => (
+                    <option key={h} value={h}>
+                      {h}
+                    </option>
+                  ))}
                 </select>
               </div>
 
-              {/* Situação / Status (opcional) */}
+              {/* Situação / Status */}
               <div className="space-y-1">
                 <label className="block font-semibold text-slate-700 text-[11px] flex items-center gap-1.5">
                   <PieChart className="w-3 h-3 text-slate-400" />
-                  Situação / Status (opcional)
+                  Situação / Status
                 </label>
                 <select
                   value={selectedSituacao}
                   onChange={(e) => setSelectedSituacao(e.target.value)}
                   className="w-full p-2 bg-slate-50 border border-slate-300 rounded-xl font-medium text-xs text-slate-900 focus:bg-white focus:outline-hidden focus:border-emerald-500"
                 >
-                  <option value="">(Não mapeada)</option>
-                  {fileData.headers.map((h) => {
-                    const sample = getHeaderSampleValue(h);
-                    return (
-                      <option key={h} value={h}>
-                        {h} {sample ? `(ex: ${sample.substring(0, 20)})` : ''}
-                      </option>
-                    );
-                  })}
+                  <option value="">Não mapeada</option>
+                  {fileData.headers.map((h) => (
+                    <option key={h} value={h}>
+                      {h}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Natureza da Despesa */}
+              <div className="space-y-1">
+                <label className="block font-semibold text-slate-700 text-[11px] flex items-center gap-1.5">
+                  <FileText className="w-3 h-3 text-slate-400" />
+                  Natureza da Despesa
+                </label>
+                <select
+                  value={selectedNatureza}
+                  onChange={(e) => setSelectedNatureza(e.target.value)}
+                  className="w-full p-2 bg-slate-50 border border-slate-300 rounded-xl font-medium text-xs text-slate-900 focus:bg-white focus:outline-hidden focus:border-violet-500"
+                >
+                  <option value="">Não mapeada</option>
+                  {fileData.headers.map((h) => (
+                    <option key={h} value={h}>
+                      {h}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Fonte de Recursos */}
+              <div className="space-y-1">
+                <label className="block font-semibold text-slate-700 text-[11px] flex items-center gap-1.5">
+                  <Layers className="w-3 h-3 text-slate-400" />
+                  Fonte de Recursos
+                </label>
+                <select
+                  value={selectedFonte}
+                  onChange={(e) => setSelectedFonte(e.target.value)}
+                  className="w-full p-2 bg-slate-50 border border-slate-300 rounded-xl font-medium text-xs text-slate-900 focus:bg-white focus:outline-hidden focus:border-emerald-500"
+                >
+                  <option value="">Não mapeada</option>
+                  {fileData.headers.map((h) => (
+                    <option key={h} value={h}>
+                      {h}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Data de Referência / Pagamento */}
+              <div className="space-y-1">
+                <label className="block font-semibold text-slate-700 text-[11px] flex items-center gap-1.5">
+                  <Calendar className="w-3 h-3 text-slate-400" />
+                  Data de Referência / Pagamento
+                </label>
+                <select
+                  value={selectedData}
+                  onChange={(e) => setSelectedData(e.target.value)}
+                  className="w-full p-2 bg-slate-50 border border-slate-300 rounded-xl font-medium text-xs text-slate-900 focus:bg-white focus:outline-hidden focus:border-emerald-500"
+                >
+                  <option value="">Não mapeada</option>
+                  {fileData.headers.map((h) => (
+                    <option key={h} value={h}>
+                      {h}
+                    </option>
+                  ))}
                 </select>
               </div>
 
@@ -431,7 +552,7 @@ export const ColumnMappingModal: React.FC<ColumnMappingModalProps> = ({
               <div className="font-bold text-slate-800 text-xs">
                 Pré-visualização (1ª linha):
               </div>
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs bg-white p-2.5 rounded-lg border border-slate-200">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs bg-white p-2.5 rounded-lg border border-slate-200">
                 <div>
                   <span className="text-[10px] text-slate-400 font-bold block uppercase">Número:</span>
                   <span className="font-medium text-slate-800 truncate block">{previewRow.numero}</span>
@@ -443,6 +564,14 @@ export const ColumnMappingModal: React.FC<ColumnMappingModalProps> = ({
                 <div>
                   <span className="text-[10px] text-slate-400 font-bold block uppercase">Favorecido:</span>
                   <span className="font-medium text-slate-800 truncate block">{previewRow.favorecido}</span>
+                </div>
+                <div>
+                  <span className="text-[10px] text-slate-400 font-bold block uppercase">Fonte:</span>
+                  <span className="font-medium text-slate-800 truncate block">{previewRow.fonte}</span>
+                </div>
+                <div>
+                  <span className="text-[10px] text-slate-400 font-bold block uppercase">Data:</span>
+                  <span className="font-medium text-slate-800 truncate block">{previewRow.data}</span>
                 </div>
                 <div>
                   <span className="text-[10px] text-slate-400 font-bold block uppercase">Nota Empenho:</span>

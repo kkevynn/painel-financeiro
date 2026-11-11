@@ -14,7 +14,45 @@ export function detectStageFromFileName(fileName: string): StageKey {
     .replace(/\s+/g, ' ')
     .trim();
 
-  // 1. NÃO OBEDECE (Priority check before "obedece")
+  // 0. DETALHAMENTO DE PAGAMENTOS / ORDEM BANCÁRIA (Listar Ordem Bancária)
+  if (
+    normalized.includes('ordem bancaria') ||
+    normalized.includes('ordens bancarias') ||
+    normalized.includes('listar ordem') ||
+    normalized.includes('listar ob') ||
+    normalized.includes('relacao de ob') ||
+    normalized.includes('relatorio ob') ||
+    normalized.includes('relatorio de ob') ||
+    normalized.includes('planilha ob') ||
+    normalized.includes('planilha de ob') ||
+    ((normalized.includes('obs') || normalized.includes('ob')) && normalized.includes('principal')) ||
+    /\bobs?\b/.test(normalized)
+  ) {
+    return 'ordem_bancaria';
+  }
+
+  // 1. NATUREZA DA DESPESA (Priority check for empenho/natureza)
+  if (
+    normalized.includes('natureza') ||
+    normalized.includes('empenho')
+  ) {
+    return 'natureza_despesa';
+  }
+
+  // 1.1 PUBLICAÇÃO / DOE / PARA PUBLICAR
+  if (
+    normalized.includes('publicacao') ||
+    normalized.includes('publicac') ||
+    normalized.includes('publicar') ||
+    normalized.includes('publicado') ||
+    normalized.includes('doe') ||
+    normalized.includes('diario oficial') ||
+    normalized.includes('para publicacao')
+  ) {
+    return 'publicacao';
+  }
+
+  // 2. NÃO OBEDECE (Priority check before "obedece")
   if (
     normalized.includes('nao obedece') ||
     normalized.includes('naoobedece') ||
@@ -42,7 +80,7 @@ export function detectStageFromFileName(fileName: string): StageKey {
     return 'nao_obedece';
   }
 
-  // 2. OBEDECE
+  // 3. OBEDECE
   if (
     normalized.includes('obedece') ||
     normalized.includes('cronologica') ||
@@ -52,7 +90,7 @@ export function detectStageFromFileName(fileName: string): StageKey {
     return 'obedece';
   }
 
-  // 3. BASE DE PPS (including SIGEF reports such as Relatorio_*.xls and payment proposals)
+  // 4. BASE DE PPS (including SIGEF reports such as Relatorio_*.xls and payment proposals)
   if (
     normalized.startsWith('relatorio') ||
     normalized.includes('relatorio') ||
@@ -63,9 +101,6 @@ export function detectStageFromFileName(fileName: string): StageKey {
     normalized.includes('proposta') ||
     normalized.includes('programacao') ||
     normalized.includes('pagamento') ||
-    normalized.includes('ordem bancaria') ||
-    normalized.includes('ordens bancarias') ||
-    normalized.includes('relacao de ob') ||
     normalized.includes('relacao de pp')
   ) {
     return 'base_pps';
@@ -369,8 +404,12 @@ export function isTotalizadorRow(
     favStr.includes('total do credor') ||
     favStr.includes('total da despesa') ||
     favStr.includes('total do elemento') ||
+    favStr.includes('total da celula') ||
+    favStr.includes('total do empenho') ||
     favStr.includes('saldo orcamentario') ||
-    favStr.includes('dotacao orcamentaria')
+    favStr.includes('dotacao orcamentaria') ||
+    favStr.startsWith('celula') ||
+    favStr.startsWith('empenho celula')
   ) {
     return true;
   }
@@ -386,11 +425,17 @@ export function isTotalizadorRow(
       .toLowerCase();
 
     if (
+      s.startsWith('c - cancelada; ap - a pagar') ||
+      s.startsWith('c - cancelada') ||
+      s.startsWith('relatorio emitido em') ||
+      s.startsWith('relatório emitido em') ||
       s === 'total geral' ||
       s.startsWith('total geral') ||
       s.startsWith('total do orgao') ||
       s.startsWith('total da unidade') ||
       s.startsWith('total da despesa') ||
+      s.startsWith('total da celula') ||
+      s.startsWith('total do empenho') ||
       s.startsWith('resumo geral') ||
       s.startsWith('saldo orcamentario') ||
       s.startsWith('dotacao atualizada') ||
@@ -487,6 +532,64 @@ export function isPPProntaAOValida(params: {
   return true;
 }
 
+/**
+ * Identifica se o nome de uma coluna se refere a Fonte de Recursos
+ */
+export function isFonteHeader(headerName: any): boolean {
+  if (!headerName) return false;
+  const norm = String(headerName)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, ' ')
+    .trim();
+  return (
+    norm === 'fonte' ||
+    norm === 'fr' ||
+    norm === 'cod fonte' ||
+    norm === 'cd fonte' ||
+    norm === 'codigo fonte' ||
+    norm === 'fonte recurso' ||
+    norm === 'fonte recursos' ||
+    norm === 'fonte de recurso' ||
+    norm === 'fonte de recursos' ||
+    norm === 'fonte detalhada' ||
+    norm.startsWith('fonte ') ||
+    norm.endsWith(' fonte') ||
+    norm.includes('fonte de recurso') ||
+    norm.includes('fonte de recursos') ||
+    norm.includes('fonte recurso') ||
+    norm.includes('fonte recursos') ||
+    norm.includes('cd fonte') ||
+    norm.includes('cod fonte')
+  );
+}
+
+/**
+ * Identifica categoricamente se um valor representa um código/identificador de Fonte de Recursos
+ * (e.g. 0.6.00.000600, 0.5.00.000500, 0.6.00, 0.5.00, 0.600, 0.500, 0,600, 0,500, 600, 500, 1500, 1600)
+ * para impedir categoricamente que seja interpretado como valor monetário da despesa.
+ */
+export function isFonteString(val: any): boolean {
+  if (val === null || val === undefined) return false;
+  if (typeof val === 'number') {
+    if (val === 600 || val === 500 || val === 1500 || val === 1600 || val === 0.6 || val === 0.5 || val === 100) return true;
+  }
+  const s = String(val).trim().toUpperCase();
+  if (!s || s === '-' || s === '0') return false;
+
+  // Padrões estruturados do SIGEF: 0.6.00.000600, 0.5.00.000500, 0.6.00, 0.5.00, 0.1.00, 1.5.00
+  if (/\b\d\.\s?\d(?:\.\d{2})?(?:\.\d{4,6})?\b/.test(s)) return true;
+  // Padrões como 0.600, 0,600, 0.500, 0,500, 1.500, 1,500, ou 0.6, 0.5, 0,6, 0,5
+  if (/^0?[,\.][56]0{0,3}$/.test(s) || /^1[,\.][56]0{0,3}$/.test(s)) return true;
+  // Códigos de fontes federais e estaduais isolados comuns em planilhas
+  if (/^(?:0500|0600|1500|1600|0100|1000|600|500)$/.test(s)) return true;
+  // Textos explícitos de fontes
+  if (s.startsWith('FONTE') || s.startsWith('FR ') || s.includes('FONTE DE RECURSO') || s.includes('FONTE:') || s.includes('FONTE ')) return true;
+
+  return false;
+}
+
 // Automatically detect Favorecido/Credor, Valor, Situação, PP, OB, Número, Nota Empenho, and Favorecido Nota Empenho columns in a sheet
 export function autoDetectColumns(
   headers: string[],
@@ -495,6 +598,7 @@ export function autoDetectColumns(
   favorecidoCol: string;
   valorCol: string;
   situacaoCol?: string;
+  situacaoObCol?: string;
   ppCol?: string;
   obCol?: string;
   numeroCol?: string;
@@ -503,10 +607,12 @@ export function autoDetectColumns(
   cnpjCol?: string;
   processoCol?: string;
   fonteCol?: string;
+  naturezaCol?: string;
 } {
   let favorecidoCol = '';
   let valorCol = '';
   let situacaoCol = '';
+  let situacaoObCol = '';
   let ppCol = '';
   let obCol = '';
   let numeroCol = '';
@@ -656,38 +762,134 @@ export function autoDetectColumns(
     if (obCol) break;
   }
 
-  // 5. Número / PP (Programação de Pagamento)
-  const numeroKeywords = [
-    'numero pp',
-    'num pp',
-    'n pp',
-    'nr pp',
-    'proposta',
-    'programacao',
-    'programação',
-    'codigo pp',
-    'pp',
-    'numero',
-    'número',
-    'num',
-    'nº',
-  ];
-
-  for (const h of headers) {
-    if (h === obCol || h === notaEmpenhoCol) continue;
-    const norm = normalize(h);
-    for (const kw of numeroKeywords) {
-      if (norm === kw || norm.startsWith(`${kw} `) || norm.endsWith(` ${kw}`) || norm.includes(` ${kw} `)) {
-        numeroCol = h;
-        ppCol = h;
+  // Fallback: scan sample rows for OB pattern \d{4}OB\d+
+  if (!obCol && sampleRows && sampleRows.length > 0) {
+    for (const h of headers) {
+      if (h === favorecidoCol || h === notaEmpenhoCol || h === favorecidoNECol) continue;
+      const count = sampleRows.filter((r) => /\b\d{4}OB\d+\b/i.test(String(r[h] || ''))).length;
+      if (count >= 1) {
+        obCol = h;
         break;
       }
     }
-    if (numeroCol) break;
   }
 
-  // 6. Valor (exact/compound keywords first, avoiding budget/dotacao columns with multi-billion totals)
-  const isBudgetHeader = (norm: string) =>
+  // 5. Número / PP (Programação de Pagamento) / NL (Nota de Liquidação)
+  if (sampleRows && sampleRows.length > 0) {
+    // Check for NL pattern (\d{4}NL\d+ or \d+NL\d+)
+    for (const h of headers) {
+      if (h === obCol || h === favorecidoCol || h === notaEmpenhoCol || h === favorecidoNECol) continue;
+      const nlCount = sampleRows.filter((r) => /\b(?:\d{2,4})?NL[\s\-_]*\d+\b/i.test(String(r[h] || ''))).length;
+      if (nlCount >= 1) {
+        numeroCol = h;
+        break;
+      }
+    }
+
+    // Check for PP pattern (\d{4}PP\d+)
+    for (const h of headers) {
+      if (h === obCol || h === favorecidoCol || h === notaEmpenhoCol || h === favorecidoNECol) continue;
+      const ppCount = sampleRows.filter((r) => /\b\d{4}PP\d+\b/i.test(String(r[h] || ''))).length;
+      if (ppCount >= 1) {
+        ppCol = h;
+        if (!numeroCol) numeroCol = h;
+        break;
+      }
+    }
+  }
+
+  // Step 5b. Header 'numero' / 'num' / 'nº' quando os dados tiverem padrão \d{4}PP\d+ ou \d{4}NL\d+
+  if (!numeroCol && sampleRows && sampleRows.length > 0) {
+    for (const h of headers) {
+      if (h === obCol || h === favorecidoCol || h === notaEmpenhoCol || h === favorecidoNECol) continue;
+      const norm = normalize(h);
+      if (norm === 'numero' || norm === 'num' || norm === 'n' || norm === 'nr' || norm === 'numero doc') {
+        const hasPpData = sampleRows.some((r) => /\b\d{4}PP\d+\b/i.test(String(r[h] || '')));
+        const hasNlData = sampleRows.some((r) => /\b(?:\d{2,4})?NL[\s\-_]*\d+\b/i.test(String(r[h] || '')));
+        if (hasPpData || hasNlData) {
+          numeroCol = h;
+          if (hasPpData && !ppCol) ppCol = h;
+          break;
+        }
+      }
+    }
+  }
+
+  // Step 5c. Specific NL and PP compound keywords
+  if (!numeroCol) {
+    const specificDocKeywords = [
+      'nota de lancamento',
+      'nota lancamento',
+      'preparacao de pagamento',
+      'preparacao pagamento',
+      'prep de pagamento',
+      'prep pagamento',
+      'nota de liquidacao',
+      'nota liquidacao',
+      'numero nl',
+      'num nl',
+      'n nl',
+      'nr nl',
+      'documento habil',
+      'doc habil',
+      'liquidacao',
+      'liquidac',
+      'nl',
+      'numero pp',
+      'num pp',
+      'n pp',
+      'nr pp',
+      'codigo pp',
+      'pp',
+      'proposta',
+      'programacao',
+      'programação',
+    ];
+
+    for (const h of headers) {
+      if (h === obCol || h === notaEmpenhoCol) continue;
+      const norm = normalize(h);
+      for (const kw of specificDocKeywords) {
+        if (norm === kw || norm.startsWith(`${kw} `) || norm.endsWith(` ${kw}`) || norm.includes(` ${kw} `)) {
+          numeroCol = h;
+          if (!ppCol || kw.includes('pp') || kw.includes('preparacao') || kw.includes('prep') || kw.includes('proposta') || kw.includes('programac')) {
+            ppCol = h;
+          }
+          break;
+        }
+      }
+      if (numeroCol) break;
+    }
+  }
+
+  // Step 5c. Generic keywords ('documento', 'processo') but avoid row sequence lines (nº, item, ordem)
+  if (!numeroCol) {
+    const genericKeywords = ['documento', 'doc', 'processo'];
+    for (const h of headers) {
+      if (h === obCol || h === notaEmpenhoCol || h === favorecidoCol) continue;
+      const norm = normalize(h);
+      for (const kw of genericKeywords) {
+        if (norm === kw || norm.startsWith(`${kw} `) || norm.endsWith(` ${kw}`) || norm.includes(` ${kw} `)) {
+          const isRowNumberCol =
+            sampleRows &&
+            sampleRows.length > 0 &&
+            sampleRows.every((r) => {
+              const val = String(r[h] || '').trim();
+              return /^\d{1,4}$/.test(val) && parseInt(val, 10) < 1000;
+            });
+          if (!isRowNumberCol) {
+            numeroCol = h;
+            break;
+          }
+        }
+      }
+      if (numeroCol) break;
+    }
+  }
+
+  // 6. Valor (exact/compound keywords first, avoiding budget/dotacao/fonte columns)
+  const isBudgetOrFonteHeader = (norm: string) =>
+    isFonteHeader(norm) ||
     norm.includes('dotacao') ||
     norm.includes('orcamento') ||
     norm.includes('orcament') ||
@@ -752,7 +954,7 @@ export function autoDetectColumns(
   // First pass: look for explicit compound payment/value columns
   for (const h of headers) {
     const norm = normalize(h);
-    if (isBudgetHeader(norm)) continue;
+    if (isBudgetOrFonteHeader(norm)) continue;
     for (const kw of valorKeywordsPrioritarias) {
       if (norm === kw || norm.startsWith(`${kw} `) || norm.endsWith(` ${kw}`) || norm.includes(` ${kw} `)) {
         valorCol = h;
@@ -762,11 +964,11 @@ export function autoDetectColumns(
     if (valorCol) break;
   }
 
-  // Second pass: if not found, look for general value keywords, strictly avoiding budget columns
+  // Second pass: if not found, look for general value keywords, strictly avoiding budget and fonte columns
   if (!valorCol) {
     for (const h of headers) {
       const norm = normalize(h);
-      if (isBudgetHeader(norm)) continue;
+      if (isBudgetOrFonteHeader(norm)) continue;
       for (const kw of valorKeywordsGerais) {
         if (norm === kw || norm.startsWith(`${kw} `) || norm.endsWith(` ${kw}`) || norm.includes(` ${kw} `)) {
           valorCol = h;
@@ -781,7 +983,7 @@ export function autoDetectColumns(
   if (!valorCol) {
     for (const h of headers) {
       const norm = normalize(h);
-      if (isBudgetHeader(norm)) continue;
+      if (isBudgetOrFonteHeader(norm)) continue;
       for (const kw of [...valorKeywordsPrioritarias, ...valorKeywordsGerais]) {
         if (norm.includes(kw)) {
           valorCol = h;
@@ -793,12 +995,34 @@ export function autoDetectColumns(
   }
 
   // 7. Situação
+  // 7a. Situação da Ordem Bancária (específica de relatórios SIGEF com status da OB)
+  const situacaoObKeywords = [
+    'situacao ob',
+    'situacao da ob',
+    'situacao ordem bancaria',
+    'situacao da ordem bancaria',
+    'status ob',
+    'status da ob',
+    'sit ob',
+    'sigla ob',
+    'fase ob',
+  ];
+  for (const h of headers) {
+    const norm = normalize(h);
+    for (const kw of situacaoObKeywords) {
+      if (norm === kw || norm.startsWith(`${kw} `) || norm.endsWith(` ${kw}`) || norm.includes(` ${kw} `)) {
+        situacaoObCol = h;
+        break;
+      }
+    }
+    if (situacaoObCol) break;
+  }
+
+  // 7b. Situação Geral / Situação da PP
   const situacaoKeywords = [
     'situacao',
     'situacao pp',
-    'situacao ob',
     'situacao da pp',
-    'situacao da ob',
     'situacao do documento',
     'situacao documento',
     'sigla',
@@ -806,16 +1030,18 @@ export function autoDetectColumns(
     'sigla da situacao',
     'status',
     'sit pp',
-    'sit ob',
     'sit',
     'estado',
     'fase',
     'fase pp',
     'fase da pp',
     'fase da despesa',
+    'situacao ob',
+    'situacao da ob',
   ];
 
   for (const h of headers) {
+    if (h === situacaoObCol) continue;
     const norm = normalize(h);
     for (const kw of situacaoKeywords) {
       if (norm === kw || norm.startsWith(`${kw} `) || norm.endsWith(` ${kw}`) || norm.includes(` ${kw} `)) {
@@ -824,6 +1050,9 @@ export function autoDetectColumns(
       }
     }
     if (situacaoCol) break;
+  }
+  if (!situacaoCol && situacaoObCol) {
+    situacaoCol = situacaoObCol;
   }
 
   // 8. CNPJ / CPF do Credor (caso venha em coluna separada do nome)
@@ -869,25 +1098,60 @@ export function autoDetectColumns(
     if (fonteCol) break;
   }
 
+  // 11. Natureza da Despesa
+  let naturezaCol = '';
+  const naturezaKeywords = [
+    'natureza da despesa',
+    'natureza de despesa',
+    'natureza despesa',
+    'natureza',
+    'nat da despesa',
+    'nat despesa',
+    'nat des',
+    'cod natureza',
+    'codigo natureza',
+    'elemento de despesa',
+    'elemento despesa',
+  ];
+  for (const h of headers) {
+    const norm = normalize(h);
+    for (const kw of naturezaKeywords) {
+      if (norm === kw || norm.startsWith(`${kw} `) || norm.endsWith(` ${kw}`) || norm.includes(` ${kw} `)) {
+        naturezaCol = h;
+        break;
+      }
+    }
+    if (naturezaCol) break;
+  }
+
   // Pass 5: Heuristic inspection of data rows if still missing or to verify non-zero values
   if (sampleRows && sampleRows.length > 0) {
     const sample = sampleRows.slice(0, 35);
 
     // Heuristic for situacaoCol if not detected from headers
+    // (no relatório .xls do SIGEF, a última coluna contém a sigla da situação mas o cabeçalho vem em branco, gerando Coluna_7 ou Coluna_14)
     if (!situacaoCol) {
+      const siglaExact = new Set(['AO', 'PPCB', 'PPNC', 'PPRJ', 'CB', 'C', 'AP', 'RJ', 'PAGA']);
+      let bestSitCol = '';
+      let bestSitMatches = 0;
+
       for (const h of headers) {
-        if (h === valorCol || h === favorecidoCol || h === notaEmpenhoCol || h === favorecidoNECol) continue;
-        let aoMatches = 0;
+        if (h === valorCol || h === favorecidoCol || h === notaEmpenhoCol || h === favorecidoNECol || h === obCol || h === ppCol || h === numeroCol) continue;
+        let matches = 0;
         sample.forEach((row) => {
-          const val = row[h];
-          if (isSituacaoAO(val) || isSituacaoEnviadaBanco(val).isEnviada) {
-            aoMatches++;
+          const val = String(row[h] ?? '').trim().toUpperCase();
+          if (siglaExact.has(val) || isSituacaoAO(val) || isSituacaoEnviadaBanco(val).isEnviada) {
+            matches++;
           }
         });
-        if (aoMatches >= 1) {
-          situacaoCol = h;
-          break;
+        if (matches > bestSitMatches && matches >= 1) {
+          bestSitMatches = matches;
+          bestSitCol = h;
         }
+      }
+
+      if (bestSitCol) {
+        situacaoCol = bestSitCol;
       }
     }
 
@@ -896,7 +1160,11 @@ export function autoDetectColumns(
       let bestValCol = '';
       let bestValMatches = 0;
       for (const h of headers) {
-        if (isBudgetHeader(normalize(h))) continue;
+        if (isBudgetOrFonteHeader(normalize(h))) continue;
+        if (h === fonteCol) continue;
+        const isColFonte = sample.some((row) => isFonteString(row[h]));
+        if (isColFonte) continue;
+
         let numCount = 0;
         sample.forEach((row) => {
           const v = parseCurrencyValue(row[h]);
@@ -910,7 +1178,7 @@ export function autoDetectColumns(
       if (bestValCol) valorCol = bestValCol;
     }
 
-    // Smart verification: If valorCol was found but has ONLY 0 in all sample rows,
+    // Smart verification: If valorCol was found but has ONLY 0 in all sample rows (or if it erroneously points to a fonte),
     // check if there's another column that has actual positive amounts (> 0),
     // avoiding the common trap where "Valor Pago = 0,00" overrides "Valor da Liquidação = 45.000,00"
     if (valorCol && sample.length > 0) {
@@ -919,11 +1187,14 @@ export function autoDetectColumns(
         if (parseCurrencyValue(row[valorCol]) > 0) positiveCount++;
       });
 
-      if (positiveCount === 0) {
+      if (positiveCount === 0 || isBudgetOrFonteHeader(normalize(valorCol))) {
         let altValCol = '';
         let altMatches = 0;
         for (const h of headers) {
-          if (h === valorCol || isBudgetHeader(normalize(h))) continue;
+          if (h === valorCol || isBudgetOrFonteHeader(normalize(h)) || h === fonteCol) continue;
+          const isColFonte = sample.some((row) => isFonteString(row[h]));
+          if (isColFonte) continue;
+
           let count = 0;
           sample.forEach((row) => {
             if (parseCurrencyValue(row[h]) > 0) count++;
@@ -961,12 +1232,24 @@ export function autoDetectColumns(
   }
 
   if (!favorecidoCol && headers.length > 0) favorecidoCol = headers[0];
-  if (!valorCol && headers.length > 1) valorCol = headers[1] || headers[0];
+
+  // Verificação de segurança estrita: valorCol NUNCA pode ser coluna de Fonte de Recursos
+  if (valorCol && (isBudgetOrFonteHeader(normalize(valorCol)) || valorCol === fonteCol)) {
+    valorCol = '';
+  }
+
+  if (!valorCol && headers.length > 0) {
+    const safeValHeader = headers.find(
+      (h) => !isBudgetOrFonteHeader(normalize(h)) && h !== fonteCol && h !== favorecidoCol
+    );
+    if (safeValHeader) valorCol = safeValHeader;
+  }
 
   return {
     favorecidoCol,
     valorCol,
     situacaoCol: situacaoCol || undefined,
+    situacaoObCol: situacaoObCol || undefined,
     ppCol: ppCol || undefined,
     obCol: obCol || undefined,
     numeroCol: numeroCol || undefined,
@@ -975,6 +1258,282 @@ export function autoDetectColumns(
     cnpjCol: cnpjCol || undefined,
     processoCol: processoCol || undefined,
     fonteCol: fonteCol || undefined,
+    naturezaCol: naturezaCol || undefined,
+  };
+}
+
+/**
+ * Analyzes file contents (headers and actual row data) specifically tailored for a given classification stage.
+ * Used by ColumnMappingModal whenever the user changes "Classificação no Painel".
+ */
+export function analyzeColumnsForStage(
+  headers: string[],
+  rows?: Record<string, any>[],
+  stage: StageKey = 'outros'
+): {
+  favorecidoCol: string;
+  valorCol: string;
+  situacaoCol?: string;
+  situacaoObCol?: string;
+  ppCol?: string;
+  obCol?: string;
+  numeroCol?: string;
+  notaEmpenhoCol?: string;
+  favorecidoNECol?: string;
+  cnpjCol?: string;
+  processoCol?: string;
+  fonteCol?: string;
+  naturezaCol?: string;
+  dataCol?: string;
+} {
+  // First run the general baseline auto-detection
+  const base = autoDetectColumns(headers, rows);
+  let {
+    favorecidoCol,
+    valorCol,
+    situacaoCol,
+    situacaoObCol,
+    ppCol,
+    obCol,
+    numeroCol,
+    notaEmpenhoCol,
+    favorecidoNECol,
+    cnpjCol,
+    processoCol,
+    fonteCol,
+    naturezaCol,
+  } = base;
+
+  let dataCol: string | undefined = undefined;
+
+  const normalize = (s: string) =>
+    String(s || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, ' ')
+      .trim();
+
+  const sample = (rows || []).slice(0, 40);
+
+  // Scan for dataCol in headers and row contents
+  const dataKeywords = [
+    'data referencia',
+    'data de referencia',
+    'data aceite',
+    'data vencimento',
+    'data emissao',
+    'data de emissao',
+    'data liquidacao',
+    'data de liquidacao',
+    'data pagamento',
+    'data pagto',
+    'data',
+    'dt',
+    'emissao',
+    'referencia',
+  ];
+  for (const h of headers) {
+    const norm = normalize(h);
+    for (const kw of dataKeywords) {
+      if (norm === kw || norm.startsWith(`${kw} `) || norm.endsWith(` ${kw}`) || norm.includes(` ${kw} `) || norm.includes(kw)) {
+        dataCol = h;
+        break;
+      }
+    }
+    if (dataCol) break;
+  }
+  if (!dataCol && sample.length > 0) {
+    for (const h of headers) {
+      if (sample.some((r) => /\b\d{2}\/\d{2}\/\d{4}\b/.test(String(r[h] || '')))) {
+        dataCol = h;
+        break;
+      }
+    }
+  }
+
+  // STAGE SPECIFIC ANALYSIS:
+  if (stage === 'ordem_bancaria') {
+    // 1. OB Column: se stage === 'ordem_bancaria' e o cabeçalho for 'numero', ou se as células tiverem o padrão \d{4}OB\d+, mapeie como obCol
+    for (const h of headers) {
+      const norm = normalize(h);
+      if (norm === 'numero' || norm === 'num' || norm === 'n' || norm === 'ob' || norm.includes('ordem bancaria')) {
+        obCol = h;
+        break;
+      }
+    }
+    if (!obCol || !sample.some((r) => /\b\d{4}OB\d+\b/i.test(String(r[obCol] || '')))) {
+      for (const h of headers) {
+        const matchCount = sample.filter((r) => /\b\d{4}OB\d+\b/i.test(String(r[h] || ''))).length;
+        if (matchCount >= 1) {
+          obCol = h;
+          break;
+        }
+      }
+    }
+    // 2. Fonte Column: Check content for 0.6.xx or .6. or \d\.\d\.\d{2}\.\d{6}
+    for (const h of headers) {
+      const matchCount = sample.filter((r) => {
+        const v = String(r[h] || '');
+        return /\b\d\.\s?\d\.\d{2}\.\d{6}\b/.test(v) || (v.includes('.6.') && !v.includes('/')) || (v.includes('.5.') && !v.includes('/'));
+      }).length;
+      if (matchCount >= 1) {
+        fonteCol = h;
+        break;
+      }
+    }
+    // 3. PP Column: Check content for \d{4}PP\d+
+    for (const h of headers) {
+      const matchCount = sample.filter((r) => /\b\d{4}PP\d+\b/i.test(String(r[h] || ''))).length;
+      if (matchCount >= 1) {
+        ppCol = h;
+        numeroCol = h;
+        break;
+      }
+    }
+    // 4. Favorecido: Check content for CNPJ or Company names (>10 chars, not bank account)
+    for (const h of headers) {
+      if (h === obCol || h === fonteCol || h === ppCol || h === dataCol) continue;
+      const cnpjMatches = sample.filter((r) => /\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}/.test(String(r[h] || ''))).length;
+      if (cnpjMatches >= 1) {
+        favorecidoCol = h;
+        break;
+      }
+    }
+    // 5. Situação: Check for CB, PPCB, RJ, etc.
+    for (const h of headers) {
+      if (h === obCol || h === fonteCol || h === ppCol) continue;
+      const sitMatches = sample.filter((r) => /\b(CB|RJ|PPCB|PPRJ|AO|C|AP|PAGA)\b/i.test(String(r[h] || '').trim())).length;
+      if (sitMatches >= 1) {
+        situacaoCol = h;
+        break;
+      }
+    }
+  } else if (stage === 'base_pps' || stage === 'pp_prontas') {
+    // Base de PPs: Prioritize PP column in headers or content (incluindo preparacao pagamento e preparacao de pagamento)
+    for (const h of headers) {
+      const norm = normalize(h);
+      if (
+        norm === 'pp' ||
+        norm.includes('numero pp') ||
+        norm.includes('preparacao de pagamento') ||
+        norm.includes('preparacao pagamento') ||
+        norm.includes('prep de pagamento') ||
+        norm.includes('prep pagamento') ||
+        norm.includes('programacao') ||
+        norm.includes('proposta')
+      ) {
+        ppCol = h;
+        numeroCol = h;
+        break;
+      }
+    }
+    if (!ppCol && sample.length > 0) {
+      for (const h of headers) {
+        if (sample.some((r) => /\b\d{4}PP\d+\b/i.test(String(r[h] || '')))) {
+          ppCol = h;
+          numeroCol = h;
+          break;
+        }
+      }
+    }
+
+    // In Base de PPs, ALSO actively detect the OB column if present in the SIGEF spreadsheet
+    if (!obCol) {
+      for (const h of headers) {
+        const norm = normalize(h);
+        if (norm === 'ob' || norm.includes('ordem bancaria') || norm.includes('numero ob') || norm.includes('n ob') || norm.includes('doc pagamento')) {
+          obCol = h;
+          break;
+        }
+      }
+    }
+    if (!obCol && sample.length > 0) {
+      for (const h of headers) {
+        if (sample.some((r) => /\b\d{4}OB\d+\b/i.test(String(r[h] || '')))) {
+          obCol = h;
+          break;
+        }
+      }
+    }
+
+    // Situação da OB específica no relatório de PP
+    for (const h of headers) {
+      const norm = normalize(h);
+      if (
+        norm.includes('situacao ob') ||
+        norm.includes('situacao da ob') ||
+        norm.includes('status ob') ||
+        norm.includes('sit ob')
+      ) {
+        situacaoObCol = h;
+        break;
+      }
+    }
+
+    // Situação geral / Situação da PP
+    for (const h of headers) {
+      if (h === situacaoObCol) continue;
+      const norm = normalize(h);
+      if (norm.includes('situacao') || norm.includes('status') || norm.includes('sigla')) {
+        situacaoCol = h;
+        break;
+      }
+    }
+    if (!situacaoCol && situacaoObCol) {
+      situacaoCol = situacaoObCol;
+    }
+  } else if (stage === 'obedece' || stage === 'nao_obedece') {
+    // Liquidação: Prioritize "valor da liquidacao" or "saldo a liquidar"
+    for (const h of headers) {
+      const norm = normalize(h);
+      if (norm.includes('liquidacao') && norm.includes('valor')) {
+        valorCol = h;
+        break;
+      }
+    }
+    // Número da liquidação / processo
+    for (const h of headers) {
+      const norm = normalize(h);
+      if (norm.includes('liquidacao') || norm.includes('nl') || norm.includes('documento')) {
+        numeroCol = h;
+        break;
+      }
+    }
+  } else if (stage === 'natureza_despesa') {
+    // Natureza: Look for natureza column in headers or 3.3.90... / 3390... in content
+    for (const h of headers) {
+      const norm = normalize(h);
+      if (norm.includes('natureza') || norm.includes('elemento')) {
+        naturezaCol = h;
+        break;
+      }
+    }
+    if (!naturezaCol && sample.length > 0) {
+      for (const h of headers) {
+        if (sample.some((r) => /\b3\.\d\.\d{2}\.\d{2}\b|\b3390\d+\b/.test(String(r[h] || '')))) {
+          naturezaCol = h;
+          break;
+        }
+      }
+    }
+  }
+
+  return {
+    favorecidoCol: favorecidoCol || headers[0] || '',
+    valorCol: valorCol || headers[1] || headers[0] || '',
+    situacaoCol: situacaoCol || undefined,
+    situacaoObCol: situacaoObCol || undefined,
+    ppCol: ppCol || undefined,
+    obCol: obCol || undefined,
+    numeroCol: numeroCol || undefined,
+    notaEmpenhoCol: notaEmpenhoCol || undefined,
+    favorecidoNECol: favorecidoNECol || undefined,
+    cnpjCol: cnpjCol || undefined,
+    processoCol: processoCol || undefined,
+    fonteCol: fonteCol || undefined,
+    naturezaCol: naturezaCol || undefined,
+    dataCol: dataCol || undefined,
   };
 }
 
@@ -1189,8 +1748,62 @@ export function isSigefPageOrAdministrativeRow(row: any[]): boolean {
   return false;
 }
 
-// Universal, high-performance spreadsheet and matrix reader (optimized for large files)
-export async function readSpreadsheetAsMatrix(file: File): Promise<any[][]> {
+export interface RawSheetResult {
+  sheetName: string;
+  matrix: any[][];
+  stage: StageKey;
+}
+
+function cleanAndFilterMatrix(rawRows: any[][]): any[][] {
+  let cleanMatrix = rawRows.filter((row) => {
+    if (!Array.isArray(row)) return false;
+    const nonEmpty = row.filter((c) => c !== null && c !== undefined && String(c).trim() !== '');
+    if (nonEmpty.length === 0) return false;
+    if (isSigefPageOrAdministrativeRow(row)) return false;
+    return true;
+  });
+  cleanMatrix = removeEmptyColumnsFromMatrix(cleanMatrix);
+  return cleanMatrix;
+}
+
+/**
+ * Verifica com rigor se uma linha é de fato um cabeçalho repetido da planilha,
+ * evitando descartar linhas de dados legítimas que começam com 2025PP... ou 2025OB...
+ */
+function isSheetHeaderRow(row: any[]): boolean {
+  if (!Array.isArray(row) || row.length === 0) return false;
+
+  const hasDataCodes = row.some((c) => {
+    const s = String(c ?? '').trim();
+    return (
+      /\b\d{2,4}(?:PP|OB|NL|NE|OP)\d+\b/i.test(s) ||
+      /^\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}$/.test(s) ||
+      /^\d{3}\.\d{3}\.\d{3}-\d{2}$/.test(s)
+    );
+  });
+  if (hasDataCodes) return false;
+
+  const cleanTexts = row.map((c) =>
+    String(c ?? '')
+      .trim()
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+  );
+
+  const hasFavCol = cleanTexts.some(
+    (c) => c === 'favorecido' || c === 'credor' || c === 'fornecedor' || c === 'interessado' || c.startsWith('favorecido ')
+  );
+  const hasValCol = cleanTexts.some((c) => c === 'valor' || c === 'vlr' || c.startsWith('valor ') || c === 'total');
+  const hasDocCol = cleanTexts.some(
+    (c) => c === 'numero' || c === 'pp' || c === 'ob' || c === 'nl' || c === 'ne' || c === 'nota empenho' || c.includes('preparacao')
+  );
+
+  return (hasFavCol && (hasValCol || hasDocCol)) || (hasDocCol && hasValCol);
+}
+
+// Reads all sheets from a spreadsheet, segregating pages with distinct stages (e.g. "Obedece - DD/MM" and "Não Obedece - DD/MM")
+export async function readSpreadsheetSheets(file: File): Promise<RawSheetResult[]> {
   const lowerName = file.name.toLowerCase();
 
   // 1. Friendly check for PDF or Image
@@ -1236,9 +1849,7 @@ export async function readSpreadsheetAsMatrix(file: File): Promise<any[][]> {
           file.type.includes('text/csv') ||
           file.type.includes('text/plain');
 
-        let matrix: any[][] = [];
-
-        // Fast path for CSV/TSV/TXT (orders of magnitude faster than SheetJS for large files)
+        // Fast path for CSV/TSV/TXT
         if (isCsvOrText && !isZip && !isOle) {
           let text = '';
           try {
@@ -1256,10 +1867,17 @@ export async function readSpreadsheetAsMatrix(file: File): Promise<any[][]> {
             }
           }
 
-          matrix = parseDelimitedText(text);
-          if (matrix.length > 0) {
-            resolve(fixDelimitedColumnsIfNeeded(matrix));
-            return;
+          const parsed = parseDelimitedText(text);
+          if (parsed.length > 0) {
+            const matrix = cleanAndFilterMatrix(fixDelimitedColumnsIfNeeded(parsed));
+            if (matrix.length > 0) {
+              resolve([{
+                sheetName: file.name,
+                matrix,
+                stage: detectStageFromFileName(file.name),
+              }]);
+              return;
+            }
           }
         }
 
@@ -1268,12 +1886,12 @@ export async function readSpreadsheetAsMatrix(file: File): Promise<any[][]> {
         try {
           workbook = XLSX.read(uint8, {
             type: 'array',
-            dense: true,        // Uses array-of-arrays internally: saves ~85% RAM on large files!
-            cellFormula: false, // Don't parse formulas
-            cellHTML: false,    // Don't format HTML
-            cellStyles: false,  // Don't parse styles
-            cellText: false,    // Don't format text strings for every cell
-            raw: true,          // Direct raw primitive values
+            dense: true,
+            cellFormula: false,
+            cellHTML: false,
+            cellStyles: false,
+            cellText: false,
+            raw: true,
             codepage: 1252,
           });
         } catch {
@@ -1281,8 +1899,7 @@ export async function readSpreadsheetAsMatrix(file: File): Promise<any[][]> {
         }
 
         if (workbook && workbook.SheetNames && workbook.SheetNames.length > 0) {
-          // Process all sheets in multi-page workbooks (e.g. daily SIGEF runs spanning multiple pages)
-          const combinedRows: any[][] = [];
+          const sheetItems: { name: string; rows: any[][]; stage: StageKey }[] = [];
 
           for (const sName of workbook.SheetNames) {
             const ws = workbook.Sheets[sName];
@@ -1300,111 +1917,264 @@ export async function readSpreadsheetAsMatrix(file: File): Promise<any[][]> {
               );
               if (cleanSheetRows.length === 0) continue;
 
-              if (combinedRows.length === 0) {
-                combinedRows.push(...cleanSheetRows);
-              } else {
-                // If subsequent sheet/page repeats the header row, skip its first row
-                const firstRow = cleanSheetRows[0] || [];
-                const isRepeatedHeader = Array.isArray(firstRow) && firstRow.some((c) => {
-                  const s = String(c || '').toLowerCase().trim();
-                  return s.includes('favorecido') || s.includes('credor') || s.includes('valor') || s === 'ob' || s === 'pp' || s.includes('empenho');
-                });
-                const rowsToAdd = isRepeatedHeader ? cleanSheetRows.slice(1) : cleanSheetRows;
-                combinedRows.push(...rowsToAdd);
-              }
+              const detected = detectStageFromFileName(sName);
+              sheetItems.push({
+                name: sName,
+                rows: cleanSheetRows,
+                stage: detected,
+              });
             } catch {
               // ignore sheet read error
             }
           }
 
-          if (combinedRows.length > 0) {
-            matrix = combinedRows;
-          }
-        }
+          // Check for distinct functional stages across sheets
+          // (e.g. "Processamento de dados" having "Obedece - DD/MM" and "Não Obedece - DD/MM")
+          const isProcessamentoDeDados =
+            lowerName.includes('processamento') && lowerName.includes('dados');
 
-        // Strategy B: For non-binary files (e.g. HTML tables or XML disguised as .xls)
-        if ((!matrix || matrix.length === 0) && !isZip && !isOle) {
-          let text = '';
-          try {
-            text = new TextDecoder('utf-8', { fatal: false }).decode(uint8);
-          } catch {
-            text = new TextDecoder('iso-8859-1').decode(uint8);
-          }
+          const hasDistinctStages =
+            sheetItems.length > 1 &&
+            (sheetItems.some((s) => s.stage === 'obedece') || sheetItems.some((s) => s.name.toLowerCase().includes('obedece'))) &&
+            (sheetItems.some((s) => s.stage === 'nao_obedece') || sheetItems.some((s) => s.name.toLowerCase().includes('nao') || s.name.toLowerCase().includes('não')));
 
-          if (text.includes('\uFFFD') || (text.includes('Ã') && !text.includes('ão') && !text.includes('ões'))) {
-            try {
-              const textLatin1 = new TextDecoder('iso-8859-1').decode(uint8);
-              if (textLatin1 && textLatin1.length > 0) text = textLatin1;
-            } catch {
-              // ignore
-            }
-          }
+          const hasMultipleKnownStages =
+            sheetItems.length > 1 &&
+            new Set(sheetItems.map((s) => s.stage).filter((st) => st !== 'outros')).size > 1;
 
-          const lowerText = text.toLowerCase();
+          if (isProcessamentoDeDados) {
+            // STRICT FILTER FOR "Processamento de dados":
+            // The user explicitly stated that this workbook only contains two relevant liquidation pages:
+            // "Obedece - DD/MM" and "Não Obedece - DD/MM".
+            // All other auxiliary or unrequested sheets in this file must be completely ignored.
+            const obedeceCandidates = sheetItems.filter((s) => {
+              const sn = s.name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+              return sn.includes('obedece') && !sn.includes('nao');
+            });
 
-          // HTML Table check (common in public finance system exports)
-          if (lowerText.includes('<table') || lowerText.includes('<tr')) {
-            const htmlRows = parseHtmlTableFast(text);
-            if (htmlRows.length > 0) {
-              matrix = htmlRows;
-            }
-          }
+            const naoObedeceCandidates = sheetItems.filter((s) => {
+              const sn = s.name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+              return sn.includes('nao obedece') || (sn.includes('nao') && sn.includes('obedec'));
+            });
 
-          // XML Spreadsheet 2003 check
-          if (matrix.length === 0 && (lowerText.includes('<?xml') || lowerText.includes('<workbook'))) {
-            try {
-              const parser = new DOMParser();
-              const doc = parser.parseFromString(text, 'application/xml');
-              const rows = doc.querySelectorAll('Row');
-              if (rows.length > 0) {
-                const xmlMatrix: any[][] = [];
-                rows.forEach((r) => {
-                  const rowData: any[] = [];
-                  r.querySelectorAll('Cell').forEach((c) => {
-                    const dataElem = c.querySelector('Data');
-                    rowData.push((dataElem ? dataElem.textContent : c.textContent) || '');
-                  });
-                  if (rowData.some((cell) => cell.trim() !== '')) {
-                    xmlMatrix.push(rowData);
-                  }
+            // If there are multiple date versions, pick the most recent one (last in list)
+            const selectedObedece = obedeceCandidates[obedeceCandidates.length - 1];
+            const selectedNaoObedece = naoObedeceCandidates[naoObedeceCandidates.length - 1];
+
+            const results: RawSheetResult[] = [];
+            if (selectedObedece) {
+              const cleanMatrix = cleanAndFilterMatrix(selectedObedece.rows);
+              if (cleanMatrix.length > 0) {
+                results.push({
+                  sheetName: selectedObedece.name,
+                  matrix: cleanMatrix,
+                  stage: 'obedece',
                 });
-                if (xmlMatrix.length > 0) matrix = xmlMatrix;
               }
-            } catch (errXml) {
-              console.warn('Falha ao processar XML Spreadsheet:', errXml);
+            }
+
+            if (selectedNaoObedece) {
+              const cleanMatrix = cleanAndFilterMatrix(selectedNaoObedece.rows);
+              if (cleanMatrix.length > 0) {
+                results.push({
+                  sheetName: selectedNaoObedece.name,
+                  matrix: cleanMatrix,
+                  stage: 'nao_obedece',
+                });
+              }
+            }
+
+            if (results.length > 0) {
+              resolve(results);
+              return;
             }
           }
 
-          // Fallback: delimited text parser
-          if (matrix.length === 0 && text.trim().length > 0) {
-            matrix = parseDelimitedText(text);
+          // STRICT FILTER FOR "OBs - sigef - Principal":
+          // The user explicitly stated: "leia a planilha nomeada: 'OBs - sigef - Principal' na pagina 'dados ajustados' outras paginas fora essa nao deve ser analisada"
+          // "leia tambem apenas as informações que sao necessárias para o app para que nao haja soma de valores que nao são necessários"
+          const isObsSigefPrincipal =
+            (lowerName.includes('obs') || lowerName.includes('ob')) &&
+            lowerName.includes('sigef') &&
+            lowerName.includes('principal');
+
+          if (isObsSigefPrincipal) {
+            const dadosAjustadosSheet = sheetItems.find((s) => {
+              const sn = s.name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+              return sn.includes('dados') && sn.includes('ajustad');
+            });
+
+            if (dadosAjustadosSheet) {
+              const cleanMatrix = cleanAndFilterMatrix(dadosAjustadosSheet.rows);
+              if (cleanMatrix.length > 0) {
+                resolve([{
+                  sheetName: `${file.name} - ${dadosAjustadosSheet.name}`,
+                  matrix: cleanMatrix,
+                  stage: 'ordem_bancaria',
+                }]);
+                return;
+              }
+            }
+          }
+
+          if (hasDistinctStages || hasMultipleKnownStages) {
+            const stageGroups: Record<string, { sheetName: string; rows: any[][]; stage: StageKey }> = {};
+
+            sheetItems.forEach((item) => {
+              let finalStage = item.stage;
+              const sn = item.name.toLowerCase();
+
+              if (finalStage === 'outros') {
+                if (sn.includes('nao') || sn.includes('não')) {
+                  finalStage = 'nao_obedece';
+                } else if (sn.includes('obedece')) {
+                  finalStage = 'obedece';
+                }
+              }
+
+              const groupKey = finalStage !== 'outros' ? `${finalStage}_${item.name}` : item.name;
+
+              if (!stageGroups[groupKey]) {
+                stageGroups[groupKey] = {
+                  sheetName: item.name,
+                  rows: [...item.rows],
+                  stage: finalStage,
+                };
+              } else {
+                const existing = stageGroups[groupKey];
+                let headerRowIdx = -1;
+                for (let r = 0; r < Math.min(item.rows.length, 5); r++) {
+                  if (isSheetHeaderRow(item.rows[r])) {
+                    headerRowIdx = r;
+                    break;
+                  }
+                }
+                const rowsToAdd = headerRowIdx >= 0 ? item.rows.slice(headerRowIdx + 1) : item.rows;
+                existing.rows.push(...rowsToAdd);
+              }
+            });
+
+            const results: RawSheetResult[] = [];
+            for (const g of Object.values(stageGroups)) {
+              const cleanMatrix = cleanAndFilterMatrix(g.rows);
+              if (cleanMatrix.length > 0) {
+                results.push({
+                  sheetName: g.sheetName,
+                  matrix: cleanMatrix,
+                  stage: g.stage,
+                });
+              }
+            }
+
+            if (results.length > 0) {
+              resolve(results);
+              return;
+            }
+          }
+
+          // Default fallback: combine pages as continuation rows of the same single report
+          // (ex: Sheet1, Sheet2, Sheet3 no relatório .xls do SIGEF onde apenas a primeira aba tem cabeçalho)
+          const combinedRows: any[][] = [];
+          for (const item of sheetItems) {
+            if (combinedRows.length === 0) {
+              combinedRows.push(...item.rows);
+            } else {
+              // Verifica se a aba de continuação repete o cabeçalho
+              let headerRowIdx = -1;
+              for (let r = 0; r < Math.min(item.rows.length, 5); r++) {
+                if (isSheetHeaderRow(item.rows[r])) {
+                  headerRowIdx = r;
+                  break;
+                }
+              }
+
+              // Se a aba de continuação não possui cabeçalho (caso do Sheet2/Sheet3 do SIGEF),
+              // inclui todas as linhas a partir do índice 0 sem perder nenhum registro de dados
+              const rowsToAdd = headerRowIdx >= 0
+                ? item.rows.slice(headerRowIdx + 1)
+                : item.rows;
+              combinedRows.push(...rowsToAdd);
+            }
+          }
+
+          if (combinedRows.length > 0) {
+            const cleanMatrix = cleanAndFilterMatrix(combinedRows);
+            if (cleanMatrix.length > 0) {
+              resolve([{
+                sheetName: file.name,
+                matrix: cleanMatrix,
+                stage: detectStageFromFileName(file.name),
+              }]);
+              return;
+            }
           }
         }
 
-        // Post-processing: fix un-split columns if needed
-        if (matrix.length > 0) {
-          matrix = fixDelimitedColumnsIfNeeded(matrix);
+        // Strategy B: For non-binary files (HTML tables or XML disguised as .xls)
+        let text = '';
+        try {
+          text = new TextDecoder('utf-8', { fatal: false }).decode(uint8);
+        } catch {
+          text = new TextDecoder('iso-8859-1').decode(uint8);
         }
 
-        // 1. Filter out completely blank lines and administrative page break lines
-        let cleanMatrix = matrix.filter((row) => {
-          if (!Array.isArray(row)) return false;
-          const nonEmpty = row.filter((c) => c !== null && c !== undefined && String(c).trim() !== '');
-          if (nonEmpty.length === 0) return false;
-          if (isSigefPageOrAdministrativeRow(row)) return false;
-          return true;
-        });
-
-        // 2. Remove entirely empty columns
-        cleanMatrix = removeEmptyColumnsFromMatrix(cleanMatrix);
-
-        if (cleanMatrix.length === 0) {
-          throw new Error(
-            'A planilha inserida não contém linhas ou dados válidos. Verifique se o arquivo possui conteúdo ou tente exportá-lo novamente.'
-          );
+        if (text.includes('\uFFFD') || (text.includes('Ã') && !text.includes('ão') && !text.includes('ões'))) {
+          try {
+            const textLatin1 = new TextDecoder('iso-8859-1').decode(uint8);
+            if (textLatin1 && textLatin1.length > 0) text = textLatin1;
+          } catch {
+            // ignore
+          }
         }
 
-        resolve(cleanMatrix);
+        const lowerText = text.toLowerCase();
+        let htmlOrXmlMatrix: any[][] = [];
+
+        if (lowerText.includes('<table') || lowerText.includes('<tr')) {
+          htmlOrXmlMatrix = parseHtmlTableFast(text);
+        }
+
+        if (htmlOrXmlMatrix.length === 0 && (lowerText.includes('<?xml') || lowerText.includes('<workbook'))) {
+          try {
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(text, 'application/xml');
+            const rows = doc.querySelectorAll('Row');
+            if (rows.length > 0) {
+              const xmlMatrix: any[][] = [];
+              rows.forEach((r) => {
+                const rowData: any[] = [];
+                r.querySelectorAll('Cell').forEach((c) => {
+                  const dataElem = c.querySelector('Data');
+                  rowData.push((dataElem ? dataElem.textContent : c.textContent) || '');
+                });
+                if (rowData.some((cell) => cell.trim() !== '')) {
+                  xmlMatrix.push(rowData);
+                }
+              });
+              if (xmlMatrix.length > 0) htmlOrXmlMatrix = xmlMatrix;
+            }
+          } catch (errXml) {
+            console.warn('Falha ao processar XML Spreadsheet:', errXml);
+          }
+        }
+
+        if (htmlOrXmlMatrix.length === 0 && text.trim().length > 0) {
+          htmlOrXmlMatrix = parseDelimitedText(text);
+        }
+
+        if (htmlOrXmlMatrix.length > 0) {
+          const cleanMatrix = cleanAndFilterMatrix(fixDelimitedColumnsIfNeeded(htmlOrXmlMatrix));
+          if (cleanMatrix.length > 0) {
+            resolve([{
+              sheetName: file.name,
+              matrix: cleanMatrix,
+              stage: detectStageFromFileName(file.name),
+            }]);
+            return;
+          }
+        }
+
+        throw new Error('A planilha inserida não contém linhas ou dados válidos. Verifique se o arquivo possui conteúdo.');
       } catch (err: any) {
         reject(err);
       }
@@ -1414,6 +2184,12 @@ export async function readSpreadsheetAsMatrix(file: File): Promise<any[][]> {
       reject(new Error('Erro de I/O ao ler o arquivo selecionado no disco. Verifique as permissões.'));
     reader.readAsArrayBuffer(file);
   });
+}
+
+// Universal, high-performance spreadsheet and matrix reader (optimized for large files)
+export async function readSpreadsheetAsMatrix(file: File): Promise<any[][]> {
+  const sheets = await readSpreadsheetSheets(file);
+  return sheets[0]?.matrix || [];
 }
 
 export function cleanDigits(val: any): string {
@@ -1497,9 +2273,15 @@ export function parseFavorecidoField(rawInput: any): { cnpj: string; name: strin
   };
 }
 
-// Parse Excel (.xlsx/.xls/.ods) or CSV/TSV/TXT file in browser
-export async function parseExcelFile(file: File): Promise<FileData> {
-  const matrix = await readSpreadsheetAsMatrix(file);
+// Converts an in-memory 2D matrix (from any spreadsheet sheet or CSV) into FileData
+export function parseMatrixToFileData(
+  matrix: any[][],
+  fileName: string,
+  forcedStage?: StageKey
+): FileData {
+  if (!matrix || matrix.length === 0) {
+    throw new Error(`A planilha "${fileName}" não possui linhas de dados.`);
+  }
 
   // Search for the header row in the first 35 rows
   let bestHeaderRowIndex = -1;
@@ -1531,6 +2313,7 @@ export async function parseExcelFile(file: File): Promise<FileData> {
     'pp',
     'ob',
     'op',
+    'nl',
     'situacao',
     'sigla',
     'status',
@@ -1621,10 +2404,21 @@ export async function parseExcelFile(file: File): Promise<FileData> {
     if (!Array.isArray(row) || row.length === 0) continue;
 
     // Check if this row is a repeated table header row (common in multi-page SIGEF exports)
-    const isRepeatedHeader = row.some((cell) => {
-      const s = String(cell || '').toLowerCase().trim();
-      return (s === 'favorecido' || s === 'credor') && row.some((c2) => String(c2 || '').toLowerCase().includes('valor'));
-    });
+    const isRepeatedHeader =
+      row.some((cell) => {
+        const s = String(cell || '').toLowerCase().trim();
+        return (
+          (s === 'favorecido' || s === 'credor' || s === 'fornecedor') &&
+          row.some((c2) => {
+            const s2 = String(c2 || '').toLowerCase();
+            return s2.includes('valor') || s2.includes('vlr') || s2 === 'ob' || s2 === 'pp';
+          })
+        );
+      }) ||
+      row.some((cell) => {
+        const s = String(cell || '').toLowerCase().trim();
+        return (s === 'pp' || s.includes('numero pp')) && row.some((c2) => String(c2 || '').toLowerCase().includes('situacao'));
+      });
     if (isRepeatedHeader) continue;
 
     const rowObj: Record<string, any> = {};
@@ -1637,34 +2431,38 @@ export async function parseExcelFile(file: File): Promise<FileData> {
       }
     });
 
-    const isTotalOrSummaryRow = row.some((cell) => {
-      if (cell === null || cell === undefined) return false;
-      const s = String(cell)
-        .normalize('NFD')
-        .replace(/[\u0300-\u036f]/g, '')
-        .trim()
-        .toLowerCase();
-      return (
-        s === 'total' ||
-        s === 'subtotal' ||
-        s === 'total geral' ||
-        s.startsWith('total geral') ||
-        s.startsWith('total do orgao') ||
-        s.startsWith('total da unidade') ||
-        s.startsWith('total da despesa') ||
-        s.startsWith('total do elemento') ||
-        s.startsWith('total da fonte') ||
-        s.startsWith('resumo geral') ||
-        s.startsWith('saldo orcamentario') ||
-        s.startsWith('dotacao orcamentaria') ||
-        s.startsWith('dotacao atualizada') ||
-        s.startsWith('quantidade de') ||
-        s.startsWith('emitido em') ||
-        s.startsWith('pagina') ||
-        s.startsWith('relatorio') ||
-        s.startsWith('sigef')
-      );
-    });
+    const isTotalOrSummaryRow =
+      isSigefPageOrAdministrativeRow(row) ||
+      row.some((cell) => {
+        if (cell === null || cell === undefined) return false;
+        const s = String(cell)
+          .normalize('NFD')
+          .replace(/[\u0300-\u036f]/g, '')
+          .trim()
+          .toLowerCase();
+        return (
+          s.startsWith('c - cancelada; ap - a pagar') ||
+          s.startsWith('c - cancelada') ||
+          s.startsWith('relatorio emitido em') ||
+          s.startsWith('relatório emitido em') ||
+          s === 'total' ||
+          s === 'subtotal' ||
+          s === 'total geral' ||
+          s.startsWith('total geral') ||
+          s.startsWith('total do orgao') ||
+          s.startsWith('total da unidade') ||
+          s.startsWith('total da despesa') ||
+          s.startsWith('total do elemento') ||
+          s.startsWith('total da fonte') ||
+          s.startsWith('total da celula') ||
+          s.startsWith('total do empenho') ||
+          s.startsWith('resumo geral') ||
+          s.startsWith('saldo orcamentario') ||
+          s.startsWith('dotacao orcamentaria') ||
+          s.startsWith('dotacao atualizada') ||
+          s.startsWith('quantidade de')
+        );
+      });
 
     if (hasAnyData && !isTotalOrSummaryRow) {
       jsonRows.push(rowObj);
@@ -1672,13 +2470,14 @@ export async function parseExcelFile(file: File): Promise<FileData> {
   }
 
   if (jsonRows.length === 0) {
-    throw new Error('A planilha selecionada não possui registros de dados válidos após o cabeçalho.');
+    throw new Error(`A planilha "${fileName}" não possui registros de dados válidos após o cabeçalho.`);
   }
 
   const {
     favorecidoCol,
     valorCol,
     situacaoCol,
+    situacaoObCol,
     ppCol,
     obCol,
     numeroCol,
@@ -1687,16 +2486,50 @@ export async function parseExcelFile(file: File): Promise<FileData> {
     cnpjCol,
     processoCol,
     fonteCol,
+    naturezaCol,
   } = autoDetectColumns(headers, jsonRows);
+
+  let autoStage: StageKey = forcedStage || detectStageFromFileName(fileName);
+  if (autoStage === 'outros') {
+    const hasObRows = jsonRows.slice(0, 30).some((r) =>
+      Object.values(r).some((v) => /\b\d{4}OB\d+\b/i.test(String(v || '')))
+    );
+    if (hasObRows || (obCol && fonteCol)) {
+      autoStage = 'ordem_bancaria';
+    }
+  }
+
+  // Filtro estrito de subtotais ocultos do SIGEF (base_pps ou relatórios com colunas de PP/OB/Nota Empenho)
+  const isBasePpsOrHasCols = autoStage === 'base_pps' || !!(ppCol || obCol || notaEmpenhoCol);
+  let finalRows = jsonRows;
+  if (isBasePpsOrHasCols) {
+    finalRows = jsonRows.filter((r) => {
+      const rawPp = ppCol ? String(r[ppCol] ?? '').trim() : '';
+      const rawNum = numeroCol ? String(r[numeroCol] ?? '').trim() : '';
+      const rawOb = obCol ? String(r[obCol] ?? '').trim() : '';
+      const rawNe = notaEmpenhoCol ? String(r[notaEmpenhoCol] ?? '').trim() : '';
+
+      // Descartar imediatamente se tanto Número (PP) quanto a OB estiverem vazios
+      if (!rawPp && !rawNum && !rawOb) {
+        return false;
+      }
+      // Descartar se a coluna Nota Empenho contiver apenas os 4 dígitos de um ano (ex: 2025, 2026)
+      if (rawNe && /^\d{4}$/.test(rawNe)) {
+        return false;
+      }
+      return true;
+    });
+  }
 
   return {
     id: `file_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-    fileName: file.name,
+    fileName,
     headers,
-    rows: jsonRows,
+    rows: finalRows,
     detectedFavorecidoCol: favorecidoCol,
     detectedValorCol: valorCol,
     detectedSituacaoCol: situacaoCol,
+    detectedSituacaoObCol: situacaoObCol || undefined,
     detectedPpCol: ppCol || numeroCol,
     detectedObCol: obCol,
     detectedNumeroCol: numeroCol,
@@ -1705,8 +2538,58 @@ export async function parseExcelFile(file: File): Promise<FileData> {
     detectedCnpjCol: cnpjCol,
     detectedProcessoCol: processoCol,
     detectedFonteCol: fonteCol,
-    totalCount: jsonRows.length,
+    detectedNaturezaCol: naturezaCol,
+    stage: autoStage,
+    totalCount: finalRows.length,
   };
+}
+
+// Parses workbook, extracting distinct pages with their individual stages (e.g. "Obedece - DD/MM" and "Não Obedece - DD/MM" from "Processamento de dados")
+export async function parseWorkbookIntoFileDatas(
+  file: File,
+  fallbackStage?: StageKey
+): Promise<FileData[]> {
+  const rawSheets = await readSpreadsheetSheets(file);
+  if (!rawSheets || rawSheets.length === 0) {
+    throw new Error('A planilha selecionada está vazia ou não contém dados legíveis.');
+  }
+
+  const cleanBaseName = file.name.replace(/\.[^/.]+$/, '').trim();
+  const fileExt = (file.name.match(/\.[^/.]+$/) || ['.xlsx'])[0];
+
+  const parsedFiles: FileData[] = [];
+
+  for (const s of rawSheets) {
+    // When file contains multiple distinct pages, name them clearly, e.g. "Processamento de dados - Obedece - 06/11.xlsx"
+    const finalFileName =
+      rawSheets.length === 1
+        ? file.name
+        : `${cleanBaseName} - ${s.sheetName}${fileExt}`;
+
+    const effectiveStage =
+      s.stage !== 'outros'
+        ? s.stage
+        : fallbackStage || detectStageFromFileName(finalFileName);
+
+    try {
+      const fileData = parseMatrixToFileData(s.matrix, finalFileName, effectiveStage);
+      parsedFiles.push(fileData);
+    } catch (err: any) {
+      console.warn(`Aviso ao processar aba "${s.sheetName}" de "${file.name}":`, err?.message || err);
+    }
+  }
+
+  if (parsedFiles.length === 0) {
+    throw new Error(`Nenhum registro válido pôde ser extraído de "${file.name}".`);
+  }
+
+  return parsedFiles;
+}
+
+// Parse Excel (.xlsx/.xls/.ods) or CSV/TSV/TXT file in browser
+export async function parseExcelFile(file: File): Promise<FileData> {
+  const list = await parseWorkbookIntoFileDatas(file);
+  return list[0];
 }
 
 // Consolidate data from all uploaded files into supplier list
@@ -1728,21 +2611,44 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
     };
   }
 
-  const supplierMap: Record<string, ConsolidatedSupplier> = {};
-  let grandTotalValue = 0;
-  let grandTotalCount = 0;
+  // Canonical transaction store across all files:
+  // Ensures that when the user keeps previous files loaded, identical records/documents (PP, OB, NL)
+  // are updated in the database rather than duplicated in financial totals.
+  const transactionMap = new Map<
+    string,
+    {
+      id: string;
+      stage: StageKey;
+      groupKey: string;
+      name: string;
+      cnpj: string;
+      val: number;
+      rawNumero: string;
+      rawOB: string;
+      rawNE: string;
+      rawSit: string;
+      isAO: boolean;
+      enviadaInfo: ReturnType<typeof isSituacaoEnviadaBanco>;
+      isPPProntaValida: boolean;
+      hasAllSixColumns: boolean;
+      fileHasSituacaoValues: boolean;
+      isConclusivoPago: boolean;
+      shouldCountInTotals: boolean;
+      favNEInfo?: { cnpj: string; name: string } | null;
+      obsList: string[];
+      ppsList: string[];
+      notasEmpenhoList: string[];
+      naturezasList: string[];
+    }
+  >();
 
-  let totalBasePps = 0;
-  let totalPpProntas = 0;
-  let totalLiqObedece = 0;
-  let totalLiqNaoObedece = 0;
-  let totalOutros = 0;
-  let totalEnviadasBanco = 0;
-  let countPpProntasAO = 0;
-  let countEnviadasBanco = 0;
-  let totalPagoAno = 0;
-  let countPagoAnoTotal = 0;
+  // Maps to capture supplier classifications from natureza_despesa files without adding financial amounts
+  const supplierNaturezasMap: Record<string, Set<string>> = {};
+  const supplierEmpenhosMap: Record<string, Set<string>> = {};
+  const neToGroupKey = new Map<string, string>();
+  const docToGroupKey = new Map<string, string>();
 
+  // Pass 1: Extract, deduplicate, and upsert records into canonical transaction database
   files.forEach((file) => {
     const favCol = file.detectedFavorecidoCol;
     const valCol = file.detectedValorCol;
@@ -1753,19 +2659,35 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
     const favNeCol = file.detectedFavorecidoNECol;
     const stage: StageKey = file.stage || detectStageFromFileName(file.fileName);
 
-    // Check if the file has situation column
-    let sitCol = file.detectedSituacaoCol;
-    if (!sitCol && file.headers) {
-      for (const h of file.headers) {
-        const norm = h.toLowerCase().trim();
-        if (norm.includes('situacao') || norm.includes('situação') || norm.includes('sigla') || norm.includes('status') || norm === 'sit') {
-          sitCol = h;
-          break;
-        }
+    // Pre-cache fallback columns from file.headers (or first row) once per file to avoid Object.keys inside row loops
+    const headersList = file.headers && file.headers.length > 0
+      ? file.headers
+      : (file.rows && file.rows.length > 0 ? Object.keys(file.rows[0]) : []);
+
+    let favFallbackCol = '';
+    let sitFallbackCol = '';
+    let natFallbackCol = '';
+    let historicoCol = '';
+
+    for (const h of headersList) {
+      const norm = h.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+      if (!favFallbackCol && (norm.includes('favorecido') || norm.includes('credor') || norm.includes('fornecedor') || norm.includes('nome'))) {
+        favFallbackCol = h;
+      }
+      if (!sitFallbackCol && (norm.includes('situa') || norm.includes('status') || norm.includes('sigla') || norm === 'sit')) {
+        sitFallbackCol = h;
+      }
+      if (!natFallbackCol && norm.includes('natureza')) {
+        natFallbackCol = h;
+      }
+      if (!historicoCol && (norm.includes('historico') || norm.includes('histórico'))) {
+        historicoCol = h;
       }
     }
 
-    // Check if any row in this file actually has a situation value
+    let natCol = file.detectedNaturezaCol || natFallbackCol;
+    let sitCol = file.detectedSituacaoCol || sitFallbackCol;
+
     let fileHasSituacaoValues = false;
     if (sitCol) {
       for (let i = 0; i < Math.min(file.rows.length, 50); i++) {
@@ -1777,6 +2699,10 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
       }
     }
 
+    const isBasePpsOrHasCols =
+      stage === 'base_pps' ||
+      !!(numCol || obCol || neCol);
+
     file.rows.forEach((row) => {
       let rawFav = row[favCol];
       let rawFavNE = favNeCol ? row[favNeCol] : undefined;
@@ -1784,6 +2710,29 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
       const rawOB = obCol ? String(row[obCol] || '').trim() : '';
       const rawNE = neCol ? String(row[neCol] || '').trim() : '';
       const val = parseCurrencyValue(row[valCol]);
+
+      // Descartar linhas de rodapé/legenda do SIGEF (C - Cancelada; AP - A pagar / Relatório Emitido em)
+      const isLegendOrFooter = Object.values(row).some((cell) => {
+        if (cell === null || cell === undefined) return false;
+        const s = String(cell).normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toLowerCase();
+        return (
+          s.startsWith('c - cancelada; ap - a pagar') ||
+          s.startsWith('c - cancelada') ||
+          s.startsWith('relatorio emitido em') ||
+          s.startsWith('relatório emitido em')
+        );
+      });
+      if (isLegendOrFooter) return;
+
+      // Regra estrita SIGEF: descarte imediatamente se tanto Número/PP quanto OB estiverem vazios
+      if (isBasePpsOrHasCols) {
+        if (!rawNumero && !rawOB) {
+          return;
+        }
+        if (rawNE && /^\d{4}$/.test(rawNE)) {
+          return;
+        }
+      }
 
       // Descartar imediatamente linhas de totalizadores, resumos gerais e saldos de dotação
       if (isTotalizadorRow(row, rawFav, rawNumero)) {
@@ -1793,15 +2742,8 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
       if (rawFav === null || rawFav === undefined || String(rawFav).trim() === '') {
         if (rawFavNE && String(rawFavNE).trim() !== '') {
           rawFav = rawFavNE;
-        } else {
-          const keys = Object.keys(row);
-          for (const k of keys) {
-            const lk = k.toLowerCase();
-            if ((lk.includes('favorecido') || lk.includes('credor') || lk.includes('fornecedor') || lk.includes('nome')) && row[k]) {
-              rawFav = row[k];
-              break;
-            }
-          }
+        } else if (favFallbackCol && row[favFallbackCol]) {
+          rawFav = row[favFallbackCol];
         }
       }
 
@@ -1829,14 +2771,11 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
         }
       }
 
-      // In SIGEF reports, when Favorecido is a bank or payment intermediary and Favorecido Nota Empenho has the real contractor:
       if (favNEInfo && favNEInfo.cnpj !== 'N/I' && (cnpj === 'N/I' || isBankOrIntermediary(name))) {
         cnpj = favNEInfo.cnpj;
         name = favNEInfo.name;
       }
 
-      // Check if this row has all 6 specific SIGEF columns filled:
-      // Número / OB / Favorecido / Nota Empenho / Favorecido Nota Empenho / Valor
       const hasAllSixColumns = !!(
         rawNumero &&
         rawOB &&
@@ -1846,199 +2785,411 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
         val > 0
       );
 
-      if (name !== 'NÃO INFORMADO' || val !== 0 || String(rawFav || '').trim() !== '') {
-        let rawSit = sitCol ? row[sitCol] : undefined;
-        if (rawSit === undefined || rawSit === null || String(rawSit).trim() === '') {
-          for (const k of Object.keys(row)) {
-            const lk = k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
-            if (lk.includes('situa') || lk.includes('status') || lk.includes('sigla') || lk === 'sit') {
-              if (row[k] !== undefined && row[k] !== null && String(row[k]).trim() !== '') {
-                rawSit = row[k];
-                break;
-              }
-            }
-          }
-        }
-
-        const isAO = isSituacaoAO(rawSit);
-        const enviadaInfo = isSituacaoEnviadaBanco(rawSit);
-
-        // Regra estrita de PPs Prontas:
-        // 1. Deve estar na situação AO
-        // 2. Deve ter todas as 5 colunas preenchidas: Número, OB, Favorecido, Nota Empenho e Valor > 0
-        const isPPProntaValida = isPPProntaAOValida({
-          situacaoRaw: rawSit,
-          numeroRaw: rawNumero,
-          obRaw: rawOB,
-          favorecidoRaw: rawFav,
-          notaEmpenhoRaw: rawNE,
-          valor: val,
-        });
-
-        let isRowPPPronta = false;
-        let isRowEnviadaBanco = false;
-        let shouldCountInTotals = false;
-
-        // Se a planilha foi classificada ou mapeada explicitamente como Liquidação (Não Obedece / Obedece) ou Base de PPs:
-        if (stage === 'nao_obedece') {
-          totalLiqNaoObedece += val;
-          shouldCountInTotals = true;
-        } else if (stage === 'obedece') {
-          totalLiqObedece += val;
-          shouldCountInTotals = true;
-        } else if (stage === 'base_pps' || stage === 'pp_prontas') {
-          // Arquivo Base de PPs (ex: Relatório SIGEF com todas as informações das PPs)
-          // Somente somar no painel inicial e na coluna PPs os registros na situação "AO"
-          if (isAO) {
-            totalBasePps += val;
-            totalPpProntas += val;
-            countPpProntasAO += 1;
-            shouldCountInTotals = true;
-          } else if (!fileHasSituacaoValues) {
-            // Se o arquivo não contiver coluna ou dados de situação, soma normalmente
-            totalBasePps += val;
-            totalPpProntas += val;
-            shouldCountInTotals = true;
-          }
-          if (enviadaInfo.isEnviada) {
-            totalEnviadasBanco += val;
-            countEnviadasBanco += 1;
-          }
-        } else if (enviadaInfo.isEnviada) {
-          // Enviada a banco (PPCB / PPNC)
-          isRowEnviadaBanco = true;
-          totalEnviadasBanco += val;
-          countEnviadasBanco += 1;
-        } else {
-          totalOutros += val;
-          shouldCountInTotals = true;
-        }
-
-        if (shouldCountInTotals) {
-          grandTotalValue += val;
-          grandTotalCount += 1;
-        }
-
       // Consolidar favorecidos principalmente a partir do CNPJ/CPF
       const digits = cleanDigits(cnpj);
       let groupKey = '';
       if (digits.length >= 12 && digits.length <= 14) {
-        // CNPJ completo ou com zeros suprimidos
         groupKey = 'CNPJ_' + formatCnpjOrCpf(digits).replace(/\D/g, '');
       } else if (digits.length >= 10 && digits.length <= 11) {
-        // CPF completo ou com zero à esquerda suprimido
         groupKey = 'CPF_' + formatCnpjOrCpf(digits).replace(/\D/g, '');
       } else if (digits.length === 8) {
-        // CNPJ encurtado (raiz) como ocorre em relatórios de liquidação
         groupKey = 'ROOT_' + digits;
       } else if (digits.length > 0) {
         groupKey = 'CNPJ_RAW_' + digits;
-      } else if (name !== 'NÃO INFORMADO' && name.trim() !== '') {
+      } else if (
+        name &&
+        name !== 'NÃO INFORMADO' &&
+        name.trim() !== '' &&
+        name !== '-' &&
+        name !== '0' &&
+        name !== 'N/I' &&
+        !name.startsWith('FORNECEDOR_REG') &&
+        !/^(TOTAL|SUBTOTAL|RESUMO|QUANTIDADE|EMITIDO|SALDO|DOTAÇÃO|DOTACAO|ORGAO|UNIDADE|FONTE|ELEMENTO|CELULA|CÉLULA)/i.test(name.trim())
+      ) {
         groupKey = 'NAME_' + name.trim().toUpperCase();
       } else {
-        groupKey = `FORNECEDOR_REG_${grandTotalCount}`;
-      }
-
-      if (!supplierMap[groupKey]) {
-        supplierMap[groupKey] = {
-          name: name !== 'NÃO INFORMADO' ? name : groupKey,
-          cnpj: cnpj !== 'N/I' ? formatCnpjOrCpf(cnpj) : 'N/I',
-          basePpsValue: 0,
-          ppProntasValue: 0,
-          liqObedeceValue: 0,
-          liqNaoObedeceValue: 0,
-          outrosValue: 0,
-          enviadasBancoValue: 0,
-          countPpProntasAO: 0,
-          countEnviadasBanco: 0,
-          valorPagoAno: 0,
-          countPagoAno: 0,
-          totalValue: 0,
-          totalCount: 0,
-          obs: [],
-          pps: [],
-          notasEmpenho: [],
-          favorecidoNE: favNEInfo && favNEInfo.name !== 'NÃO INFORMADO' ? favNEInfo.name : undefined,
-          hasFullSigefFields: hasAllSixColumns,
-        };
-      }
-
-      if (hasAllSixColumns) {
-        supplierMap[groupKey].hasFullSigefFields = true;
-      }
-
-      // Priorizar o nome com mais caracteres para o favorecido
-      if (name && name !== 'NÃO INFORMADO') {
-        const curName = supplierMap[groupKey].name || '';
-        if (!curName || curName === 'NÃO INFORMADO' || name.trim().length > curName.trim().length) {
-          supplierMap[groupKey].name = name.trim().toUpperCase();
+        let matchedKey = '';
+        if (rawNE) {
+          matchedKey = neToGroupKey.get(rawNE) || '';
+        }
+        if (!matchedKey && rawNumero) {
+          matchedKey = docToGroupKey.get(rawNumero) || '';
+        }
+        if (matchedKey) {
+          groupKey = matchedKey;
+        } else {
+          return;
         }
       }
 
-      // Atualizar CNPJ caso o novo seja mais completo
-      if (cnpj && cnpj !== 'N/I') {
-        const curDigits = cleanDigits(supplierMap[groupKey].cnpj);
-        const newDigits = cleanDigits(cnpj);
-        if (newDigits.length > curDigits.length) {
-          supplierMap[groupKey].cnpj = formatCnpjOrCpf(cnpj);
+      if (rawNE && !neToGroupKey.has(rawNE)) {
+        neToGroupKey.set(rawNE, groupKey);
+      }
+      if (rawNumero && !docToGroupKey.has(rawNumero)) {
+        docToGroupKey.set(rawNumero, groupKey);
+      }
+
+      // Capturar Natureza da Despesa
+      let natText = '';
+      if (natCol && row[natCol]) {
+        natText = String(row[natCol]).trim();
+      } else if (natFallbackCol && row[natFallbackCol]) {
+        natText = String(row[natFallbackCol]).trim();
+      }
+
+      // Se for arquivo exclusivo de natureza de despesa ou controle de publicação, não somar no saldo geral de credores
+      if (stage === 'natureza_despesa') {
+        if (natText && natText !== '-' && natText !== '0') {
+          if (!supplierNaturezasMap[groupKey]) supplierNaturezasMap[groupKey] = new Set();
+          supplierNaturezasMap[groupKey].add(natText);
         }
+        if (rawNE && rawNE !== '-' && rawNE !== '0') {
+          if (!supplierEmpenhosMap[groupKey]) supplierEmpenhosMap[groupKey] = new Set();
+          supplierEmpenhosMap[groupKey].add(rawNE);
+        }
+        return;
       }
 
-      if (rawOB && (!supplierMap[groupKey].obs || !supplierMap[groupKey].obs!.includes(rawOB))) {
-        supplierMap[groupKey].obs = supplierMap[groupKey].obs || [];
-        supplierMap[groupKey].obs!.push(rawOB);
-      }
-      if (rawNumero && (!supplierMap[groupKey].pps || !supplierMap[groupKey].pps!.includes(rawNumero))) {
-        supplierMap[groupKey].pps = supplierMap[groupKey].pps || [];
-        supplierMap[groupKey].pps!.push(rawNumero);
-      }
-      if (rawNE && (!supplierMap[groupKey].notasEmpenho || !supplierMap[groupKey].notasEmpenho!.includes(rawNE))) {
-        supplierMap[groupKey].notasEmpenho = supplierMap[groupKey].notasEmpenho || [];
-        supplierMap[groupKey].notasEmpenho!.push(rawNE);
-      }
-      if (favNEInfo && favNEInfo.name !== 'NÃO INFORMADO' && !supplierMap[groupKey].favorecidoNE) {
-        supplierMap[groupKey].favorecidoNE = favNEInfo.name;
+      if (stage === 'publicacao') {
+        // Planilha dedicada ao monitoramento da publicação
+        return;
       }
 
-      // Histórico de pagamentos conclusivos do ano (PPCB, CB, etc.)
-      const isConclusivoPago = isSituacaoConclusivaPagamento(rawSit);
-      if (isConclusivoPago) {
-        supplierMap[groupKey].valorPagoAno = (supplierMap[groupKey].valorPagoAno || 0) + val;
-        supplierMap[groupKey].countPagoAno = (supplierMap[groupKey].countPagoAno || 0) + 1;
-        totalPagoAno += val;
-        countPagoAnoTotal += 1;
+      if (name === 'NÃO INFORMADO' && val === 0 && String(rawFav || '').trim() === '') {
+        return;
       }
 
-      if (stage === 'nao_obedece') {
-        supplierMap[groupKey].liqNaoObedeceValue += val;
-      } else if (stage === 'obedece') {
-        supplierMap[groupKey].liqObedeceValue += val;
+      let rawSit = sitCol ? row[sitCol] : undefined;
+      if ((rawSit === undefined || rawSit === null || String(rawSit).trim() === '') && sitFallbackCol) {
+        rawSit = row[sitFallbackCol];
+      }
+
+      const isAO = isSituacaoAO(rawSit);
+      const enviadaInfo = isSituacaoEnviadaBanco(rawSit);
+      const isPPProntaValida = isPPProntaAOValida({
+        situacaoRaw: rawSit,
+        numeroRaw: rawNumero,
+        obRaw: rawOB,
+        favorecidoRaw: rawFav,
+        notaEmpenhoRaw: rawNE,
+        valor: val,
+      });
+
+      let shouldCountInTotals = false;
+      if (stage === 'nao_obedece' || stage === 'obedece') {
+        shouldCountInTotals = true;
       } else if (stage === 'base_pps' || stage === 'pp_prontas') {
         if (isAO || !fileHasSituacaoValues) {
-          supplierMap[groupKey].basePpsValue = (supplierMap[groupKey].basePpsValue || 0) + val;
-          supplierMap[groupKey].ppProntasValue += val;
+          shouldCountInTotals = true;
         }
-        if (isAO) {
-          supplierMap[groupKey].countPpProntasAO = (supplierMap[groupKey].countPpProntasAO || 0) + 1;
-        }
-        if (enviadaInfo.isEnviada) {
-          supplierMap[groupKey].enviadasBancoValue = (supplierMap[groupKey].enviadasBancoValue || 0) + val;
-          supplierMap[groupKey].countEnviadasBanco = (supplierMap[groupKey].countEnviadasBanco || 0) + 1;
-        }
-      } else if (isRowEnviadaBanco) {
-        supplierMap[groupKey].enviadasBancoValue = (supplierMap[groupKey].enviadasBancoValue || 0) + val;
-        supplierMap[groupKey].countEnviadasBanco = (supplierMap[groupKey].countEnviadasBanco || 0) + 1;
-      } else {
-        supplierMap[groupKey].outrosValue += val;
+      } else if (stage !== 'ordem_bancaria' && !enviadaInfo.isEnviada) {
+        shouldCountInTotals = true;
       }
 
-      if (shouldCountInTotals) {
-        supplierMap[groupKey].totalValue += val;
-        supplierMap[groupKey].totalCount += 1;
+      const isConclusivoPago = isSituacaoConclusivaPagamento(rawSit);
+
+      // Gerar chave canônica de identificação do documento / transação
+      const cleanDoc = (s?: string) => String(s || '').trim().toUpperCase().replace(/[\s\.\-\/]/g, '');
+      let canonicalNum = rawNumero;
+      if (!canonicalNum || /^\d{1,4}$/.test(canonicalNum) || /^linha\s*\d+$/i.test(canonicalNum)) {
+        if (historicoCol && row[historicoCol]) {
+          const s = String(row[historicoCol]).trim();
+          const m = s.match(/\b(?:\d{2,4})?NL[\s\-_]*\d+\b/i) || s.match(/\b\d{4}PP\d+\b/i);
+          if (m) {
+            canonicalNum = m[0].toUpperCase().replace(/\s+/g, '');
+          }
+        }
+      }
+      const numDoc = cleanDoc(canonicalNum);
+      const obDoc = cleanDoc(rawOB);
+      const neDoc = cleanDoc(rawNE);
+      const valCents = Math.round(val * 100);
+
+      let txKey = '';
+      if (numDoc && (/\b\d{4}PP\d+\b/i.test(numDoc) || stage === 'base_pps' || stage === 'pp_prontas')) {
+        // Cada proposta de pagamento é única no SIGEF. Se houver desdobramento por NE, inclui a NE
+        txKey = `PP_${numDoc}` + (neDoc ? `_NE_${neDoc}` : '') + (valCents > 0 ? `_${valCents}` : '');
+      } else if (obDoc && (/\b\d{4}OB\d+\b/i.test(obDoc) || stage === 'ordem_bancaria')) {
+        txKey = `OB_${obDoc}` + (valCents > 0 ? `_${valCents}` : '');
+      } else if (stage === 'obedece' || stage === 'nao_obedece') {
+        txKey = `LIQ_${stage}_${numDoc || 'S_N'}` + (neDoc ? `_NE_${neDoc}` : '') + (valCents > 0 ? `_${valCents}` : '');
+      } else if (numDoc) {
+        txKey = `DOC_${stage}_${numDoc}` + (neDoc ? `_NE_${neDoc}` : '') + (valCents > 0 ? `_${valCents}` : '');
+      } else if (neDoc) {
+        txKey = `NE_${neDoc}_${digits || cleanDoc(name)}_${valCents}`;
+      } else {
+        txKey = `TX_${stage}_${digits || cleanDoc(name)}_${valCents}`;
+      }
+
+      const existingTx = transactionMap.get(txKey);
+      if (existingTx) {
+        // A transação já existe em arquivo anterior!
+        // Atualiza a linha no banco de dados (upsert) com as informações mais recentes, SEM DUPLICAR VALORES!
+        const isNewConclusivo = isSituacaoConclusivaPagamento(rawSit) || /^(PPCB|CB|PAGO|PAGA|RJ|PPRJ|C|CANCELAD|REJEITAD)/i.test(String(rawSit || '').trim());
+        const isOldConclusivo = isSituacaoConclusivaPagamento(existingTx.rawSit) || /^(PPCB|CB|PAGO|PAGA|RJ|PPRJ|C|CANCELAD|REJEITAD)/i.test(String(existingTx.rawSit || '').trim());
+
+        if (isNewConclusivo || !isOldConclusivo || (rawSit && rawSit !== '-' && rawSit !== '0')) {
+          existingTx.rawSit = rawSit || existingTx.rawSit;
+          existingTx.isAO = isSituacaoAO(existingTx.rawSit);
+          existingTx.enviadaInfo = isSituacaoEnviadaBanco(existingTx.rawSit);
+          existingTx.isConclusivoPago = isSituacaoConclusivaPagamento(existingTx.rawSit);
+          existingTx.isPPProntaValida = isPPProntaAOValida({
+            situacaoRaw: existingTx.rawSit,
+            numeroRaw: rawNumero || existingTx.rawNumero,
+            obRaw: rawOB || existingTx.rawOB,
+            favorecidoRaw: rawFav || existingTx.name,
+            notaEmpenhoRaw: rawNE || existingTx.rawNE,
+            valor: existingTx.val,
+          });
+        }
+
+        if (rawOB) {
+          if (!existingTx.rawOB) existingTx.rawOB = rawOB;
+          if (!existingTx.obsList.includes(rawOB)) existingTx.obsList.push(rawOB);
+        }
+        if (rawNumero) {
+          if (!existingTx.rawNumero) existingTx.rawNumero = rawNumero;
+          if (!existingTx.ppsList.includes(rawNumero)) existingTx.ppsList.push(rawNumero);
+        }
+        if (rawNE) {
+          if (!existingTx.rawNE) existingTx.rawNE = rawNE;
+          if (!existingTx.notasEmpenhoList.includes(rawNE)) existingTx.notasEmpenhoList.push(rawNE);
+        }
+        if (name && name !== 'NÃO INFORMADO' && name.trim().length > (existingTx.name || '').length) {
+          existingTx.name = name.trim().toUpperCase();
+        }
+        if (cnpj && cnpj !== 'N/I' && cleanDigits(cnpj).length > cleanDigits(existingTx.cnpj).length) {
+          existingTx.cnpj = formatCnpjOrCpf(cnpj);
+        }
+        if (hasAllSixColumns) {
+          existingTx.hasAllSixColumns = true;
+        }
+        if (favNEInfo && favNEInfo.name !== 'NÃO INFORMADO' && !existingTx.favNEInfo) {
+          existingTx.favNEInfo = favNEInfo;
+        }
+        if (natText && !existingTx.naturezasList.includes(natText)) {
+          existingTx.naturezasList.push(natText);
+        }
+      } else {
+        // Nova transação identificada no banco de dados
+        transactionMap.set(txKey, {
+          id: txKey,
+          stage,
+          groupKey,
+          name: name !== 'NÃO INFORMADO' ? name.trim().toUpperCase() : groupKey,
+          cnpj: cnpj !== 'N/I' ? formatCnpjOrCpf(cnpj) : 'N/I',
+          val,
+          rawNumero,
+          rawOB,
+          rawNE,
+          rawSit: rawSit || '',
+          isAO,
+          enviadaInfo,
+          isPPProntaValida,
+          hasAllSixColumns,
+          fileHasSituacaoValues,
+          isConclusivoPago,
+          shouldCountInTotals,
+          favNEInfo,
+          obsList: rawOB ? [rawOB] : [],
+          ppsList: rawNumero ? [rawNumero] : [],
+          notasEmpenhoList: rawNE ? [rawNE] : [],
+          naturezasList: natText ? [natText] : [],
+        });
+      }
+    });
+  });
+
+  // Pass 2: Consolidar métricas gerais e totais dos fornecedores a partir das transações deduplicadas
+  const supplierMap: Record<string, ConsolidatedSupplier> = {};
+  let grandTotalValue = 0;
+  let grandTotalCount = 0;
+
+  let totalBasePps = 0;
+  let totalPpProntas = 0;
+  let totalLiqObedece = 0;
+  let totalLiqNaoObedece = 0;
+  let totalOutros = 0;
+  let totalEnviadasBanco = 0;
+  let countPpProntasAO = 0;
+  let countEnviadasBanco = 0;
+  let totalPagoAno = 0;
+  let countPagoAnoTotal = 0;
+
+  for (const tx of transactionMap.values()) {
+    const val = tx.val;
+    const stage = tx.stage;
+    const isAO = tx.isAO;
+    const enviadaInfo = tx.enviadaInfo;
+    const fileHasSituacaoValues = tx.fileHasSituacaoValues;
+
+    let isRowEnviadaBanco = false;
+    let shouldCountInTotals = false;
+
+    if (stage === 'nao_obedece') {
+      totalLiqNaoObedece += val;
+      shouldCountInTotals = true;
+    } else if (stage === 'obedece') {
+      totalLiqObedece += val;
+      shouldCountInTotals = true;
+    } else if (stage === 'base_pps' || stage === 'pp_prontas') {
+      if (isAO) {
+        totalBasePps += val;
+        totalPpProntas += val;
+        countPpProntasAO += 1;
+        shouldCountInTotals = true;
+      } else if (!fileHasSituacaoValues) {
+        totalBasePps += val;
+        totalPpProntas += val;
+        shouldCountInTotals = true;
+      }
+      if (enviadaInfo.isEnviada) {
+        totalEnviadasBanco += val;
+        countEnviadasBanco += 1;
+      }
+    } else if (stage === 'ordem_bancaria') {
+      // Alimentam o Detalhamento por Fonte via applyEnrichment
+    } else if (stage === 'natureza_despesa') {
+      shouldCountInTotals = false;
+    } else if (enviadaInfo.isEnviada) {
+      isRowEnviadaBanco = true;
+      totalEnviadasBanco += val;
+      countEnviadasBanco += 1;
+    } else {
+      totalOutros += val;
+      shouldCountInTotals = true;
+    }
+
+    if (shouldCountInTotals) {
+      grandTotalValue += val;
+      grandTotalCount += 1;
+    }
+
+    const groupKey = tx.groupKey;
+    if (!supplierMap[groupKey]) {
+      supplierMap[groupKey] = {
+        name: tx.name,
+        cnpj: tx.cnpj,
+        basePpsValue: 0,
+        ppProntasValue: 0,
+        liqObedeceValue: 0,
+        liqNaoObedeceValue: 0,
+        outrosValue: 0,
+        enviadasBancoValue: 0,
+        countPpProntasAO: 0,
+        countEnviadasBanco: 0,
+        valorPagoAno: 0,
+        countPagoAno: 0,
+        totalValue: 0,
+        totalCount: 0,
+        obs: [],
+        pps: [],
+        notasEmpenho: [],
+        naturezasDespesa: [],
+        favorecidoNE: tx.favNEInfo && tx.favNEInfo.name !== 'NÃO INFORMADO' ? tx.favNEInfo.name : undefined,
+        hasFullSigefFields: tx.hasAllSixColumns,
+      };
+    }
+
+    if (tx.hasAllSixColumns) {
+      supplierMap[groupKey].hasFullSigefFields = true;
+    }
+
+    if (tx.name && tx.name !== 'NÃO INFORMADO') {
+      const curName = supplierMap[groupKey].name || '';
+      if (!curName || curName === 'NÃO INFORMADO' || tx.name.length > curName.length) {
+        supplierMap[groupKey].name = tx.name;
       }
     }
-  });
-});
+
+    if (tx.cnpj && tx.cnpj !== 'N/I') {
+      const curDigits = cleanDigits(supplierMap[groupKey].cnpj);
+      const newDigits = cleanDigits(tx.cnpj);
+      if (newDigits.length > curDigits.length) {
+        supplierMap[groupKey].cnpj = tx.cnpj;
+      }
+    }
+
+    tx.obsList.forEach((ob) => {
+      supplierMap[groupKey].obs = supplierMap[groupKey].obs || [];
+      if (!supplierMap[groupKey].obs!.includes(ob)) supplierMap[groupKey].obs!.push(ob);
+    });
+    tx.ppsList.forEach((pp) => {
+      supplierMap[groupKey].pps = supplierMap[groupKey].pps || [];
+      if (!supplierMap[groupKey].pps!.includes(pp)) supplierMap[groupKey].pps!.push(pp);
+    });
+    tx.notasEmpenhoList.forEach((ne) => {
+      supplierMap[groupKey].notasEmpenho = supplierMap[groupKey].notasEmpenho || [];
+      if (!supplierMap[groupKey].notasEmpenho!.includes(ne)) supplierMap[groupKey].notasEmpenho!.push(ne);
+    });
+    tx.naturezasList.forEach((nat) => {
+      supplierMap[groupKey].naturezasDespesa = supplierMap[groupKey].naturezasDespesa || [];
+      if (!supplierMap[groupKey].naturezasDespesa!.includes(nat)) supplierMap[groupKey].naturezasDespesa!.push(nat);
+    });
+
+    if (tx.favNEInfo && tx.favNEInfo.name !== 'NÃO INFORMADO' && !supplierMap[groupKey].favorecidoNE) {
+      supplierMap[groupKey].favorecidoNE = tx.favNEInfo.name;
+    }
+
+    if (tx.isConclusivoPago && stage !== 'natureza_despesa') {
+      supplierMap[groupKey].valorPagoAno = (supplierMap[groupKey].valorPagoAno || 0) + val;
+      supplierMap[groupKey].countPagoAno = (supplierMap[groupKey].countPagoAno || 0) + 1;
+      totalPagoAno += val;
+      countPagoAnoTotal += 1;
+    }
+
+    if (stage === 'nao_obedece') {
+      supplierMap[groupKey].liqNaoObedeceValue += val;
+    } else if (stage === 'obedece') {
+      supplierMap[groupKey].liqObedeceValue += val;
+    } else if (stage === 'base_pps' || stage === 'pp_prontas') {
+      if (isAO || !fileHasSituacaoValues) {
+        supplierMap[groupKey].basePpsValue = (supplierMap[groupKey].basePpsValue || 0) + val;
+        supplierMap[groupKey].ppProntasValue += val;
+      }
+      if (isAO) {
+        supplierMap[groupKey].countPpProntasAO = (supplierMap[groupKey].countPpProntasAO || 0) + 1;
+      }
+      if (enviadaInfo.isEnviada) {
+        supplierMap[groupKey].enviadasBancoValue = (supplierMap[groupKey].enviadasBancoValue || 0) + val;
+        supplierMap[groupKey].countEnviadasBanco = (supplierMap[groupKey].countEnviadasBanco || 0) + 1;
+      }
+    } else if (stage === 'natureza_despesa') {
+      // Natureza não soma financeiro
+    } else if (isRowEnviadaBanco) {
+      supplierMap[groupKey].enviadasBancoValue = (supplierMap[groupKey].enviadasBancoValue || 0) + val;
+      supplierMap[groupKey].countEnviadasBanco = (supplierMap[groupKey].countEnviadasBanco || 0) + 1;
+    } else {
+      supplierMap[groupKey].outrosValue += val;
+    }
+
+    if (shouldCountInTotals) {
+      supplierMap[groupKey].totalValue += val;
+      supplierMap[groupKey].totalCount += 1;
+    }
+  }
+
+  // Pass 3: Anexar classificações de natureza de despesa e empenhos aos fornecedores correspondentes
+  for (const [gKey, natSet] of Object.entries(supplierNaturezasMap)) {
+    if (supplierMap[gKey]) {
+      supplierMap[gKey].naturezasDespesa = supplierMap[gKey].naturezasDespesa || [];
+      natSet.forEach((nat) => {
+        if (!supplierMap[gKey].naturezasDespesa!.includes(nat)) {
+          supplierMap[gKey].naturezasDespesa!.push(nat);
+        }
+      });
+    }
+  }
+  for (const [gKey, neSet] of Object.entries(supplierEmpenhosMap)) {
+    if (supplierMap[gKey]) {
+      supplierMap[gKey].notasEmpenho = supplierMap[gKey].notasEmpenho || [];
+      neSet.forEach((ne) => {
+        if (!supplierMap[gKey].notasEmpenho!.includes(ne)) {
+          supplierMap[gKey].notasEmpenho!.push(ne);
+        }
+      });
+    }
+  }
 
   // Reconciliação e consolidação inteligente por CNPJ/CPF
   // 1. Vincula CNPJs encurtados (como no relatório de liquidação) ao CNPJ completo correspondente
@@ -2047,11 +3198,25 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
   const fullEntries: Array<{ key: string; digits: string; root: string }> = [];
   const shortenedOrNameEntries: Array<{ key: string; digits: string }> = [];
 
+  const fullEntriesByRoot = new Map<string, string[]>();
+  const fullEntriesByName = new Map<string, string>();
+
   for (const k of supplierKeys) {
     const s = supplierMap[k];
     const d = cleanDigits(s.cnpj);
     if (d.length === 14 || d.length === 11) {
-      fullEntries.push({ key: k, digits: d, root: d.substring(0, 8) });
+      const root = d.substring(0, 8);
+      fullEntries.push({ key: k, digits: d, root });
+      let rootList = fullEntriesByRoot.get(root);
+      if (!rootList) {
+        rootList = [];
+        fullEntriesByRoot.set(root, rootList);
+      }
+      rootList.push(k);
+      const cleanName = (s.name || '').trim().toUpperCase();
+      if (cleanName && cleanName !== 'NÃO INFORMADO') {
+        fullEntriesByName.set(cleanName, k);
+      }
     } else {
       shortenedOrNameEntries.push({ key: k, digits: d });
     }
@@ -2065,34 +3230,35 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
 
     let matchedTargetKey: string | null = null;
 
-    // Caso 1: Possui 8 dígitos da raiz do CNPJ -> busca correspondente com a mesma raiz
+    // Caso 1: Possui 8 dígitos da raiz do CNPJ -> busca correspondente indexado O(1)
     if (srcDigits.length >= 8) {
       const srcRoot = srcDigits.substring(0, 8);
-      const matches = fullEntries.filter((f) => f.root === srcRoot);
-      if (matches.length === 1) {
-        matchedTargetKey = matches[0].key;
-      } else if (matches.length > 1) {
+      const rootMatches = fullEntriesByRoot.get(srcRoot);
+      if (rootMatches && rootMatches.length === 1) {
+        matchedTargetKey = rootMatches[0];
+      } else if (rootMatches && rootMatches.length > 1) {
         // Se houver mais de uma filial, correlaciona pelo nome
-        const byName = matches.find((m) => {
-          const tName = (supplierMap[m.key]?.name || '').trim().toUpperCase();
+        const byName = rootMatches.find((k) => {
+          const tName = (supplierMap[k]?.name || '').trim().toUpperCase();
           return tName.includes(srcName) || srcName.includes(tName);
         });
-        matchedTargetKey = byName ? byName.key : matches[0].key;
+        matchedTargetKey = byName || rootMatches[0];
       }
     }
 
-    // Caso 2: Se não localizou por dígitos, correlaciona pelo nome do favorecido
+    // Caso 2: Se não localizou por dígitos, correlaciona pelo nome exato ou prefixo
     if (!matchedTargetKey && srcName && srcName !== 'NÃO INFORMADO') {
-      const byName = fullEntries.filter((f) => {
-        const tName = (supplierMap[f.key]?.name || '').trim().toUpperCase();
-        if (tName === srcName) return true;
-        if (srcName.length >= 5 && tName.length >= 5) {
-          return tName.startsWith(srcName) || srcName.startsWith(tName) || tName.includes(srcName) || srcName.includes(tName);
+      matchedTargetKey = fullEntriesByName.get(srcName) || null;
+      if (!matchedTargetKey && srcName.length >= 6) {
+        // Busca apenas nos primeiros 200 para manter UI 60fps
+        for (let i = 0; i < Math.min(fullEntries.length, 250); i++) {
+          const f = fullEntries[i];
+          const tName = (supplierMap[f.key]?.name || '').trim().toUpperCase();
+          if (tName.length >= 6 && (tName.startsWith(srcName) || srcName.startsWith(tName))) {
+            matchedTargetKey = f.key;
+            break;
+          }
         }
-        return false;
-      });
-      if (byName.length === 1) {
-        matchedTargetKey = byName[0].key;
       }
     }
 
@@ -2141,13 +3307,31 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
           if (!target.notasEmpenho!.includes(ne)) target.notasEmpenho!.push(ne);
         });
       }
+      if (source.naturezasDespesa && source.naturezasDespesa.length > 0) {
+        target.naturezasDespesa = target.naturezasDespesa || [];
+        source.naturezasDespesa.forEach((nat) => {
+          if (!target.naturezasDespesa!.includes(nat)) target.naturezasDespesa!.push(nat);
+        });
+      }
 
       delete supplierMap[shortItem.key];
     }
   }
 
-  // Filtrar favorecidos válidos
+  // Filtrar favorecidos válidos (removendo qualquer registro fantasma, totalizador ou cabeçalho)
   const consolidatedSuppliers: ConsolidatedSupplier[] = Object.values(supplierMap).filter((s) => {
+    const cleanName = (s.name || '').trim().toUpperCase();
+    if (
+      !cleanName ||
+      cleanName === 'NÃO INFORMADO' ||
+      cleanName === 'N/I' ||
+      cleanName.startsWith('FORNECEDOR_REG') ||
+      cleanName.startsWith('CNPJ_RAW_') ||
+      cleanName.startsWith('NAME_') ||
+      /^(TOTAL|SUBTOTAL|RESUMO|QUANTIDADE|EMITIDO|SALDO|DOTAÇÃO|DOTACAO|ORGAO|UNIDADE|FONTE|ELEMENTO|CELULA|CÉLULA)/i.test(cleanName)
+    ) {
+      return false;
+    }
     return (
       (s.totalValue || 0) > 0 ||
       (s.totalCount || 0) > 0 ||
@@ -2155,7 +3339,8 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
       (s.liqObedeceValue || 0) > 0 ||
       (s.liqNaoObedeceValue || 0) > 0 ||
       (s.outrosValue || 0) > 0 ||
-      (s.valorPagoAno || 0) > 0
+      (s.valorPagoAno || 0) > 0 ||
+      Boolean(s.naturezasDespesa && s.naturezasDespesa.length > 0)
     );
   });
   consolidatedSuppliers.sort((a, b) => b.totalValue - a.totalValue);

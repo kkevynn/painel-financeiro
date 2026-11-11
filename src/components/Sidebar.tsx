@@ -28,8 +28,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const menuItems = [
     { id: 'painel', label: 'Painel' },
     { id: 'pagamentos_fonte', label: 'Pagamentos por Fonte' },
+    { id: 'publicacao', label: 'Publicação' },
+    { id: 'para_publicar', label: 'Para publicar' },
     { id: 'fornecedores_mes', label: 'Fornecedores Atendidos' },
-    { id: 'quebra_ordem', label: 'Quebra de Ordem' },
     { id: 'recorrencia', label: 'Fornecedores Recorrentes' },
     { id: 'categorias', label: 'Categorias' },
     { id: 'importacoes', label: 'Importações' },

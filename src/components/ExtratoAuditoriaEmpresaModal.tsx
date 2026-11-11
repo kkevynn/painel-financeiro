@@ -4,6 +4,7 @@ import {
   Building,
   FileSpreadsheet,
   Download,
+  FileText,
   Printer,
   Search,
   Filter,
@@ -16,14 +17,20 @@ import {
   ChevronLeft,
   ChevronRight,
   ShieldCheck,
+  Check,
 } from 'lucide-react';
 import { FileData, QuebraOrdemItem } from '../types';
 import { formatBRL } from '../utils/excelParser';
 import {
   buildCompanyAuditSummary,
   exportCompanyAuditToExcel,
+  exportCompanyAuditToPdf,
+  formatCleanNL,
   BankAuditRecord,
 } from '../utils/auditCompanyService';
+import { OrdemBancariaItem } from '../utils/ordemBancariaParser';
+import { paraPublicarService } from '../utils/paraPublicarService';
+import { resolveCnpj, resolveSupplierName } from '../utils/appKnowledgeDirectory';
 
 interface ExtratoAuditoriaEmpresaModalProps {
   supplier: { name: string; cnpj: string } | null;
@@ -31,6 +38,7 @@ interface ExtratoAuditoriaEmpresaModalProps {
   files: FileData[];
   quebraOrdemItems?: QuebraOrdemItem[];
   bankRecords?: BankAuditRecord[];
+  ordensBancariasList?: OrdemBancariaItem[] | null;
   isRecurring?: boolean;
 }
 
@@ -40,12 +48,31 @@ export const ExtratoAuditoriaEmpresaModal: React.FC<ExtratoAuditoriaEmpresaModal
   files,
   quebraOrdemItems,
   bankRecords,
+  ordensBancariasList,
   isRecurring,
 }) => {
   const [activeFilterStage, setActiveFilterStage] = useState<string>('all');
   const [searchTerm, setSearchTerm] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
+  const [, setPublicarTick] = useState(0);
+
+  // Prevent background scrolling when modal is open
+  useEffect(() => {
+    const originalOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = originalOverflow;
+    };
+  }, []);
+
+  // Subscribe to changes in paraPublicarService
+  useEffect(() => {
+    const unsub = paraPublicarService.subscribe(() => {
+      setPublicarTick((t) => t + 1);
+    });
+    return () => unsub();
+  }, []);
 
   // Close on Escape key
   useEffect(() => {
@@ -59,15 +86,22 @@ export const ExtratoAuditoriaEmpresaModal: React.FC<ExtratoAuditoriaEmpresaModal
   // Compute the audit summary
   const summary = useMemo(() => {
     if (!supplier) return null;
-    return buildCompanyAuditSummary(supplier, files, quebraOrdemItems, bankRecords);
-  }, [supplier, files, quebraOrdemItems, bankRecords]);
+    return buildCompanyAuditSummary(supplier, files, quebraOrdemItems, bankRecords, ordensBancariasList);
+  }, [supplier, files, quebraOrdemItems, bankRecords, ordensBancariasList]);
 
   // Filter rows
   const filteredRows = useMemo(() => {
     if (!summary) return [];
 
     return summary.allRows.filter((r) => {
-      if (activeFilterStage !== 'all' && r.sourceType !== activeFilterStage) {
+      if (activeFilterStage === 'ordens_bancarias') {
+        const isOB =
+          r.sourceType === 'status_banco' ||
+          r.sourceType === 'pagamentos_emitidos' ||
+          r.sourceType === 'ordem_bancaria' ||
+          (r.status && (r.status.includes('PPCB') || r.status.includes('PAGA') || r.status.includes('PAGO') || r.status.includes('CB')));
+        if (!isOB) return false;
+      } else if (activeFilterStage !== 'all' && r.sourceType !== activeFilterStage) {
         return false;
       }
 
@@ -132,9 +166,9 @@ export const ExtratoAuditoriaEmpresaModal: React.FC<ExtratoAuditoriaEmpresaModal
   };
 
   return (
-    <div className="fixed inset-0 z-50 overflow-y-auto bg-black/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-6 animate-in fade-in-50 duration-200">
+    <div className="fixed inset-0 z-50 overflow-y-auto overscroll-contain bg-black/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-6 animate-in fade-in-50 duration-200">
       <div
-        className="bg-white rounded-3xl shadow-2xl border border-slate-200 w-full max-w-6xl max-h-[92vh] flex flex-col overflow-hidden animate-in zoom-in-95 duration-200"
+        className="bg-white rounded-3xl shadow-2xl border border-slate-200 w-full max-w-6xl max-h-[92vh] flex flex-col overflow-hidden overscroll-contain animate-in zoom-in-95 duration-200"
         role="dialog"
         aria-modal="true"
       >
@@ -160,12 +194,21 @@ export const ExtratoAuditoriaEmpresaModal: React.FC<ExtratoAuditoriaEmpresaModal
                 {summary.supplierName}
               </h2>
               <p className="text-xs text-emerald-200/80 font-mono mt-0.5">
-                CNPJ/CPF: <strong className="text-white">{summary.cnpj}</strong>
+                CNPJ/CPF: <strong className="text-white">{summary.cnpj && summary.cnpj !== 'N/I' ? summary.cnpj : (resolveCnpj(summary.supplierName) || 'Não informado')}</strong>
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => exportCompanyAuditToPdf(summary)}
+              className="px-3.5 py-2 bg-red-600 hover:bg-red-500 text-white text-xs font-bold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-md shadow-red-600/20 active:scale-95"
+              title="Gerar Relatório em PDF com divisão mensal de pagamentos"
+            >
+              <FileText className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Exportar PDF</span>
+            </button>
             <button
               type="button"
               onClick={handleExport}
@@ -198,12 +241,12 @@ export const ExtratoAuditoriaEmpresaModal: React.FC<ExtratoAuditoriaEmpresaModal
         <div className="overflow-y-auto flex-1 p-6 space-y-6">
           {/* Financial Summary Cards */}
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-            {/* Total Consolidado */}
+            {/* Soma Bruta Geral */}
             <div className="bg-slate-900 text-white rounded-2xl p-3.5 space-y-1 shadow-xs border border-slate-800">
               <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
-                Total Consolidado
+                Soma Bruta Geral
               </span>
-              <span className="text-base sm:text-lg font-black font-mono block text-emerald-400 truncate" title={formatBRL(summary.totalConsolidatedValue)}>
+              <span className="text-sm sm:text-base font-black font-mono block text-emerald-400 break-words leading-tight" title={formatBRL(summary.totalConsolidatedValue)}>
                 {formatBRL(summary.totalConsolidatedValue)}
               </span>
               <span className="text-[10px] text-slate-400 block">
@@ -216,7 +259,7 @@ export const ExtratoAuditoriaEmpresaModal: React.FC<ExtratoAuditoriaEmpresaModal
               <span className="text-[10px] font-bold text-emerald-800 uppercase tracking-wider block">
                 Base de PPs
               </span>
-              <span className="text-base sm:text-lg font-black font-mono block text-emerald-950 truncate" title={formatBRL(summary.ppProntasAOValue || summary.ppProntasValue)}>
+              <span className="text-sm sm:text-base font-black font-mono block text-emerald-950 break-words leading-tight" title={formatBRL(summary.ppProntasAOValue || summary.ppProntasValue)}>
                 {formatBRL(summary.ppProntasAOValue || summary.ppProntasValue)}
               </span>
               <span className="text-[10px] text-emerald-700 block">
@@ -230,7 +273,7 @@ export const ExtratoAuditoriaEmpresaModal: React.FC<ExtratoAuditoriaEmpresaModal
                 <span className="text-[10px] font-bold text-blue-900 uppercase tracking-wider block">
                   Enviadas a Banco
                 </span>
-                <span className="text-base sm:text-lg font-black font-mono block text-blue-950 truncate" title={formatBRL(summary.enviadasBancoValue || 0)}>
+                <span className="text-sm sm:text-base font-black font-mono block text-blue-950 break-words leading-tight" title={formatBRL(summary.enviadasBancoValue || 0)}>
                   {formatBRL(summary.enviadasBancoValue || 0)}
                 </span>
                 <span className="text-[10px] text-blue-800 font-bold block">
@@ -244,7 +287,7 @@ export const ExtratoAuditoriaEmpresaModal: React.FC<ExtratoAuditoriaEmpresaModal
               <span className="text-[10px] font-bold text-blue-800 uppercase tracking-wider block">
                 Liquidado - Obedece
               </span>
-              <span className="text-base sm:text-lg font-black font-mono block text-blue-950 truncate" title={formatBRL(summary.liqObedeceValue)}>
+              <span className="text-sm sm:text-base font-black font-mono block text-blue-950 break-words leading-tight" title={formatBRL(summary.liqObedeceValue)}>
                 {formatBRL(summary.liqObedeceValue)}
               </span>
               <span className="text-[10px] text-blue-700 block">
@@ -257,7 +300,7 @@ export const ExtratoAuditoriaEmpresaModal: React.FC<ExtratoAuditoriaEmpresaModal
               <span className="text-[10px] font-bold text-amber-800 uppercase tracking-wider block">
                 Liquidado - Não Obedece
               </span>
-              <span className="text-base sm:text-lg font-black font-mono block text-amber-950 truncate" title={formatBRL(summary.liqNaoObedeceValue)}>
+              <span className="text-sm sm:text-base font-black font-mono block text-amber-950 break-words leading-tight" title={formatBRL(summary.liqNaoObedeceValue)}>
                 {formatBRL(summary.liqNaoObedeceValue)}
               </span>
               <span className="text-[10px] text-amber-700 block">
@@ -265,25 +308,27 @@ export const ExtratoAuditoriaEmpresaModal: React.FC<ExtratoAuditoriaEmpresaModal
               </span>
             </div>
 
-            {/* Quebra de Ordem (AO) */}
-            <div className="bg-purple-50/60 rounded-2xl p-3.5 space-y-1 border border-purple-200">
-              <span className="text-[10px] font-bold text-purple-800 uppercase tracking-wider block">
-                Quebra Ordem (AO)
-              </span>
-              <span className="text-base sm:text-lg font-black font-mono block text-purple-950 truncate" title={formatBRL(summary.quebraOrdemValue)}>
-                {formatBRL(summary.quebraOrdemValue)}
-              </span>
-              <span className="text-[10px] text-purple-700 block">
-                {summary.quebraOrdemCount} OBs emitidas
-              </span>
-            </div>
+            {/* Quebra de Ordem (AO) - se houver */}
+            {(summary.quebraOrdemCount || 0) > 0 && (
+              <div className="bg-purple-50/60 rounded-2xl p-3.5 space-y-1 border border-purple-200">
+                <span className="text-[10px] font-bold text-purple-800 uppercase tracking-wider block">
+                  Quebra Ordem (AO)
+                </span>
+                <span className="text-sm sm:text-base font-black font-mono block text-purple-950 break-words leading-tight" title={formatBRL(summary.quebraOrdemValue)}>
+                  {formatBRL(summary.quebraOrdemValue)}
+                </span>
+                <span className="text-[10px] text-purple-700 block">
+                  {summary.quebraOrdemCount} OBs emitidas
+                </span>
+              </div>
+            )}
 
             {/* Status Banco */}
             <div className="bg-teal-50/60 rounded-2xl p-3.5 space-y-1 border border-teal-200">
               <span className="text-[10px] font-bold text-teal-800 uppercase tracking-wider block">
                 Status Banco
               </span>
-              <span className="text-base sm:text-lg font-black font-mono block text-teal-950">
+              <span className="text-sm sm:text-base font-black font-mono block text-teal-950 break-words leading-tight">
                 {summary.bancoRecordsCount} reg.
               </span>
               <span className="text-[10px] text-teal-700 block">
@@ -308,73 +353,53 @@ export const ExtratoAuditoriaEmpresaModal: React.FC<ExtratoAuditoriaEmpresaModal
                 Todas ({summary.allRows.length})
               </button>
 
+              <button
+                type="button"
+                onClick={() => setActiveFilterStage('obedece')}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer shrink-0 ${
+                  activeFilterStage === 'obedece'
+                    ? 'bg-blue-700 text-white shadow-xs'
+                    : 'bg-white text-blue-800 hover:bg-blue-50 border border-blue-200'
+                }`}
+              >
+                Liquidações - Obedece ({summary.liqObedeceCount})
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setActiveFilterStage('nao_obedece')}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer shrink-0 ${
+                  activeFilterStage === 'nao_obedece'
+                    ? 'bg-amber-700 text-white shadow-xs'
+                    : 'bg-white text-amber-800 hover:bg-amber-50 border border-amber-200'
+                }`}
+              >
+                Liquidações - Não Obedece ({summary.liqNaoObedeceCount})
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setActiveFilterStage('ordens_bancarias')}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer shrink-0 ${
+                  activeFilterStage === 'ordens_bancarias'
+                    ? 'bg-teal-700 text-white shadow-xs'
+                    : 'bg-white text-teal-800 hover:bg-teal-50 border border-teal-200'
+                }`}
+              >
+                Ordens bancárias ({summary.bancoRecordsCount || 0})
+              </button>
+
               {summary.ppProntasCount > 0 && (
                 <button
                   type="button"
-                  onClick={() => setActiveFilterStage('pp_prontas')}
+                  onClick={() => setActiveFilterStage('base_pps')}
                   className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer shrink-0 ${
-                    activeFilterStage === 'pp_prontas'
+                    activeFilterStage === 'base_pps'
                       ? 'bg-emerald-700 text-white shadow-xs'
                       : 'bg-white text-emerald-800 hover:bg-emerald-50 border border-emerald-200'
                   }`}
                 >
                   Base de PPs ({summary.ppProntasCount})
-                </button>
-              )}
-
-              {summary.liqObedeceCount > 0 && (
-                <button
-                  type="button"
-                  onClick={() => setActiveFilterStage('obedece')}
-                  className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer shrink-0 ${
-                    activeFilterStage === 'obedece'
-                      ? 'bg-blue-700 text-white shadow-xs'
-                      : 'bg-white text-blue-800 hover:bg-blue-50 border border-blue-200'
-                  }`}
-                >
-                  Liquidado - Obedece ({summary.liqObedeceCount})
-                </button>
-              )}
-
-              {summary.liqNaoObedeceCount > 0 && (
-                <button
-                  type="button"
-                  onClick={() => setActiveFilterStage('nao_obedece')}
-                  className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer shrink-0 ${
-                    activeFilterStage === 'nao_obedece'
-                      ? 'bg-amber-700 text-white shadow-xs'
-                      : 'bg-white text-amber-800 hover:bg-amber-50 border border-amber-200'
-                  }`}
-                >
-                  Liquidado - Não Obedece ({summary.liqNaoObedeceCount})
-                </button>
-              )}
-
-              {summary.quebraOrdemCount > 0 && (
-                <button
-                  type="button"
-                  onClick={() => setActiveFilterStage('pagamentos_emitidos')}
-                  className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer shrink-0 ${
-                    activeFilterStage === 'pagamentos_emitidos'
-                      ? 'bg-purple-700 text-white shadow-xs'
-                      : 'bg-white text-purple-800 hover:bg-purple-50 border border-purple-200'
-                  }`}
-                >
-                  Quebra Ordem ({summary.quebraOrdemCount})
-                </button>
-              )}
-
-              {summary.bancoRecordsCount > 0 && (
-                <button
-                  type="button"
-                  onClick={() => setActiveFilterStage('status_banco')}
-                  className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer shrink-0 ${
-                    activeFilterStage === 'status_banco'
-                      ? 'bg-teal-700 text-white shadow-xs'
-                      : 'bg-white text-teal-800 hover:bg-teal-50 border border-teal-200'
-                  }`}
-                >
-                  Status Banco ({summary.bancoRecordsCount})
                 </button>
               )}
             </div>
@@ -399,24 +424,24 @@ export const ExtratoAuditoriaEmpresaModal: React.FC<ExtratoAuditoriaEmpresaModal
                 <thead>
                   <tr className="bg-slate-100/80 text-slate-700 font-extrabold uppercase tracking-wider border-b border-slate-200 text-[11px]">
                     <th className="py-3 px-3 text-center w-10">#</th>
-                    <th className="py-3 px-3 w-36">ETAPA / ORIGEM</th>
-                    <th className="py-3 px-4 min-w-[160px]">ARQUIVO DA PLANILHA</th>
-                    <th className="py-3 px-3 w-36 font-mono">DOCUMENTO / PP / OB</th>
+                    <th className="py-3 px-3 w-40">LIQUIDAÇÃO</th>
+                    <th className="py-3 px-3 w-44 font-mono">NÚMERO DA LIQUIDAÇÃO</th>
                     <th className="py-3 px-3 text-right w-32 font-mono">VALOR (R$)</th>
-                    <th className="py-3 px-3 w-36">SITUAÇÃO / STATUS</th>
-                    <th className="py-3 px-3 min-w-[140px]">DETALHES / FONTE</th>
+                    <th className="py-3 px-3 text-center w-36">PUBLICAR</th>
+                    <th className="py-3 px-3 min-w-[120px]">FONTE DE RECURSO</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 font-medium">
                   {paginatedRows.length === 0 ? (
                     <tr>
-                      <td colSpan={7} className="py-10 text-center text-slate-400 italic">
+                      <td colSpan={6} className="py-10 text-center text-slate-400 italic">
                         Nenhuma ocorrência encontrada para este filtro.
                       </td>
                     </tr>
                   ) : (
                     paginatedRows.map((row, idx) => {
                       const realIndex = pageSize === 0 ? idx + 1 : (currentPage - 1) * pageSize + idx + 1;
+                      const isSelected = paraPublicarService.isSelected(row.documentNumber, summary.cnpj);
                       return (
                         <tr key={row.id} className="hover:bg-slate-50 transition-colors">
                           <td className="py-2.5 px-3 text-center font-mono text-[11px] text-slate-400 border-r border-slate-100">
@@ -427,26 +452,47 @@ export const ExtratoAuditoriaEmpresaModal: React.FC<ExtratoAuditoriaEmpresaModal
                               {row.sourceLabel}
                             </span>
                           </td>
-                          <td className="py-2.5 px-4 font-medium text-slate-700 border-r border-slate-100">
-                            <span className="truncate max-w-[200px] block text-xs" title={row.sourceFileName}>
-                              {row.sourceFileName}
-                            </span>
-                          </td>
                           <td className="py-2.5 px-3 font-mono font-bold text-slate-900 border-r border-slate-100">
-                            <span className="bg-slate-100 px-1.5 py-0.5 rounded border border-slate-200 text-[11px]">
-                              {row.documentNumber}
+                            <span className="bg-slate-100 px-2 py-0.5 rounded border border-slate-200 text-[11px] font-mono font-bold text-slate-900 inline-block">
+                              {formatCleanNL(row.documentNumber)}
                             </span>
                           </td>
                           <td className="py-2.5 px-3 text-right font-mono font-bold text-slate-900 border-r border-slate-100">
                             {formatBRL(row.value)}
                           </td>
-                          <td className="py-2.5 px-3 text-slate-700 border-r border-slate-100">
-                            <span className="text-[11px] font-semibold">
-                              {row.status || '-'}
-                            </span>
+                          <td className="py-2.5 px-3 text-center border-r border-slate-100">
+                            <label className="inline-flex items-center gap-1.5 cursor-pointer select-none">
+                              <input
+                                type="checkbox"
+                                checked={isSelected}
+                                onChange={() =>
+                                  paraPublicarService.toggleItem({
+                                    documentNumber: row.documentNumber,
+                                    supplierName: summary.supplierName,
+                                    cnpj: resolveCnpj(summary.supplierName, row.documentNumber, summary.cnpj),
+                                    value: row.value,
+                                    fonteRecurso: row.fonteRecurso,
+                                    sourceType: row.sourceType,
+                                    sourceLabel: row.sourceLabel,
+                                    status: row.status,
+                                    date: row.date,
+                                  })
+                                }
+                                className="w-4 h-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500 cursor-pointer"
+                              />
+                              <span
+                                className={`text-[10px] font-bold px-1.5 py-0.5 rounded transition ${
+                                  isSelected
+                                    ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                                    : 'text-slate-500 hover:text-slate-800'
+                                }`}
+                              >
+                                {isSelected ? 'Selecionado' : 'Publicar'}
+                              </span>
+                            </label>
                           </td>
-                          <td className="py-2.5 px-3 text-slate-500 text-[11px]">
-                            {row.details || (row.fonteRecurso ? `Fonte: ${row.fonteRecurso}` : '-')}
+                          <td className="py-2.5 px-3 text-slate-700 text-[11px] font-mono font-bold">
+                            {row.fonteRecurso || '0.6.00'}
                           </td>
                         </tr>
                       );
@@ -487,14 +533,11 @@ export const ExtratoAuditoriaEmpresaModal: React.FC<ExtratoAuditoriaEmpresaModal
         </div>
 
         {/* Modal Footer */}
-        <div className="bg-slate-50 px-6 py-4 border-t border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-3 shrink-0">
-          <div className="text-xs text-slate-500">
-            Varredura realizada em todas as planilhas carregadas no painel.
-          </div>
+        <div className="bg-slate-50 px-6 py-4 border-t border-slate-200 flex items-center justify-end shrink-0">
           <button
             type="button"
             onClick={onClose}
-            className="w-full sm:w-auto px-5 py-2 bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs rounded-xl transition cursor-pointer active:scale-95"
+            className="w-full sm:w-auto px-6 py-2.5 bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs rounded-xl transition cursor-pointer active:scale-95 shadow-xs"
           >
             Fechar Extrato
           </button>

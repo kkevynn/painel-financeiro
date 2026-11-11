@@ -9,7 +9,11 @@ import {
   BrainCircuit,
   Bell,
   Loader2,
+  RefreshCw,
+  LogOut,
 } from 'lucide-react';
+import { GoogleDriveState } from '../utils/googleDriveService';
+import { CloudSyncState } from '../utils/cloudSyncService';
 
 interface HeaderProps {
   activeTab: string;
@@ -23,6 +27,21 @@ interface HeaderProps {
   unreadAlertsCount?: number;
   isProcessed: boolean;
   lastProcessedAt?: Date | string | null;
+
+  // Google Drive & Sheets Integration
+  driveState?: GoogleDriveState;
+  onConnectDrive?: () => Promise<void> | void;
+  onDisconnectDrive?: () => void;
+  onSyncDriveNow?: () => Promise<void> | void;
+  isDriveSyncing?: boolean;
+
+  // Cloud Multi-Device Synchronization (Tablet & PC)
+  cloudSyncState?: CloudSyncState;
+
+  // Discreet Progress Bar
+  isProcessing?: boolean;
+  processingProgress?: number;
+  processingMessage?: string;
 }
 
 const TAB_TITLES: Record<string, { title: string; subtitle: string }> = {
@@ -34,13 +53,17 @@ const TAB_TITLES: Record<string, { title: string; subtitle: string }> = {
     title: 'Pagamentos por Fonte de Recursos',
     subtitle: 'Divisão, detalhamento e consolidação das Ordens Bancárias por Fonte e Credor',
   },
+  publicacao: {
+    title: 'NLs para Publicação por Dia',
+    subtitle: 'Acompanhamento diário de publicação, emissão de PP/OB e pendências em Obedece',
+  },
+  para_publicar: {
+    title: 'Para Publicar',
+    subtitle: 'Liquidações selecionadas para publicação no Diário Oficial (DOE)',
+  },
   fornecedores_mes: {
     title: 'Controle Mensal de Fornecedores',
     subtitle: 'Acompanhamento e registro mensal de fornecedores atendidos e pendentes',
-  },
-  quebra_ordem: {
-    title: 'Monitoramento de Publicações',
-    subtitle: 'Cruzamento de Liquidações e Ordens Bancárias (AO) por Quebra de Ordem Cronológica',
   },
   recorrencia: {
     title: 'Fornecedores Recorrentes',
@@ -68,6 +91,15 @@ export const Header: React.FC<HeaderProps> = ({
   unreadAlertsCount,
   isProcessed,
   lastProcessedAt,
+  driveState,
+  onConnectDrive,
+  onDisconnectDrive,
+  onSyncDriveNow,
+  isDriveSyncing,
+  cloudSyncState,
+  isProcessing,
+  processingProgress,
+  processingMessage,
 }) => {
   const [isSaving, setIsSaving] = useState(false);
   const [savedNotification, setSavedNotification] = useState(false);
@@ -135,24 +167,41 @@ export const Header: React.FC<HeaderProps> = ({
         {/* Date/Time + Action Buttons */}
         <div className="flex flex-wrap items-center gap-3">
           
-          {/* Updated Date & Time Display */}
-          <div className="bg-emerald-50/80 text-emerald-900 px-3.5 py-1.5 rounded-xl border border-emerald-200 text-xs font-semibold flex items-center gap-2">
-            <Calendar className="w-3.5 h-3.5 text-emerald-700" />
-            <span className="font-mono">{formattedUpdateDate}</span>
-          </div>
+          {/* Updated Date & Time Display OR Discreet Updating Indicator */}
+          {isProcessing ? (
+            <div className="bg-emerald-50 text-emerald-900 px-3.5 py-1.5 rounded-xl border border-emerald-300 text-xs font-bold flex items-center gap-2 shadow-2xs">
+              <RefreshCw className="w-3.5 h-3.5 animate-spin text-emerald-600" />
+              <span>{processingMessage || 'Atualizando informações...'} ({processingProgress || 100}%)</span>
+            </div>
+          ) : (
+            <div className="bg-emerald-50/80 text-emerald-900 px-3.5 py-1.5 rounded-xl border border-emerald-200 text-xs font-semibold flex items-center gap-2">
+              <Calendar className="w-3.5 h-3.5 text-emerald-700" />
+              <span className="font-mono">{formattedUpdateDate}</span>
+            </div>
+          )}
 
           {/* Auditoria IA Button */}
           {onOpenAuditoriaML && (
             <button
               type="button"
               onClick={onOpenAuditoriaML}
-              className="px-3.5 py-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5 border shadow-2xs cursor-pointer bg-indigo-50 hover:bg-indigo-100 text-indigo-900 border-indigo-200 active:scale-95"
-              title="Auditoria de Inferências e Aprendizado de Máquina (Conversão de NL em PP)"
+              className={`px-3.5 py-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5 border shadow-2xs cursor-pointer active:scale-95 ${
+                typeof pendingInferencesCount === 'number' && pendingInferencesCount > 0
+                  ? 'bg-amber-50 hover:bg-amber-100 text-amber-950 border-amber-300 ring-2 ring-amber-400/30'
+                  : 'bg-indigo-50 hover:bg-indigo-100 text-indigo-900 border-indigo-200'
+              }`}
+              title="Auditoria de Inferências e Validação de Conversões (NL em PP / OB)"
             >
-              <BrainCircuit className="w-4 h-4 text-indigo-600" />
+              <BrainCircuit
+                className={`w-4 h-4 ${
+                  typeof pendingInferencesCount === 'number' && pendingInferencesCount > 0
+                    ? 'text-amber-600 animate-pulse'
+                    : 'text-indigo-600'
+                }`}
+              />
               <span>Auditoria IA</span>
               {typeof pendingInferencesCount === 'number' && pendingInferencesCount > 0 && (
-                <span className="bg-indigo-600 text-white text-[10px] font-black px-1.5 py-0.5 rounded-full leading-none">
+                <span className="bg-amber-600 text-white text-[10px] font-black px-1.5 py-0.5 rounded-full leading-none">
                   {pendingInferencesCount}
                 </span>
               )}
@@ -175,6 +224,61 @@ export const Header: React.FC<HeaderProps> = ({
                 </span>
               )}
             </button>
+          )}
+
+          {/* Google Integration Controls (Drive + Cloud Sync Tablet & PC) */}
+          {driveState && (
+            <div className="flex items-center gap-2">
+              {!driveState.isConnected ? (
+                <button
+                  type="button"
+                  onClick={onConnectDrive}
+                  disabled={driveState.status === 'connecting'}
+                  className="px-3.5 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 border shadow-2xs cursor-pointer active:scale-95 bg-white hover:bg-slate-50 text-slate-700 border-slate-300"
+                  title="Conectar Conta Google para sincronização automática entre Tablet, PC e relatórios do SIGEF"
+                >
+                  {driveState.status === 'connecting' ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-600" />
+                  ) : (
+                    <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" fill="none">
+                      <path d="M7.71 3.5L1.15 15l3.43 6 6.55-11.5L7.71 3.5z" fill="#0066DA" />
+                      <path d="M16.29 3.5H7.71l6.56 11.5h8.58L16.29 3.5z" fill="#00AC47" />
+                      <path d="M14.27 15l-3.43 6h11.96l3.43-6H14.27z" fill="#EA4335" />
+                      <path d="M7.71 3.5l3.43 6-3.43 6-3.43-6 3.43-6z" fill="#00832D" />
+                      <path d="M14.27 15l-3.14-5.5-3.42 6h6.56z" fill="#2684FC" />
+                      <path d="M22.85 15h-8.58l3.44-6h5.14z" fill="#FFBA00" />
+                    </svg>
+                  )}
+                  <span>{driveState.status === 'connecting' ? 'Conectando...' : 'Conectar Conta Google'}</span>
+                </button>
+              ) : (
+                <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 p-1 rounded-xl">
+                  {/* Status Indicator */}
+                  <div
+                    className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-slate-700"
+                    title={`Conta Google Conectada (${driveState.userEmail || ''}). Sincronização em nuvem e Drive ativas entre Tablet e PC.`}
+                  >
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                    <span className="font-semibold text-slate-800 max-w-[120px] sm:max-w-[160px] truncate">
+                      {driveState.userEmail || 'Conta Google'}
+                    </span>
+                  </div>
+
+
+                  {/* Desconectar */}
+                  {onDisconnectDrive && (
+                    <button
+                      type="button"
+                      onClick={onDisconnectDrive}
+                      className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition cursor-pointer"
+                      title="Desconectar Conta Google"
+                    >
+                      <LogOut className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
           )}
 
           {/* Salvar Button */}
@@ -244,8 +348,17 @@ export const Header: React.FC<HeaderProps> = ({
           )}
 
         </div>
-
       </div>
+
+      {/* Discreet Animated Progress Bar */}
+      {isProcessing && (
+        <div className="absolute bottom-0 left-0 right-0 h-1 bg-emerald-100 overflow-hidden">
+          <div
+            className="h-full bg-emerald-600 transition-all duration-300 ease-out shadow-xs shadow-emerald-500/50"
+            style={{ width: `${Math.min(100, Math.max(8, processingProgress || 100))}%` }}
+          />
+        </div>
+      )}
     </header>
   );
 };

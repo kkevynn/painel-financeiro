@@ -36,7 +36,7 @@ export const TopSuppliersTables: React.FC<TopSuppliersTablesProps> = ({ metrics 
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
           {topList.map((item, index) => {
             const rank = index + 1;
-            const percentage = totalValue > 0 ? ((item.totalValue / totalValue) * 100).toFixed(1) : '0';
+            const percentage = totalValue > 0 ? ((item.totalValue / totalValue) * 100).toFixed(1).replace('.', ',') : '0';
 
             return (
               <div

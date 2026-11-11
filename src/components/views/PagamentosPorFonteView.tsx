@@ -13,14 +13,19 @@ import {
   Receipt,
   ChevronDown,
   ChevronRight,
-  ExternalLink,
   ChevronLeft,
   ChevronRight as ChevronRightIcon,
   ChevronsUpDown,
+  Settings2,
 } from 'lucide-react';
 import * as XLSX from 'xlsx';
-import { OrdemBancariaItem, parseListarOrdemBancariaMatrixAsync } from '../../utils/ordemBancariaParser';
-import { readSpreadsheetAsMatrix, formatBRL } from '../../utils/excelParser';
+import {
+  OrdemBancariaItem,
+  parseListarOrdemBancariaMatrixAsync,
+  isObFileName,
+  extractOrdensBancariasFromFileData,
+} from '../../utils/ordemBancariaParser';
+import { readSpreadsheetAsMatrix, formatBRL, parseCurrencyValue } from '../../utils/excelParser';
 import { FileData } from '../../types';
 
 interface PagamentosPorFonteViewProps {
@@ -30,12 +35,15 @@ interface PagamentosPorFonteViewProps {
   onUpdateOrdensBancariasList?: (list: OrdemBancariaItem[] | null, fileName?: string) => void;
   onOpenCompanyAudit?: (supplier: { name: string; cnpj: string }) => void;
   onNavigateToImportacoes?: () => void;
+  onOpenColumnMapModal?: (fileId: string) => void;
+  onFileUpload?: (file: File) => void;
 }
 
 interface SupplierFonteRow {
   key: string;
   name: string;
   cnpj: string;
+  qtdOrdens: number;
   totalGeral: number;
   pagoNoMes: number;
   fontesValues: Record<string, number>;
@@ -126,6 +134,32 @@ const getFonteColorStyle = (fonte: string): FonteColorStyle => {
   return palettes[Math.abs(hash) % palettes.length];
 };
 
+/**
+ * Safely converts any value (number, string, currency string) into a finite positive number.
+ */
+function sanitizeNumericValue(val: unknown): number {
+  if (val === null || val === undefined) return 0;
+  if (typeof val === 'number') {
+    return Number.isFinite(val) && !Number.isNaN(val) && val > 0 ? val : 0;
+  }
+  if (typeof val === 'string') {
+    const trimmed = val.trim();
+    if (!trimmed || trimmed === '-' || trimmed === '0' || trimmed === '0,00' || trimmed === 'R$ 0,00') {
+      return 0;
+    }
+    const parsed = parseCurrencyValue(trimmed);
+    if (typeof parsed === 'number' && Number.isFinite(parsed) && !Number.isNaN(parsed) && parsed > 0) {
+      return parsed;
+    }
+    const cleaned = trimmed.replace(/[R$\s]/g, '').replace(/\./g, '').replace(',', '.');
+    const direct = parseFloat(cleaned);
+    if (typeof direct === 'number' && Number.isFinite(direct) && !Number.isNaN(direct) && direct > 0) {
+      return direct;
+    }
+  }
+  return 0;
+}
+
 export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
   files = [],
   ordensBancariasList = [],
@@ -133,6 +167,8 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
   onUpdateOrdensBancariasList,
   onOpenCompanyAudit,
   onNavigateToImportacoes,
+  onOpenColumnMapModal,
+  onFileUpload,
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedMes, setSelectedMes] = useState<string>('all');
@@ -145,57 +181,75 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
   const [confirmClear, setConfirmClear] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  // Consolidated items from ordensBancariasList or detected Fonte in files
+  // Consolidated items: direct, fast, linear reading of ordensBancariasList
   const items = useMemo<OrdemBancariaItem[]>(() => {
-    if (ordensBancariasList && ordensBancariasList.length > 0) {
-      return ordensBancariasList;
+    let rawList: unknown[] = [];
+
+    if (Array.isArray(ordensBancariasList) && ordensBancariasList.length > 0) {
+      rawList = ordensBancariasList;
+    } else if (Array.isArray(files) && files.length > 0) {
+      const obFile = files.find(
+        (f) =>
+          f &&
+          (f.stage === 'ordem_bancaria' ||
+            (typeof f.fileName === 'string' && isObFileName(f.fileName)) ||
+            Boolean(f.detectedObCol && f.detectedFonteCol))
+      );
+      if (obFile) {
+        rawList = extractOrdensBancariasFromFileData(obFile);
+      }
     }
 
-    if (files && files.length > 0) {
-      const extracted: OrdemBancariaItem[] = [];
-      files.forEach((file) => {
-        const fonteCol = file.detectedFonteCol;
-        if (!fonteCol) return;
-        const favCol = file.detectedFavorecidoCol;
-        const valCol = file.detectedValorCol;
-        const obCol = file.detectedObCol;
-        const ppCol = file.detectedNumeroCol || file.detectedPpCol;
-        const cnpjCol = file.detectedCnpjCol;
-        const sitCol = file.detectedSituacaoCol;
+    if (!Array.isArray(rawList) || rawList.length === 0) {
+      return [];
+    }
 
-        file.rows.forEach((row, idx) => {
-          const rawFonte = String(row[fonteCol] || '').trim();
-          if (!rawFonte) return;
-          const rawVal = valCol ? row[valCol] : 0;
-          const valor = typeof rawVal === 'number' ? rawVal : 0;
-          if (valor <= 0) return;
+    const validated: OrdemBancariaItem[] = [];
+    for (let i = 0; i < rawList.length; i++) {
+      const entry = rawList[i];
+      if (!entry || typeof entry !== 'object') continue;
 
-          const rawFav = favCol ? String(row[favCol] || '').trim() : 'Favorecido';
-          const ob = obCol ? String(row[obCol] || '').trim() : `ITEM-${idx + 1}`;
-          const pp = ppCol ? String(row[ppCol] || '').trim() : '';
-          const cnpj = cnpjCol ? String(row[cnpjCol] || '').trim() : '';
-          const sit = sitCol ? String(row[sitCol] || '').trim() : 'PAGO';
+      const raw = entry as Record<string, unknown>;
+      const rawVal = raw.valor ?? raw.Valor ?? raw.VALOR ?? raw.vlr ?? raw.valorPago;
+      const valor = sanitizeNumericValue(rawVal);
+      if (valor <= 0) continue;
 
-          extracted.push({
-            id: `${file.id}_${idx}`,
-            ob: ob || `ITEM-${idx + 1}`,
-            dataReferencia: '',
-            mesAnoKey: '',
-            mesAnoLabel: 'Exercício Atual',
-            valor,
-            situacao: sit,
-            pp,
-            fonteRecurso: rawFonte,
-            favorecidoRaw: rawFav,
-            favorecidoCnpj: cnpj,
-            favorecidoName: rawFav,
-          });
-        });
+      const rawOb = raw.ob ?? '';
+      const cleanOb = String(rawOb).trim().toUpperCase().replace(/[\s\.\-\/]/g, '');
+      const rawName = String(raw.favorecidoName ?? raw.favorecidoRaw ?? '').trim();
+      const upperName = rawName.toUpperCase();
+
+      // FILTRO RIGOROSO PARA BARRAR LINHAS TOTALIZADORAS
+      if (!cleanOb || cleanOb === '-' || cleanOb === '0') continue;
+      if (cleanOb.includes('TOTAL') || cleanOb.includes('RESUMO') || cleanOb.includes('SUBTOTAL')) continue;
+      if (upperName.includes('TOTAL') || upperName.includes('RESUMO') || upperName.includes('SUBTOTAL')) continue;
+
+      const favorecidoName = rawName || 'NÃO INFORMADO';
+      const favorecidoCnpj = String(raw.favorecidoCnpj ?? '').trim() || 'N/I';
+
+      const fonteRecurso = String(raw.fonteRecurso ?? '').trim() || 'Fonte Não Identificada';
+      const mesAnoKey = String(raw.mesAnoKey ?? '').trim();
+      const mesAnoLabel = String(raw.mesAnoLabel ?? '').trim() || 'Sem Data';
+
+      validated.push({
+        id: String(raw.id || `ob_${cleanOb}_${i}`),
+        ob: cleanOb,
+        dataReferencia: String(raw.dataReferencia ?? ''),
+        dataIso: typeof raw.dataIso === 'string' ? raw.dataIso : undefined,
+        mesAnoKey,
+        mesAnoLabel,
+        valor,
+        situacao: String(raw.situacao ?? 'CB'),
+        pp: String(raw.pp ?? '').trim(),
+        fonteRecurso,
+        favorecidoRaw: String(raw.favorecidoRaw ?? ''),
+        favorecidoCnpj,
+        favorecidoName,
+        linhaOrigem: typeof raw.linhaOrigem === 'number' ? raw.linhaOrigem : i + 1,
       });
-      if (extracted.length > 0) return extracted;
     }
 
-    return [];
+    return validated;
   }, [ordensBancariasList, files]);
 
   // Handle direct file upload in this view
@@ -219,6 +273,10 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
       if (onUpdateOrdensBancariasList) {
         onUpdateOrdensBancariasList(parsed, file.name);
       }
+
+      if (onFileUpload) {
+        onFileUpload(file);
+      }
     } catch (err: any) {
       setErrorMessage('Erro ao processar planilha: ' + (err?.message || 'Arquivo corrompido ou formato inválido.'));
     } finally {
@@ -227,12 +285,29 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
     }
   };
 
+  // Find active FileData for OB report if available in files
+  const activeObFile = useMemo(() => {
+    if (!Array.isArray(files) || files.length === 0) return null;
+    if (ordensBancariasFileName) {
+      const match = files.find((f) => f.fileName === ordensBancariasFileName);
+      if (match) return match;
+    }
+    return (
+      files.find(
+        (f) =>
+          f.stage === 'ordem_bancaria' ||
+          isObFileName(f.fileName) ||
+          Boolean(f.detectedObCol && f.detectedFonteCol)
+      ) || null
+    );
+  }, [files, ordensBancariasFileName]);
+
   // Distinct list of Available Fontes de Recurso
   const availableFontes = useMemo(() => {
     const fontesSet = new Set<string>();
     items.forEach((it) => {
       const f = (it.fonteRecurso || '').trim();
-      if (f) fontesSet.add(f);
+      if (f && f !== '-' && f !== '0') fontesSet.add(f);
     });
     return Array.from(fontesSet).sort();
   }, [items]);
@@ -250,13 +325,6 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
       .sort((a, b) => b.key.localeCompare(a.key));
   }, [items]);
 
-  // Set default month to the most recent month if available and currently 'all'
-  React.useEffect(() => {
-    if (selectedMes === 'all' && availableMonths.length > 0) {
-      setSelectedMes(availableMonths[0].key);
-    }
-  }, [availableMonths]);
-
   // Active Month Label for headers
   const activeMonthLabel = useMemo(() => {
     if (selectedMes === 'all') return 'Todos os Meses';
@@ -264,39 +332,53 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
     return found ? found.label : selectedMes;
   }, [selectedMes, availableMonths]);
 
-  // Build supplier matrix: Fornecedores x Fontes + Pago no Mês
+  // Aggregated Supplier rows: single fast O(N) pass
   const supplierRows = useMemo<SupplierFonteRow[]>(() => {
+    if (items.length === 0) return [];
+
     const map = new Map<string, SupplierFonteRow>();
 
-    items.forEach((it) => {
-      const cnpjDigits = (it.favorecidoCnpj || '').replace(/\D/g, '');
-      const key = cnpjDigits.length >= 11 ? cnpjDigits : it.favorecidoName.trim().toUpperCase();
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      const cnpjDigits = it.favorecidoCnpj.replace(/\D/g, '');
+      const rawName = it.favorecidoName.trim().toUpperCase();
+
+      const key = cnpjDigits.length >= 11 ? cnpjDigits : rawName || it.ob || String(i);
 
       let row = map.get(key);
       if (!row) {
         row = {
           key,
           name: it.favorecidoName,
-          cnpj: it.favorecidoCnpj || 'N/I',
+          cnpj: it.favorecidoCnpj !== 'N/I' ? it.favorecidoCnpj : (cnpjDigits || 'N/I'),
+          qtdOrdens: 0,
           totalGeral: 0,
           pagoNoMes: 0,
           fontesValues: {},
           despesas: [],
         };
         map.set(key, row);
+      } else {
+        if ((!row.cnpj || row.cnpj === 'N/I') && it.favorecidoCnpj && it.favorecidoCnpj !== 'N/I') {
+          row.cnpj = it.favorecidoCnpj;
+        }
+        if ((row.name === 'NÃO INFORMADO' || row.name.length < 5) && it.favorecidoName && it.favorecidoName.length >= 5) {
+          row.name = it.favorecidoName;
+        }
       }
 
-      const f = (it.fonteRecurso || 'OUTRAS').trim();
+      const f = it.fonteRecurso || 'Fonte Não Identificada';
       const belongsToSelectedMonth = selectedMes === 'all' || it.mesAnoKey === selectedMes;
 
       row.totalGeral += it.valor;
 
       if (belongsToSelectedMonth) {
         row.pagoNoMes += it.valor;
+        row.qtdOrdens += 1;
         row.fontesValues[f] = (row.fontesValues[f] || 0) + it.valor;
         row.despesas.push(it);
       }
-    });
+    }
 
     return Array.from(map.values());
   }, [items, selectedMes]);
@@ -307,9 +389,7 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
     const cleanQuery = query.replace(/\D/g, '');
 
     const list = supplierRows.filter((s) => {
-      // Must have value in the current filter context
       if (s.pagoNoMes <= 0 && selectedMes !== 'all') return false;
-
       if (!query) return true;
 
       const cleanCnpj = s.cnpj.replace(/\D/g, '');
@@ -328,13 +408,12 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
       if (sortField === 'name') {
         const comp = a.name.localeCompare(b.name);
         return sortOrder === 'asc' ? comp : -comp;
-      } else if (sortField === 'pagoNoMes') {
-        valA = a.pagoNoMes;
-        valB = b.pagoNoMes;
-      } else if (sortField.startsWith('fonte_')) {
-        const fonteKey = sortField.replace('fonte_', '');
-        valA = a.fontesValues[fonteKey] || 0;
-        valB = b.fontesValues[fonteKey] || 0;
+      } else if (sortField === 'cnpj') {
+        const comp = a.cnpj.localeCompare(b.cnpj);
+        return sortOrder === 'asc' ? comp : -comp;
+      } else if (sortField === 'qtdOrdens') {
+        valA = a.qtdOrdens;
+        valB = b.qtdOrdens;
       } else {
         valA = a.pagoNoMes;
         valB = b.pagoNoMes;
@@ -348,24 +427,20 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
     return list;
   }, [supplierRows, searchTerm, selectedMes, sortField, sortOrder]);
 
-  // Totals for table footer
+  // Totals for table footer and KPI cards
   const columnTotals = useMemo(() => {
-    const totals: Record<string, number> = {};
     let totalPagoNoMes = 0;
     let totalGeral = 0;
     let totalOrdens = 0;
 
-    filteredSuppliers.forEach((s) => {
+    for (let i = 0; i < filteredSuppliers.length; i++) {
+      const s = filteredSuppliers[i];
       totalPagoNoMes += s.pagoNoMes;
       totalGeral += s.totalGeral;
-      totalOrdens += s.despesas.length;
-      Object.entries(s.fontesValues).forEach(([f, val]) => {
-        totals[f] = (totals[f] || 0) + val;
-      });
-    });
+      totalOrdens += s.qtdOrdens;
+    }
 
     return {
-      fontes: totals,
       totalPagoNoMes,
       totalGeral,
       totalOrdens,
@@ -381,7 +456,7 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
     return filteredSuppliers.slice(start, start + pageSize);
   }, [filteredSuppliers, currentPage, pageSize]);
 
-  // Toggle supplier expansion
+  // Toggle supplier expansion (Master-Detail)
   const toggleSupplierExpand = (key: string) => {
     setExpandedSuppliers((prev) => {
       const next = new Set(prev);
@@ -418,12 +493,13 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
   const handleExportExcel = () => {
     if (filteredSuppliers.length === 0) return;
 
-    // Sheet 1: Matrix view
+    // Sheet 1: Main Supplier summary with Fonte breakdown
     const matrixRows = filteredSuppliers.map((s, idx) => {
       const row: any = {
         '#': idx + 1,
         'Fornecedor / Favorecido': s.name,
         'CNPJ / CPF': s.cnpj,
+        'Qtd de Ordens': s.qtdOrdens,
       };
 
       availableFontes.forEach((fonte) => {
@@ -431,7 +507,6 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
       });
 
       row[`Pago no Mês (${activeMonthLabel})`] = s.pagoNoMes;
-      row['Total de Despesas (OBs)'] = s.despesas.length;
       return row;
     });
 
@@ -538,11 +613,23 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
             type="button"
             onClick={handleExportExcel}
             className="inline-flex items-center gap-2 px-4 py-2.5 bg-white/10 hover:bg-white/20 text-white rounded-xl text-xs font-bold transition cursor-pointer active:scale-98"
-            title="Exportar matriz de fornecedores e fontes para Excel"
+            title="Exportar fornecedores e detalhamento para Excel"
           >
             <Download className="w-4 h-4 text-emerald-300" />
             <span>Exportar Excel</span>
           </button>
+
+          {activeObFile && onOpenColumnMapModal && (
+            <button
+              type="button"
+              onClick={() => onOpenColumnMapModal(activeObFile.id)}
+              className="inline-flex items-center gap-2 px-4 py-2.5 bg-emerald-700 hover:bg-emerald-600 text-white rounded-xl text-xs font-bold transition shadow-md cursor-pointer active:scale-98"
+              title="Ajustar manualmente as colunas dos dados a serem analisados"
+            >
+              <Settings2 className="w-4 h-4 text-emerald-200" />
+              <span>Ajustar Colunas</span>
+            </button>
+          )}
 
           {onUpdateOrdensBancariasList && (
             confirmClear ? (
@@ -601,7 +688,7 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
         <div className="bg-white rounded-2xl p-5 border border-slate-200/80 shadow-sm flex items-center justify-between">
           <div>
             <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">
-              Total Pago no Mês
+              {selectedMes === 'all' ? 'Total Pago (Acumulado)' : `Total Pago no Mês (${activeMonthLabel})`}
             </span>
             <span className="text-xl sm:text-2xl font-black text-slate-900 tracking-tight block mt-1">
               {formatBRL(columnTotals.totalPagoNoMes)}
@@ -627,7 +714,7 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
           </div>
         </div>
 
-        {/* Fontes de Recurso */}
+        {/* Fontes em Operação */}
         <div className="bg-white rounded-2xl p-5 border border-slate-200/80 shadow-sm flex items-center justify-between">
           <div>
             <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">
@@ -707,15 +794,15 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
               </select>
             </div>
 
-            {/* Expand / Collapse All Despesas Button */}
+            {/* Expand / Collapse All Accordions Button */}
             <button
               type="button"
               onClick={handleToggleExpandAll}
               className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer active:scale-98"
-              title={isAllExpanded ? 'Recolher despesas de todos os fornecedores' : 'Expandir despesas de todos os fornecedores'}
+              title={isAllExpanded ? 'Recolher fontes de todos os fornecedores' : 'Expandir fontes de todos os fornecedores'}
             >
               <ChevronsUpDown className="w-3.5 h-3.5 text-slate-500" />
-              <span>{isAllExpanded ? 'Recolher Despesas' : 'Expandir Todas as Despesas'}</span>
+              <span>{isAllExpanded ? 'Recolher Fontes' : 'Expandir Todas as Fontes'}</span>
             </button>
           </div>
         </div>
@@ -753,84 +840,68 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
         </div>
       </div>
 
-      {/* ---------------- MAIN MATRIX TABLE: FORNECEDORES x FONTES + PAGO NO MÊS ---------------- */}
+      {/* ---------------- MAIN TABLE (MASTER-DETAIL APPROACH: APENAS 4 COLUNAS PRINCIPAIS + AÇÃO) ---------------- */}
       <div className="bg-white rounded-3xl border border-slate-200/80 shadow-sm overflow-hidden">
         <div className="overflow-x-auto max-h-[700px] overflow-y-auto">
           <table className="w-full text-left border-collapse text-xs">
             <thead className="sticky top-0 z-20 bg-slate-100/95 backdrop-blur-xs shadow-xs">
               <tr className="border-b border-slate-200 text-slate-700 font-bold uppercase tracking-wider text-[11px]">
-                {/* Index Column */}
-                <th className="py-3 px-3 w-12 text-center text-slate-400 sticky left-0 z-20 bg-slate-100/95 border-r border-slate-200/80">
+                {/* Index */}
+                <th className="py-3 px-3 w-12 text-center text-slate-400">
                   #
                 </th>
 
-                {/* Fornecedor Column (Sticky Left) */}
-                <th className="py-3 px-4 min-w-[260px] sticky left-12 z-20 bg-slate-100/95 border-r border-slate-200/80 shadow-sm">
+                {/* Fornecedor */}
+                <th className="py-3 px-4 min-w-[240px]">
                   <button
                     type="button"
                     onClick={() => handleSort('name')}
                     className="flex items-center gap-1.5 hover:text-emerald-700 cursor-pointer font-extrabold active:scale-98"
                   >
-                    <span>FORNECEDOR / FAVORECIDO</span>
+                    <span>FORNECEDOR</span>
                     <ArrowUpDown className="w-3.5 h-3.5 text-slate-400" />
                   </button>
                 </th>
 
-                {/* Dynamic Columns for each Fonte de Recurso */}
-                {availableFontes.map((fonte) => {
-                  const style = getFonteColorStyle(fonte);
-                  const isSorted = sortField === `fonte_${fonte}`;
-                  return (
-                    <th
-                      key={fonte}
-                      className={`py-3 px-3.5 text-right min-w-[155px] border-r border-slate-200/80 whitespace-nowrap transition-colors ${
-                        isSorted ? 'bg-slate-100/90' : 'bg-slate-50/70'
-                      }`}
-                    >
-                      <button
-                        type="button"
-                        onClick={() => handleSort(`fonte_${fonte}`)}
-                        className="group flex items-center justify-end gap-1.5 w-full cursor-pointer active:scale-98"
-                        title={`Ordenar por pagamentos na Fonte ${fonte}`}
-                      >
-                        <span
-                          className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-semibold tracking-tight transition shadow-2xs ${
-                            isSorted
-                              ? `${style.badgeBg} ${style.badgeBorder} ${style.badgeText} ring-1 ring-slate-400/30`
-                              : `bg-white border-slate-200/90 text-slate-700 group-hover:border-slate-300 group-hover:bg-slate-50`
-                          }`}
-                        >
-                          <span className={`w-1.5 h-1.5 rounded-full ${style.dot} shrink-0`} />
-                          <span className="font-mono font-bold tracking-tight text-[11px]">Fonte {fonte}</span>
-                        </span>
-                        <ArrowUpDown
-                          className={`w-3 h-3 transition-colors shrink-0 ${
-                            isSorted ? 'text-slate-800' : 'text-slate-400 group-hover:text-slate-600'
-                          }`}
-                        />
-                      </button>
-                    </th>
-                  );
-                })}
+                {/* CNPJ */}
+                <th className="py-3 px-4 min-w-[160px]">
+                  <button
+                    type="button"
+                    onClick={() => handleSort('cnpj')}
+                    className="flex items-center gap-1.5 hover:text-emerald-700 cursor-pointer font-extrabold active:scale-98"
+                  >
+                    <span>CNPJ</span>
+                    <ArrowUpDown className="w-3.5 h-3.5 text-slate-400" />
+                  </button>
+                </th>
 
-                {/* Final Column: Pago no Mês */}
-                <th className="py-3 px-4 text-right min-w-[175px] bg-emerald-50/90 border-l-2 border-emerald-400 whitespace-nowrap sticky right-0 z-10 shadow-xs">
+                {/* Qtd de Ordens */}
+                <th className="py-3 px-4 text-center min-w-[140px]">
+                  <button
+                    type="button"
+                    onClick={() => handleSort('qtdOrdens')}
+                    className="inline-flex items-center gap-1.5 hover:text-emerald-700 cursor-pointer font-extrabold active:scale-98"
+                  >
+                    <span>QTD DE ORDENS</span>
+                    <ArrowUpDown className="w-3.5 h-3.5 text-slate-400" />
+                  </button>
+                </th>
+
+                {/* Total Pago no Mês */}
+                <th className="py-3 px-4 text-right min-w-[180px]">
                   <button
                     type="button"
                     onClick={() => handleSort('pagoNoMes')}
-                    className="group flex items-center justify-end gap-2 w-full cursor-pointer font-bold active:scale-98 text-emerald-950"
-                    title="Ordenar pelo valor total pago no mês"
+                    className="inline-flex items-center justify-end gap-1.5 w-full hover:text-emerald-700 cursor-pointer font-extrabold active:scale-98"
                   >
-                    <div className="flex items-center gap-1.5">
-                      <span className="px-1.5 py-0.5 rounded text-[10px] font-black uppercase tracking-wider bg-emerald-600 text-white shadow-2xs">
-                        Total
-                      </span>
-                      <span className="text-xs font-bold text-emerald-950 tracking-tight group-hover:text-emerald-800">
-                        PAGO NO MÊS
-                      </span>
-                    </div>
-                    <ArrowUpDown className="w-3.5 h-3.5 text-emerald-700 shrink-0 group-hover:text-emerald-900" />
+                    <span>{selectedMes === 'all' ? 'TOTAL PAGO (ACUMULADO)' : `TOTAL PAGO NO MÊS (${activeMonthLabel.toUpperCase()})`}</span>
+                    <ArrowUpDown className="w-3.5 h-3.5 text-emerald-700" />
                   </button>
+                </th>
+
+                {/* Ação: Detalhar Fontes */}
+                <th className="py-3 px-4 text-center min-w-[150px]">
+                  <span>FONTES DE RECURSO</span>
                 </th>
               </tr>
             </thead>
@@ -839,7 +910,7 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
               {paginatedSuppliers.length === 0 ? (
                 <tr>
                   <td
-                    colSpan={availableFontes.length + 3}
+                    colSpan={6}
                     className="py-12 text-center text-slate-400 italic"
                   >
                     Nenhum fornecedor localizado com o termo digitado ou sem pagamentos no período selecionado.
@@ -854,168 +925,187 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
                     <React.Fragment key={supplier.key}>
                       <tr className={`hover:bg-slate-50 transition-colors ${isExpanded ? 'bg-slate-50/70' : ''}`}>
                         {/* Index */}
-                        <td className="py-3 px-3 text-center font-mono text-[11px] text-slate-400 border-r border-slate-100 sticky left-0 bg-white z-10">
+                        <td className="py-3 px-3 text-center font-mono text-[11px] text-slate-400">
                           {realIndex}
                         </td>
 
-                        {/* Fornecedor Name & Despesas Toggle */}
-                        <td className="py-3 px-4 font-bold text-slate-900 border-r border-slate-100 sticky left-12 bg-white z-10 shadow-xs">
-                          <div className="flex items-center justify-between gap-2">
-                            <div className="flex items-center gap-2 min-w-0">
-                              {/* Toggle Accordion Button */}
-                              <button
-                                type="button"
-                                onClick={() => toggleSupplierExpand(supplier.key)}
-                                className="p-1 hover:bg-slate-100 rounded text-slate-500 hover:text-emerald-700 transition cursor-pointer shrink-0"
-                                title={isExpanded ? 'Ocultar despesas' : 'Ver despesas listadas'}
-                              >
-                                {isExpanded ? (
-                                  <ChevronDown className="w-4 h-4 text-emerald-600" />
-                                ) : (
-                                  <ChevronRight className="w-4 h-4 text-slate-400" />
-                                )}
-                              </button>
-
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  onOpenCompanyAudit &&
-                                  onOpenCompanyAudit({ name: supplier.name, cnpj: supplier.cnpj })
-                                }
-                                className="flex items-center gap-1.5 text-left hover:text-emerald-700 transition cursor-pointer group truncate"
-                                title="Abrir Extrato de Auditoria do Fornecedor"
-                              >
-                                <Building className="w-3.5 h-3.5 text-slate-400 group-hover:text-emerald-600 shrink-0" />
-                                <span className="truncate max-w-[200px] sm:max-w-xs font-bold text-xs group-hover:underline">
-                                  {supplier.name}
-                                </span>
-                              </button>
-                            </div>
-
-                            {/* Badge with despesas count */}
-                            <button
-                              type="button"
-                              onClick={() => toggleSupplierExpand(supplier.key)}
-                              className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200/80 shrink-0 transition cursor-pointer"
-                              title="Clique para listar todas as despesas deste fornecedor"
-                            >
-                              {supplier.despesas.length}{' '}
-                              {supplier.despesas.length === 1 ? 'despesa' : 'despesas'}
-                            </button>
-                          </div>
+                        {/* Fornecedor */}
+                        <td className="py-3 px-4 font-bold text-slate-900">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onOpenCompanyAudit &&
+                              onOpenCompanyAudit({ name: supplier.name, cnpj: supplier.cnpj })
+                            }
+                            className="flex items-center gap-2 text-left hover:text-emerald-700 transition cursor-pointer group"
+                            title="Abrir Extrato de Auditoria do Fornecedor"
+                          >
+                            <Building className="w-3.5 h-3.5 text-slate-400 group-hover:text-emerald-600 shrink-0" />
+                            <span className="font-bold text-xs group-hover:underline">
+                              {supplier.name}
+                            </span>
+                          </button>
                         </td>
 
-                        {/* Fonte Columns Values */}
-                        {availableFontes.map((fonte) => {
-                          const val = supplier.fontesValues[fonte] || 0;
-                          return (
-                            <td
-                              key={fonte}
-                              className="py-3 px-3.5 text-right tabular-nums border-r border-slate-100 whitespace-nowrap"
-                            >
-                              {val > 0 ? (
-                                <span className="font-semibold text-slate-800 text-xs tracking-tight">
-                                  {formatBRL(val)}
-                                </span>
-                              ) : (
-                                <span className="text-slate-300 font-light select-none text-xs">—</span>
-                              )}
-                            </td>
-                          );
-                        })}
+                        {/* CNPJ */}
+                        <td className="py-3 px-4 font-mono text-slate-600 font-medium text-xs whitespace-nowrap">
+                          {supplier.cnpj}
+                        </td>
 
-                        {/* Final Column: Pago no Mês */}
-                        <td className="py-3 px-4 text-right tabular-nums font-bold text-emerald-950 bg-emerald-50/40 border-l-2 border-emerald-300/80 whitespace-nowrap sticky right-0 z-10 shadow-xs text-xs">
-                          <span className="inline-block px-2.5 py-1 rounded-lg bg-emerald-100/70 border border-emerald-200/80 font-mono font-bold text-emerald-950 shadow-2xs">
+                        {/* Qtd de Ordens */}
+                        <td className="py-3 px-4 text-center">
+                          <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold bg-slate-100 text-slate-700 border border-slate-200/80">
+                            {supplier.qtdOrdens} {supplier.qtdOrdens === 1 ? 'ordem' : 'ordens'}
+                          </span>
+                        </td>
+
+                        {/* Total Pago no Mês */}
+                        <td className="py-3 px-4 text-right tabular-nums font-bold text-emerald-950 whitespace-nowrap text-xs">
+                          <span className="inline-block px-2.5 py-1 rounded-lg bg-emerald-50 border border-emerald-200/80 font-mono font-bold text-emerald-950 shadow-2xs">
                             {formatBRL(supplier.pagoNoMes)}
                           </span>
                         </td>
+
+                        {/* Botão Detalhar Fontes */}
+                        <td className="py-3 px-4 text-center whitespace-nowrap">
+                          <button
+                            type="button"
+                            onClick={() => toggleSupplierExpand(supplier.key)}
+                            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer active:scale-98 ${
+                              isExpanded
+                                ? 'bg-emerald-600 text-white shadow-sm'
+                                : 'bg-slate-100 hover:bg-slate-200 text-slate-700'
+                            }`}
+                            title={isExpanded ? 'Ocultar divisão de fontes' : 'Ver divisão de valores por fonte'}
+                          >
+                            <Layers className="w-3.5 h-3.5" />
+                            <span>Detalhar Fontes</span>
+                            {isExpanded ? (
+                              <ChevronDown className="w-3.5 h-3.5" />
+                            ) : (
+                              <ChevronRight className="w-3.5 h-3.5" />
+                            )}
+                          </button>
+                        </td>
                       </tr>
 
-                      {/* ---------------- EXPANDABLE ROW: DEVIDAS DESPESAS LISTADAS ---------------- */}
+                      {/* ---------------- EXPANDED DETAIL: DIVISÃO DE VALORES POR FONTE APENAS PARA ESTE FORNECEDOR ---------------- */}
                       {isExpanded && (
                         <tr className="bg-emerald-50/20">
                           <td
-                            colSpan={availableFontes.length + 3}
-                            className="p-3 pl-8 sm:pl-14 border-b border-emerald-200/60"
+                            colSpan={6}
+                            className="p-4 sm:p-6 border-b border-emerald-200/60"
                           >
-                            <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-sm space-y-3">
-                              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 border-b border-slate-100 pb-2">
+                            <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-sm space-y-4">
+                              {/* Header do Detalhamento */}
+                              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 border-b border-slate-100 pb-3">
                                 <div className="flex items-center gap-2">
-                                  <Receipt className="w-4 h-4 text-emerald-600" />
+                                  <Layers className="w-4 h-4 text-emerald-600" />
                                   <h4 className="text-xs font-black text-slate-900">
-                                    Despesas Efetuadas para {supplier.name}
+                                    Divisão de Pagamentos por Fonte de Recursos
                                   </h4>
-                                  <span className="text-[10px] font-mono text-slate-500">
-                                    ({supplier.cnpj})
+                                  <span className="text-[11px] font-mono text-slate-500">
+                                    ({supplier.name} — {supplier.cnpj})
                                   </span>
                                 </div>
                                 <div className="text-xs tabular-nums font-bold text-slate-700">
-                                  <span>Total das Despesas: </span>
-                                  <span className="text-emerald-900 font-black font-mono">
+                                  <span>Total Pago: </span>
+                                  <span className="text-emerald-900 font-black font-mono text-sm">
                                     {formatBRL(supplier.pagoNoMes)}
                                   </span>
                                 </div>
                               </div>
 
-                              {supplier.despesas.length === 0 ? (
-                                <p className="text-xs text-slate-400 italic py-2">
-                                  Nenhuma despesa individual registrada no mês selecionado.
-                                </p>
-                              ) : (
-                                <div className="overflow-x-auto rounded-xl border border-slate-200">
-                                  <table className="w-full text-left border-collapse text-xs">
-                                    <thead>
-                                      <tr className="bg-slate-50 text-[10px] font-bold text-slate-600 uppercase border-b border-slate-200">
-                                        <th className="py-2.5 px-3">#</th>
-                                        <th className="py-2.5 px-3">Ordem Bancária (OB)</th>
-                                        <th className="py-2.5 px-3">PP (Preparação)</th>
-                                        <th className="py-2.5 px-3">Data</th>
-                                        <th className="py-2.5 px-3">Mês</th>
-                                        <th className="py-2.5 px-3">Fonte de Recursos</th>
-                                        <th className="py-2.5 px-3 text-center">Situação</th>
-                                        <th className="py-2.5 px-3 text-right">Valor Pago (R$)</th>
-                                      </tr>
-                                    </thead>
-                                    <tbody className="divide-y divide-slate-100 text-[11px]">
-                                      {supplier.despesas.map((despesa, dIdx) => {
-                                        const fStyle = getFonteColorStyle(despesa.fonteRecurso || '');
-                                        return (
-                                          <tr key={despesa.id || dIdx} className="hover:bg-slate-50">
-                                            <td className="py-2.5 px-3 text-slate-400 font-mono text-[10px]">
-                                              {dIdx + 1}
-                                            </td>
-                                            <td className="py-2.5 px-3 font-mono font-bold text-slate-900">
-                                              {despesa.ob}
-                                            </td>
-                                            <td className="py-2.5 px-3 font-mono text-slate-600">
-                                              {despesa.pp || '—'}
-                                            </td>
-                                            <td className="py-2.5 px-3 text-slate-700">
-                                              {despesa.dataReferencia || '—'}
-                                            </td>
-                                            <td className="py-2.5 px-3 text-slate-600 font-medium">
-                                              {despesa.mesAnoLabel || '—'}
-                                            </td>
-                                            <td className="py-2.5 px-3">
-                                              <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md ${fStyle.badgeBg} border ${fStyle.badgeBorder} ${fStyle.badgeText} font-semibold font-mono text-[10px]`}>
-                                                <span className={`w-1.5 h-1.5 rounded-full ${fStyle.dot}`} />
-                                                <span>Fonte {despesa.fonteRecurso || 'OUTRAS'}</span>
-                                              </span>
-                                            </td>
-                                            <td className="py-2.5 px-3 text-center">
-                                              <span className="px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-blue-50 text-blue-800 border border-blue-200">
-                                                {despesa.situacao || 'CB'}
-                                              </span>
-                                            </td>
-                                            <td className="py-2.5 px-3 text-right font-mono font-bold text-emerald-950 tabular-nums">
-                                              {formatBRL(despesa.valor)}
-                                            </td>
-                                          </tr>
-                                        );
-                                      })}
-                                    </tbody>
-                                  </table>
+                              {/* Badges/Cards de cada Fonte usada por este fornecedor */}
+                              <div className="space-y-1.5">
+                                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
+                                  Fontes Utilizadas
+                                </span>
+                                <div className="flex flex-wrap items-center gap-2.5">
+                                  {Object.keys(supplier.fontesValues).length === 0 ? (
+                                    <span className="text-xs text-slate-400 italic">Nenhuma fonte vinculada.</span>
+                                  ) : (
+                                    Object.entries(supplier.fontesValues).map(([fonte, val]) => {
+                                      const style = getFonteColorStyle(fonte);
+                                      const pct = supplier.pagoNoMes > 0 ? ((val / supplier.pagoNoMes) * 100).toLocaleString('pt-BR', { minimumFractionDigits: 1, maximumFractionDigits: 1 }) : '0,0';
+                                      return (
+                                        <div
+                                          key={fonte}
+                                          className={`flex items-center gap-2 px-3.5 py-2 rounded-xl border ${style.badgeBg} ${style.badgeBorder} ${style.badgeText} text-xs font-semibold shadow-2xs`}
+                                        >
+                                          <span className={`w-2 h-2 rounded-full ${style.dot} shrink-0`} />
+                                          <span className="font-mono font-bold">Fonte {fonte}:</span>
+                                          <span className="font-mono font-black">{formatBRL(val)}</span>
+                                          <span className="text-[10px] opacity-75">({pct}%)</span>
+                                        </div>
+                                      );
+                                    })
+                                  )}
+                                </div>
+                              </div>
+
+                              {/* Lista de Despesas Individuais do Fornecedor */}
+                              {supplier.despesas.length > 0 && (
+                                <div className="pt-2 space-y-1.5">
+                                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
+                                    Ordens Bancárias Individuais ({supplier.despesas.length})
+                                  </span>
+                                  <div className="overflow-x-auto rounded-xl border border-slate-200">
+                                    <table className="w-full text-left border-collapse text-xs">
+                                      <thead>
+                                        <tr className="bg-slate-50 text-[10px] font-bold text-slate-600 uppercase border-b border-slate-200">
+                                          <th className="py-2.5 px-3">#</th>
+                                          <th className="py-2.5 px-3">Ordem Bancária (OB)</th>
+                                          <th className="py-2.5 px-3">PP (Preparação)</th>
+                                          <th className="py-2.5 px-3">Data</th>
+                                          <th className="py-2.5 px-3">Mês</th>
+                                          <th className="py-2.5 px-3">Fonte de Recursos</th>
+                                          <th className="py-2.5 px-3 text-center">Situação</th>
+                                          <th className="py-2.5 px-3 text-right">Valor Pago (R$)</th>
+                                        </tr>
+                                      </thead>
+                                      <tbody className="divide-y divide-slate-100 text-[11px]">
+                                        {supplier.despesas.map((despesa, dIdx) => {
+                                          const fStyle = getFonteColorStyle(despesa.fonteRecurso || '');
+                                          return (
+                                            <tr key={despesa.id || dIdx} className="hover:bg-slate-50">
+                                              <td className="py-2.5 px-3 text-slate-400 font-mono text-[10px]">
+                                                {dIdx + 1}
+                                              </td>
+                                              <td className="py-2.5 px-3 font-mono font-bold text-slate-900">
+                                                {despesa.ob}
+                                              </td>
+                                              <td className="py-2.5 px-3 font-mono text-slate-600">
+                                                {despesa.pp || '—'}
+                                              </td>
+                                              <td className="py-2.5 px-3 text-slate-700">
+                                                {despesa.dataReferencia || '—'}
+                                              </td>
+                                              <td className="py-2.5 px-3 text-slate-600 font-medium">
+                                                {despesa.mesAnoLabel || '—'}
+                                              </td>
+                                              <td className="py-2.5 px-3">
+                                                <span
+                                                  className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md ${fStyle.badgeBg} border ${fStyle.badgeBorder} ${fStyle.badgeText} font-semibold font-mono text-[10px]`}
+                                                >
+                                                  <span className={`w-1.5 h-1.5 rounded-full ${fStyle.dot}`} />
+                                                  <span>Fonte {despesa.fonteRecurso || 'Fonte Não Identificada'}</span>
+                                                </span>
+                                              </td>
+                                              <td className="py-2.5 px-3 text-center">
+                                                <span className="px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-blue-50 text-blue-800 border border-blue-200">
+                                                  {despesa.situacao || 'CB'}
+                                                </span>
+                                              </td>
+                                              <td className="py-2.5 px-3 text-right font-mono font-bold text-emerald-950 tabular-nums">
+                                                {formatBRL(despesa.valor)}
+                                              </td>
+                                            </tr>
+                                          );
+                                        })}
+                                      </tbody>
+                                    </table>
+                                  </div>
                                 </div>
                               )}
                             </div>
@@ -1028,32 +1118,29 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
               )}
             </tbody>
 
-            {/* Table Footer: Column Totals */}
+            {/* Table Footer: Totals */}
             {filteredSuppliers.length > 0 && (
               <tfoot className="sticky bottom-0 z-20 bg-slate-100/95 backdrop-blur-xs border-t-2 border-slate-300 font-black text-slate-900 text-xs">
                 <tr>
-                  <td className="py-3.5 px-3 text-center sticky left-0 bg-slate-100 border-r border-slate-200">
+                  <td className="py-3.5 px-3 text-center text-slate-400">
                     Σ
                   </td>
-                  <td className="py-3.5 px-4 uppercase text-[11px] tracking-wider sticky left-12 bg-slate-100 border-r border-slate-200 shadow-sm">
+                  <td className="py-3.5 px-4 uppercase text-[11px] tracking-wider">
                     TOTAL CONSOLIDADO ({filteredSuppliers.length} fornecedores)
                   </td>
-
-                  {/* Totals per Fonte */}
-                  {availableFontes.map((fonte) => (
-                    <td
-                      key={fonte}
-                      className="py-3.5 px-3.5 text-right tabular-nums font-bold text-slate-900 border-r border-slate-200 whitespace-nowrap text-xs"
-                    >
-                      {formatBRL(columnTotals.fontes[fonte] || 0)}
-                    </td>
-                  ))}
-
-                  {/* Total Pago no Mês */}
-                  <td className="py-3.5 px-4 text-right tabular-nums font-black text-emerald-950 bg-emerald-100/90 border-l-2 border-emerald-400 whitespace-nowrap sticky right-0 z-10 shadow-xs text-xs">
-                    <span className="inline-block px-2.5 py-1 rounded-lg bg-emerald-200/80 border border-emerald-300 font-mono font-black text-emerald-950 shadow-2xs">
+                  <td className="py-3.5 px-4 text-slate-400">
+                    —
+                  </td>
+                  <td className="py-3.5 px-4 text-center font-mono font-bold text-slate-800">
+                    {columnTotals.totalOrdens} {columnTotals.totalOrdens === 1 ? 'ordem' : 'ordens'}
+                  </td>
+                  <td className="py-3.5 px-4 text-right tabular-nums font-black text-emerald-950">
+                    <span className="inline-block px-3 py-1 rounded-lg bg-emerald-200/80 border border-emerald-300 font-mono font-black text-emerald-950 shadow-2xs">
                       {formatBRL(columnTotals.totalPagoNoMes)}
                     </span>
+                  </td>
+                  <td className="py-3.5 px-4 text-center text-slate-400">
+                    —
                   </td>
                 </tr>
               </tfoot>

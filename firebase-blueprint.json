@@ -1,0 +1,133 @@
+{
+  "entities": {
+    "WorkspaceMeta": {
+      "title": "WorkspaceMeta",
+      "description": "General synchronization metadata for cross-device state (Tablet, PC, Mobile)",
+      "type": "object",
+      "properties": {
+        "lastSyncAt": { "type": "string" },
+        "lastUpdatedBy": { "type": "string" },
+        "userEmail": { "type": "string" },
+        "deviceType": { "type": "string" },
+        "totalFiles": { "type": "number" },
+        "version": { "type": "number" }
+      },
+      "required": ["lastSyncAt", "version"]
+    },
+    "ImportedFile": {
+      "title": "ImportedFile",
+      "description": "Spreadsheet file imported and synchronized across all user devices",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "fileName": { "type": "string" },
+        "stage": { "type": "string" },
+        "uploadDate": { "type": "string" },
+        "detectedFavorecidoCol": { "type": "string" },
+        "detectedValorCol": { "type": "string" },
+        "detectedNumeroCol": { "type": "string" },
+        "detectedPpCol": { "type": "string" },
+        "rowCount": { "type": "number" },
+        "rowsJson": { "type": "string" },
+        "totalChunks": { "type": "number" },
+        "chunkSize": { "type": "number" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "fileName", "stage"]
+    },
+    "FileChunk": {
+      "title": "FileChunk",
+      "description": "Chunk of up to 1000 rows for imported spreadsheet document",
+      "type": "object",
+      "properties": {
+        "chunkId": { "type": "string" },
+        "chunkIndex": { "type": "number" },
+        "rowCount": { "type": "number" },
+        "rowsJson": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["chunkId", "chunkIndex", "rowsJson"]
+    },
+    "OrdensBancariasChunk": {
+      "title": "OrdensBancariasChunk",
+      "description": "Synchronized bank orders dataset chunk from OBs - sigef - Principal",
+      "type": "object",
+      "properties": {
+        "chunkId": { "type": "string" },
+        "chunkIndex": { "type": "number" },
+        "fileName": { "type": "string" },
+        "totalItems": { "type": "number" },
+        "itemsJson": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["chunkId", "chunkIndex", "itemsJson"]
+    },
+    "ParaPublicarDoc": {
+      "title": "ParaPublicarDoc",
+      "description": "Liquidations marked for publication synchronized across devices",
+      "type": "object",
+      "properties": {
+        "documentNumber": { "type": "string" },
+        "supplierName": { "type": "string" },
+        "cnpj": { "type": "string" },
+        "value": { "type": "number" },
+        "fonteRecurso": { "type": "string" },
+        "status": { "type": "string" },
+        "selectedAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["documentNumber", "supplierName", "cnpj", "value"]
+    },
+    "MlPatternDoc": {
+      "title": "MlPatternDoc",
+      "description": "Machine learning manual links between NL and PP/OB",
+      "type": "object",
+      "properties": {
+        "nl": { "type": "string" },
+        "pp": { "type": "string" },
+        "ob": { "type": "string" },
+        "manual": { "type": "boolean" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["nl"]
+    },
+    "TestDoc": {
+      "title": "TestDoc",
+      "description": "Firestore connectivity test document",
+      "type": "object",
+      "properties": {
+        "status": { "type": "string" }
+      }
+    }
+  },
+  "firestore": {
+    "/test/{docId}": {
+      "schema": "TestDoc",
+      "description": "Connectivity test document for verifying Firestore client-server reachability"
+    },
+    "/workspaces/{workspaceId}": {
+      "schema": "WorkspaceMeta",
+      "description": "Metadata for the active synchronization workspace"
+    },
+    "/workspaces/{workspaceId}/imported_files/{fileId}": {
+      "schema": "ImportedFile",
+      "description": "Imported spreadsheets synchronized across devices"
+    },
+    "/workspaces/{workspaceId}/imported_files/{fileId}/chunks/{chunkId}": {
+      "schema": "FileChunk",
+      "description": "1000-row chunks of imported spreadsheet data"
+    },
+    "/workspaces/{workspaceId}/ordens_bancarias_store/{chunkId}": {
+      "schema": "OrdensBancariasChunk",
+      "description": "Bank orders and PPs synchronized across devices"
+    },
+    "/workspaces/{workspaceId}/para_publicar/{itemId}": {
+      "schema": "ParaPublicarDoc",
+      "description": "Liquidations queue marked for publication"
+    },
+    "/workspaces/{workspaceId}/ml_patterns/{patternId}": {
+      "schema": "MlPatternDoc",
+      "description": "Manual mappings and learned patterns for NL to PP/OB matching"
+    }
+  }
+}

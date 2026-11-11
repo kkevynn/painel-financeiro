@@ -631,7 +631,7 @@ export const CategoriasView: React.FC<CategoriasViewProps> = ({ metrics }) => {
                             {formatBRL(totalValue)}
                           </span>
                           <span className="text-[10px] font-bold text-slate-500">
-                            {percentOfTotal.toFixed(1)}% do total
+                            {percentOfTotal.toFixed(1).replace('.', ',')}% do total
                           </span>
                         </div>
                       </div>

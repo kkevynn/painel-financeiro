@@ -9,32 +9,57 @@ let cachedDBPromise: Promise<IDBDatabase> | null = null;
 function openDB(dbName: string = DB_NAME_PRIMARY): Promise<IDBDatabase> {
   if (cachedDBPromise) return cachedDBPromise;
 
-  cachedDBPromise = new Promise((resolve, reject) => {
-    if (!window.indexedDB) {
-      reject(new Error('IndexedDB não suportado neste navegador.'));
-      return;
-    }
-
-    const request = indexedDB.open(dbName, DB_VERSION);
-
-    request.onupgradeneeded = (event) => {
-      const db = (event.target as IDBOpenDBRequest).result;
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        db.createObjectStore(STORE_NAME);
+  const dbPromise = new Promise<IDBDatabase>((resolve, reject) => {
+    try {
+      if (typeof window === 'undefined' || !window.indexedDB) {
+        reject(new Error('IndexedDB não suportado neste navegador.'));
+        return;
       }
-    };
 
-    request.onsuccess = () => {
-      const db = request.result;
-      db.onclose = () => {
-        cachedDBPromise = null;
+      const request = indexedDB.open(dbName, DB_VERSION);
+
+      request.onupgradeneeded = (event) => {
+        try {
+          const db = (event.target as IDBOpenDBRequest).result;
+          if (!db.objectStoreNames.contains(STORE_NAME)) {
+            db.createObjectStore(STORE_NAME);
+          }
+        } catch (e) {
+          reject(e);
+        }
       };
-      resolve(db);
-    };
-    request.onerror = () => {
+
+      request.onsuccess = () => {
+        const db = request.result;
+        db.onclose = () => {
+          cachedDBPromise = null;
+        };
+        resolve(db);
+      };
+
+      request.onerror = () => {
+        cachedDBPromise = null;
+        reject(request.error || new Error('Falha ao abrir IndexedDB'));
+      };
+
+      request.onblocked = () => {
+        cachedDBPromise = null;
+        reject(new Error('IndexedDB bloqueado'));
+      };
+    } catch (err) {
       cachedDBPromise = null;
-      reject(request.error);
-    };
+      reject(err);
+    }
+  });
+
+  // Timeout guard (7000ms max) to ensure app never hangs indefinitely during startup
+  const timeoutPromise = new Promise<IDBDatabase>((_, reject) => {
+    setTimeout(() => reject(new Error('Timeout ao conectar com IndexedDB')), 7000);
+  });
+
+  cachedDBPromise = Promise.race([dbPromise, timeoutPromise]).catch((err) => {
+    cachedDBPromise = null;
+    throw err;
   });
 
   return cachedDBPromise;

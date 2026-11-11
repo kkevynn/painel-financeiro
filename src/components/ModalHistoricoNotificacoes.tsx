@@ -22,7 +22,7 @@ export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProp
   ordensBancariasList,
   onSyncAlerts,
 }) => {
-  const [filter, setFilter] = useState<'all' | 'sucesso' | 'virou_ob' | 'critico'>('sucesso');
+  const [filter, setFilter] = useState<'all' | 'sucesso' | 'outras_alteracoes' | 'critico'>('all');
   const [searchTerm, setSearchTerm] = useState('');
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncFeedback, setSyncFeedback] = useState<string | null>(null);
@@ -39,6 +39,16 @@ export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProp
     return () => unsub();
   }, []);
 
+  // Lock background scroll when open
+  useEffect(() => {
+    if (!isOpen) return;
+    const orig = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = orig;
+    };
+  }, [isOpen]);
+
   // Load alerts when modal opens
   useEffect(() => {
     if (isOpen) {
@@ -52,8 +62,8 @@ export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProp
   const countConfirmadas = allAlerts.filter(
     (a) => a.tipo === 'sucesso' && a.situacaoNova !== 'Virou OB' && !a.titulo.toLowerCase().includes('virou ob')
   ).length;
-  const countVirouOB = allAlerts.filter(
-    (a) => a.situacaoNova === 'Virou OB' || a.titulo.toLowerCase().includes('virou ob')
+  const countOutrasAlteracoes = allAlerts.filter(
+    (a) => a.tipo === 'info' || a.tipo === 'aviso' || a.situacaoNova === 'Virou OB' || a.titulo.toLowerCase().includes('virou ob')
   ).length;
 
   const handleSync = () => {
@@ -81,34 +91,36 @@ export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProp
     setTimeout(() => setSyncFeedback(null), 3500);
   };
 
-  const formatConfirmationTime = (d: Date | null, isCritico?: boolean, isVirouOB?: boolean) => {
-    if (!d || isNaN(d.getTime())) return '';
+  const formatConfirmationTime = (d: Date | string | null | undefined, isCritico?: boolean, isOutras?: boolean) => {
+    if (!d) return '';
+    const dateObj = d instanceof Date ? d : new Date(d);
+    if (isNaN(dateObj.getTime())) return '';
     const now = new Date();
     const isToday =
-      d.getDate() === now.getDate() &&
-      d.getMonth() === now.getMonth() &&
-      d.getFullYear() === now.getFullYear();
-    const timeStr = d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
-    const prefix = isCritico ? 'Rejeitado' : isVirouOB ? 'Gerou OB' : 'Confirmado';
+      dateObj.getDate() === now.getDate() &&
+      dateObj.getMonth() === now.getMonth() &&
+      dateObj.getFullYear() === now.getFullYear();
+    const timeStr = dateObj.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+    const prefix = isCritico ? 'Rejeitado' : isOutras ? 'Alterado' : 'Confirmado';
 
     if (isToday) return `${prefix} hoje às ${timeStr}`;
 
     const yesterday = new Date(now);
     yesterday.setDate(yesterday.getDate() - 1);
     const isYesterday =
-      d.getDate() === yesterday.getDate() &&
-      d.getMonth() === yesterday.getMonth() &&
-      d.getFullYear() === yesterday.getFullYear();
+      dateObj.getDate() === yesterday.getDate() &&
+      dateObj.getMonth() === yesterday.getMonth() &&
+      dateObj.getFullYear() === yesterday.getFullYear();
     if (isYesterday) return `${prefix} ontem às ${timeStr}`;
 
-    return `${prefix} em ${d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric' })} às ${timeStr}`;
+    return `${prefix} em ${dateObj.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric' })} às ${timeStr}`;
   };
 
   const filtered = allAlerts.filter((a) => {
     // Filter type
     if (filter === 'critico' && a.tipo !== 'critico') return false;
     if (filter === 'sucesso' && (a.tipo !== 'sucesso' || a.situacaoNova === 'Virou OB' || a.titulo.toLowerCase().includes('virou ob'))) return false;
-    if (filter === 'virou_ob' && a.situacaoNova !== 'Virou OB' && !a.titulo.toLowerCase().includes('virou ob')) return false;
+    if (filter === 'outras_alteracoes' && a.tipo !== 'info' && a.tipo !== 'aviso' && a.situacaoNova !== 'Virou OB' && !a.titulo.toLowerCase().includes('virou ob')) return false;
 
     // Search term
     if (searchTerm.trim()) {
@@ -128,11 +140,11 @@ export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProp
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-xs animate-in fade-in duration-150"
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-xs overscroll-contain animate-in fade-in duration-150"
       onClick={onClose}
     >
       <div
-        className="bg-white rounded-2xl shadow-2xl border border-slate-200 w-full max-w-xl max-h-[85vh] flex flex-col overflow-hidden animate-in zoom-in-95 duration-150"
+        className="bg-white rounded-2xl shadow-2xl border border-slate-200 w-full max-w-xl max-h-[85vh] flex flex-col overflow-hidden overscroll-contain animate-in zoom-in-95 duration-150"
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"
@@ -193,6 +205,16 @@ export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProp
         <div className="px-4 py-2 bg-white border-b border-slate-200 flex flex-wrap items-center justify-between gap-2 text-xs">
           <div className="flex flex-wrap items-center gap-1.5">
             <button
+              onClick={() => setFilter('all')}
+              className={`px-2.5 py-1 rounded-lg font-bold text-xs transition cursor-pointer ${
+                filter === 'all'
+                  ? 'bg-slate-800 text-white shadow-2xs'
+                  : 'text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              Todos ({allAlerts.length})
+            </button>
+            <button
               onClick={() => setFilter('sucesso')}
               className={`px-2.5 py-1 rounded-lg font-bold text-xs transition cursor-pointer ${
                 filter === 'sucesso'
@@ -203,14 +225,14 @@ export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProp
               Confirmadas ({countConfirmadas})
             </button>
             <button
-              onClick={() => setFilter('virou_ob')}
+              onClick={() => setFilter('outras_alteracoes')}
               className={`px-2.5 py-1 rounded-lg font-bold text-xs transition cursor-pointer ${
-                filter === 'virou_ob'
+                filter === 'outras_alteracoes'
                   ? 'bg-blue-600 text-white shadow-2xs'
                   : 'text-blue-700 bg-blue-50 hover:bg-blue-100'
               }`}
             >
-              Viraram OB ({countVirouOB})
+              Outras Alterações ({countOutrasAlteracoes})
             </button>
             <button
               onClick={() => setFilter('critico')}
@@ -221,16 +243,6 @@ export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProp
               }`}
             >
               Rejeitadas ({countCritico})
-            </button>
-            <button
-              onClick={() => setFilter('all')}
-              className={`px-2.5 py-1 rounded-lg font-bold text-xs transition cursor-pointer ${
-                filter === 'all'
-                  ? 'bg-slate-800 text-white shadow-2xs'
-                  : 'text-slate-600 hover:bg-slate-100'
-              }`}
-            >
-              Todos ({allAlerts.length})
             </button>
           </div>
 
@@ -302,6 +314,11 @@ export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProp
           ) : (
             filtered.map((item) => {
               const isCritico = item.tipo === 'critico';
+              const isOutras =
+                item.tipo === 'info' ||
+                item.tipo === 'aviso' ||
+                item.situacaoNova === 'Virou OB' ||
+                item.titulo.toLowerCase().includes('virou ob');
               const isVirouOB = item.situacaoNova === 'Virou OB' || item.titulo.toLowerCase().includes('virou ob');
               const itemDate = item.dataHora ? new Date(item.dataHora) : null;
               const formattedDate = itemDate && !isNaN(itemDate.getTime())
@@ -310,6 +327,14 @@ export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProp
               const formattedTime = itemDate && !isNaN(itemDate.getTime())
                 ? itemDate.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })
                 : '';
+
+              const badgeText = isOutras
+                ? item.situacaoAnterior && item.situacaoNova && item.situacaoAnterior !== item.situacaoNova
+                  ? `${item.situacaoAnterior} → ${item.situacaoNova}`
+                  : item.situacaoNova || 'Alteração'
+                : isCritico
+                ? item.situacaoNova || 'Rejeitada'
+                : item.situacaoNova || 'Confirmada';
 
               return (
                 <div
@@ -323,7 +348,7 @@ export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProp
                   <div className="flex items-start gap-2.5 min-w-0 flex-1">
                     <span
                       className={`w-2.5 h-2.5 rounded-full shrink-0 mt-1 ${
-                        isCritico ? 'bg-rose-500' : isVirouOB ? 'bg-blue-500' : 'bg-emerald-500'
+                        isCritico ? 'bg-rose-500' : isOutras ? 'bg-blue-500' : 'bg-emerald-500'
                       }`}
                     />
                     <div className="min-w-0 flex-1">
@@ -340,14 +365,14 @@ export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProp
                           className={`text-[10px] font-extrabold uppercase px-2 py-0.5 rounded-md ${
                             isCritico
                               ? 'bg-rose-100 text-rose-800 border border-rose-200'
-                              : isVirouOB
+                              : isOutras
                               ? 'bg-blue-100 text-blue-800 border border-blue-200'
                               : 'bg-emerald-100 text-emerald-800 border border-emerald-200'
                           }`}
                         >
-                          {isVirouOB ? 'Virou OB' : item.situacaoNova || (isCritico ? 'Rejeitada' : 'Confirmada')}
+                          {badgeText}
                         </span>
-                        {item.situacaoAnterior && item.situacaoAnterior !== item.situacaoNova && (
+                        {!isOutras && item.situacaoAnterior && item.situacaoAnterior !== item.situacaoNova && (
                           <span className="text-[10px] text-slate-400 font-medium font-mono">
                             ({item.situacaoAnterior} → {item.situacaoNova || 'Confirmado'})
                           </span>
@@ -378,14 +403,14 @@ export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProp
                     )}
                     <span
                       className={`text-[10px] font-semibold block mt-0.5 ${
-                        isCritico ? 'text-rose-700' : isVirouOB ? 'text-blue-700' : 'text-emerald-700'
+                        isCritico ? 'text-rose-700' : isOutras ? 'text-blue-700' : 'text-emerald-700'
                       }`}
                       title={itemDate ? itemDate.toLocaleString('pt-BR') : ''}
                     >
-                      {formatConfirmationTime(itemDate, isCritico, isVirouOB)}
+                      {formatConfirmationTime(itemDate, isCritico, isOutras)}
                     </span>
                     <span className="text-[9px] text-slate-400 font-mono block">
-                      {isCritico ? 'Rejeitado no Banco' : isVirouOB ? 'Liquidado → OB' : 'Confirmado no Banco'}
+                      {isCritico ? 'Rejeitado / Cancelado' : isVirouOB ? 'Liquidado → OB' : isOutras ? (item.situacaoNova ? `Situação: ${item.situacaoNova}` : 'Alteração') : 'Confirmado no Banco'}
                     </span>
                   </div>
                 </div>

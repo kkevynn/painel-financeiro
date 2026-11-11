@@ -1,0 +1,53 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny all unknown collections
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // Connection test document
+    match /test/{docId} {
+      allow get: if true;
+    }
+
+    // Workspaces collection for cross-device synchronization (Tablet, PC, Phone)
+    match /workspaces/{workspaceId} {
+      allow read, write: if isValidId(workspaceId);
+
+      // Imported spreadsheet datasets
+      match /imported_files/{fileId} {
+        allow read, write, delete: if isValidId(workspaceId) && isValidId(fileId);
+
+        // Chunks subcollection for large spreadsheets (1000 rows max per doc)
+        match /chunks/{chunkId} {
+          allow read, write, delete: if isValidId(workspaceId) && isValidId(fileId) && isValidId(chunkId);
+        }
+      }
+
+      // Bank Orders & PPs dataset
+      match /ordens_bancarias_store/{chunkId} {
+        allow read, write, delete: if isValidId(workspaceId) && isValidId(chunkId);
+      }
+
+      // Liquidations marked for publication
+      match /para_publicar/{itemId} {
+        allow read, write, delete: if isValidId(workspaceId);
+      }
+
+      // Machine learning patterns (NL -> PP/OB)
+      match /ml_patterns/{patternId} {
+        allow read, write, delete: if isValidId(workspaceId);
+      }
+    }
+  }
+}

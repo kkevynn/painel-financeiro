@@ -41,6 +41,7 @@ import {
 } from '../utils/categoryService';
 import { ExtratoAuditoriaEmpresaModal } from './ExtratoAuditoriaEmpresaModal';
 import { BankAuditRecord } from '../utils/auditCompanyService';
+import { OrdemBancariaItem } from '../utils/ordemBancariaParser';
 import { CheckCircle2, Clock } from 'lucide-react';
 import { InfoHelpButton } from './InfoHelpButton';
 
@@ -49,6 +50,7 @@ interface DetailedConsolidationTableProps {
   files?: FileData[];
   quebraOrdemItems?: QuebraOrdemItem[];
   bankRecords?: BankAuditRecord[];
+  ordensBancariasList?: OrdemBancariaItem[] | null;
   onOpenCompanyAudit?: (supplier: { name: string; cnpj: string }) => void;
 }
 
@@ -59,6 +61,7 @@ export const DetailedConsolidationTable: React.FC<DetailedConsolidationTableProp
   files = [],
   quebraOrdemItems = [],
   bankRecords = [],
+  ordensBancariasList,
   onOpenCompanyAudit,
 }) => {
   const { consolidatedSuppliers, isProcessed } = metrics;
@@ -207,7 +210,7 @@ export const DetailedConsolidationTable: React.FC<DetailedConsolidationTableProp
 
     // Map each item to its sort key once O(N) instead of during every O(N log N) compare
     const mapped = filtered.map((s, idx) => {
-      let key: any = s[sortField] ?? 0;
+      let key: any = s[sortField] ?? (isStringField ? '' : 0);
       if (isStringField && typeof key === 'string') {
         key = key.toLowerCase();
       }
@@ -257,6 +260,7 @@ export const DetailedConsolidationTable: React.FC<DetailedConsolidationTableProp
           return {
             'FAVORECIDO': s.name,
             'CNPJ': s.cnpj,
+            'NATUREZAS / SERVIÇOS': (s.naturezasDespesa || []).join('; '),
             'PPS PRONTAS (R$)': s.ppProntasValue || 0,
             'LIQUIDAÇÃO OBEDECE (R$)': s.liqObedeceValue || 0,
             'LIQUIDAÇÃO NÃO OBEDECE (R$)': s.liqNaoObedeceValue || 0,
@@ -288,15 +292,6 @@ export const DetailedConsolidationTable: React.FC<DetailedConsolidationTableProp
             <Building2 className="w-5 h-5 text-emerald-600" />
             <span>Tabela Principal de Credores</span>
           </h3>
-          <InfoHelpButton
-            title="Tabela de Credores"
-            variant="light"
-            content={
-              <p>
-                Consolidação geral de credores por CNPJ/Favorecido, totalizando os pagamentos emitidos no exercício e os valores na Base de PPs e Liquidações.
-              </p>
-            }
-          />
         </div>
 
         {/* Export Button */}
@@ -421,6 +416,9 @@ export const DetailedConsolidationTable: React.FC<DetailedConsolidationTableProp
                 <th className="py-3.5 px-3 text-center min-w-[130px] whitespace-nowrap">
                   <span>RECORRÊNCIA</span>
                 </th>
+                <th className="py-3.5 px-3 min-w-[180px] max-w-[220px] whitespace-nowrap">
+                  <span>NATUREZAS / SERVIÇOS</span>
+                </th>
                 <th className="py-3.5 px-3 text-center min-w-[140px] whitespace-nowrap">
                   <span>MÊS ATUAL ({monthShortLabel.toUpperCase()})</span>
                 </th>
@@ -535,6 +533,42 @@ export const DetailedConsolidationTable: React.FC<DetailedConsolidationTableProp
                             <Repeat className="w-3 h-3 shrink-0" />
                             <span className="whitespace-nowrap">{isRec ? 'Recorrente' : '+ Marcar'}</span>
                           </button>
+                        </div>
+                      </td>
+
+                      {/* Naturezas / Serviços */}
+                      <td className="py-3 px-3 border-r border-slate-100">
+                        <div className="flex flex-wrap gap-1 max-w-[220px]">
+                          {(() => {
+                            const nats = supplier.naturezasDespesa || [];
+                            if (nats.length === 0) {
+                              return <span className="text-[11px] text-slate-300 font-mono">-</span>;
+                            }
+                            const firstTwo = nats.slice(0, 2);
+                            const remaining = nats.slice(2);
+
+                            return (
+                              <>
+                                {firstTwo.map((natureza, nIdx) => (
+                                  <span
+                                    key={nIdx}
+                                    className="text-[9px] font-semibold bg-slate-100 text-slate-600 border border-slate-200 px-1.5 py-0.5 rounded truncate max-w-full"
+                                    title={natureza}
+                                  >
+                                    {natureza}
+                                  </span>
+                                ))}
+                                {remaining.length > 0 && (
+                                  <span
+                                    className="text-[9px] font-bold bg-slate-700 text-slate-100 px-1.5 py-0.5 rounded truncate cursor-help shadow-2xs"
+                                    title={remaining.join('\n')}
+                                  >
+                                    +{remaining.length} outras
+                                  </span>
+                                )}
+                              </>
+                            );
+                          })()}
                         </div>
                       </td>
 
@@ -661,6 +695,7 @@ export const DetailedConsolidationTable: React.FC<DetailedConsolidationTableProp
           files={files}
           quebraOrdemItems={quebraOrdemItems}
           bankRecords={bankRecords}
+          ordensBancariasList={ordensBancariasList}
           isRecurring={
             recurringKeysSet.has((internalAuditedSupplier.cnpj || '').replace(/\D/g, '')) ||
             recurringKeysSet.has((internalAuditedSupplier.name || '').trim().toUpperCase())

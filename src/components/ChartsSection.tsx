@@ -86,7 +86,7 @@ export const ChartsSection: React.FC<ChartsSectionProps> = ({ metrics }) => {
         ticks: {
           font: { family: 'sans-serif', size: 10 },
           callback: (val: any) => {
-            if (val >= 1000000) return `R$ ${(val / 1000000).toFixed(1)}M`;
+            if (val >= 1000000) return `R$ ${(val / 1000000).toFixed(1).replace('.', ',')}M`;
             if (val >= 1000) return `R$ ${(val / 1000).toFixed(0)}k`;
             return `R$ ${val}`;
           },

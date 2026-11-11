@@ -39,6 +39,9 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
   const ppInputRef = useRef<HTMLInputElement>(null);
   const obedeceInputRef = useRef<HTMLInputElement>(null);
   const naoObedeceInputRef = useRef<HTMLInputElement>(null);
+  const naturezaInputRef = useRef<HTMLInputElement>(null);
+  const obInputRef = useRef<HTMLInputElement>(null);
+  const publicacaoInputRef = useRef<HTMLInputElement>(null);
 
   const handleGeneralFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
@@ -79,6 +82,9 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
   const ppCount = files.filter((f) => f.stage === 'base_pps' || f.stage === 'pp_prontas').length;
   const obedeceCount = files.filter((f) => f.stage === 'obedece').length;
   const naoObedeceCount = files.filter((f) => f.stage === 'nao_obedece').length;
+  const naturezaCount = files.filter((f) => f.stage === 'natureza_despesa').length;
+  const obCount = files.filter((f) => f.stage === 'ordem_bancaria').length;
+  const publicacaoCount = files.filter((f) => f.stage === 'publicacao').length;
 
   return (
     <section className="bg-white rounded-2xl p-6 shadow-xs border border-slate-200/90 space-y-6">
@@ -125,39 +131,60 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
         className="hidden"
         onChange={(e) => handleStageFileChange(e, 'nao_obedece')}
       />
+      <input
+        type="file"
+        ref={naturezaInputRef}
+        accept=".xlsx, .xls, .csv"
+        multiple
+        className="hidden"
+        onChange={(e) => handleStageFileChange(e, 'natureza_despesa')}
+      />
+      <input
+        type="file"
+        ref={obInputRef}
+        accept=".xlsx, .xls, .csv"
+        multiple
+        className="hidden"
+        onChange={(e) => handleStageFileChange(e, 'ordem_bancaria')}
+      />
+      <input
+        type="file"
+        ref={publicacaoInputRef}
+        accept=".xlsx, .xls, .csv"
+        multiple
+        className="hidden"
+        onChange={(e) => handleStageFileChange(e, 'publicacao')}
+      />
 
-      {/* 3 DEDICATED STAGE UPLOAD CARDS */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      {/* DEDICATED STAGE UPLOAD CARDS */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3">
         {/* Card 1: Base de PPs (Relatório SIGEF) */}
         <div
           onDragOver={handleDragOver}
           onDrop={(e) => handleDropStage(e, 'base_pps')}
           onClick={() => ppInputRef.current?.click()}
-          className="bg-emerald-50/60 hover:bg-emerald-100/60 border-2 border-dashed border-emerald-300 hover:border-emerald-500 rounded-2xl p-5 text-center cursor-pointer transition-all space-y-3 relative group"
+          className="bg-emerald-50/60 hover:bg-emerald-100/60 border-2 border-dashed border-emerald-300 hover:border-emerald-500 rounded-2xl p-4 text-center cursor-pointer transition-all space-y-2.5 relative group"
         >
           <div className="flex items-center justify-between">
-            <span className="px-2.5 py-1 bg-emerald-100 text-emerald-900 border border-emerald-300 rounded-lg text-[10px] font-black uppercase tracking-wider flex items-center gap-1">
-              <FileCheck2 className="w-3.5 h-3.5 text-emerald-700" />
+            <span className="px-2 py-0.5 bg-emerald-100 text-emerald-900 border border-emerald-300 rounded-lg text-[10px] font-black uppercase tracking-wider flex items-center gap-1">
+              <FileCheck2 className="w-3 h-3 text-emerald-700" />
               Base de PPs
             </span>
             {ppCount > 0 && (
-              <span className="bg-emerald-600 text-white text-[10px] font-bold px-2 py-0.5 rounded-full">
-                {ppCount} {ppCount === 1 ? 'arquivo' : 'arquivos'}
+              <span className="bg-emerald-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full">
+                {ppCount}
               </span>
             )}
           </div>
 
-          <div className="w-12 h-12 rounded-xl bg-emerald-600 text-white flex items-center justify-center mx-auto shadow-md group-hover:scale-105 transition-transform">
-            <Upload className="w-6 h-6" />
+          <div className="w-10 h-10 rounded-xl bg-emerald-600 text-white flex items-center justify-center mx-auto shadow-md group-hover:scale-105 transition-transform">
+            <Upload className="w-5 h-5" />
           </div>
 
           <div>
             <h4 className="text-xs font-black text-emerald-950 uppercase tracking-tight">
-              Arquivo Base de PPs
+              Base de PPs
             </h4>
-            <p className="text-[11px] text-slate-500 mt-0.5">
-              Relatório SIGEF (ex: Relatorio_*.xls)
-            </p>
           </div>
         </div>
 
@@ -166,22 +193,22 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
           onDragOver={handleDragOver}
           onDrop={(e) => handleDropStage(e, 'obedece')}
           onClick={() => obedeceInputRef.current?.click()}
-          className="bg-blue-50/60 hover:bg-blue-100/60 border-2 border-dashed border-blue-300 hover:border-blue-500 rounded-2xl p-5 text-center cursor-pointer transition-all space-y-3 relative group"
+          className="bg-blue-50/60 hover:bg-blue-100/60 border-2 border-dashed border-blue-300 hover:border-blue-500 rounded-2xl p-4 text-center cursor-pointer transition-all space-y-2.5 relative group"
         >
           <div className="flex items-center justify-between">
-            <span className="px-2.5 py-1 bg-blue-100 text-blue-900 border border-blue-300 rounded-lg text-[10px] font-black uppercase tracking-wider flex items-center gap-1">
-              <Clock className="w-3.5 h-3.5 text-blue-700" />
-              Liquidado - Obedece
+            <span className="px-2 py-0.5 bg-blue-100 text-blue-900 border border-blue-300 rounded-lg text-[10px] font-black uppercase tracking-wider flex items-center gap-1">
+              <Clock className="w-3 h-3 text-blue-700" />
+              Obedece
             </span>
             {obedeceCount > 0 && (
-              <span className="bg-blue-600 text-white text-[10px] font-bold px-2 py-0.5 rounded-full">
-                {obedeceCount} {obedeceCount === 1 ? 'arquivo' : 'arquivos'}
+              <span className="bg-blue-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full">
+                {obedeceCount}
               </span>
             )}
           </div>
 
-          <div className="w-12 h-12 rounded-xl bg-blue-600 text-white flex items-center justify-center mx-auto shadow-md group-hover:scale-105 transition-transform">
-            <Upload className="w-6 h-6" />
+          <div className="w-10 h-10 rounded-xl bg-blue-600 text-white flex items-center justify-center mx-auto shadow-md group-hover:scale-105 transition-transform">
+            <Upload className="w-5 h-5" />
           </div>
 
           <div>
@@ -196,27 +223,117 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
           onDragOver={handleDragOver}
           onDrop={(e) => handleDropStage(e, 'nao_obedece')}
           onClick={() => naoObedeceInputRef.current?.click()}
-          className="bg-amber-50/60 hover:bg-amber-100/60 border-2 border-dashed border-amber-300 hover:border-amber-500 rounded-2xl p-5 text-center cursor-pointer transition-all space-y-3 relative group"
+          className="bg-amber-50/60 hover:bg-amber-100/60 border-2 border-dashed border-amber-300 hover:border-amber-500 rounded-2xl p-4 text-center cursor-pointer transition-all space-y-2.5 relative group"
         >
           <div className="flex items-center justify-between">
-            <span className="px-2.5 py-1 bg-amber-100 text-amber-900 border border-amber-300 rounded-lg text-[10px] font-black uppercase tracking-wider flex items-center gap-1">
-              <AlertTriangle className="w-3.5 h-3.5 text-amber-700" />
-              Liquidado - Não Obedece
+            <span className="px-2 py-0.5 bg-amber-100 text-amber-900 border border-amber-300 rounded-lg text-[10px] font-black uppercase tracking-wider flex items-center gap-1">
+              <AlertTriangle className="w-3 h-3 text-amber-700" />
+              Não Obedece
             </span>
             {naoObedeceCount > 0 && (
-              <span className="bg-amber-600 text-white text-[10px] font-bold px-2 py-0.5 rounded-full">
-                {naoObedeceCount} {naoObedeceCount === 1 ? 'arquivo' : 'arquivos'}
+              <span className="bg-amber-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full">
+                {naoObedeceCount}
               </span>
             )}
           </div>
 
-          <div className="w-12 h-12 rounded-xl bg-amber-600 text-white flex items-center justify-center mx-auto shadow-md group-hover:scale-105 transition-transform">
-            <Upload className="w-6 h-6" />
+          <div className="w-10 h-10 rounded-xl bg-amber-600 text-white flex items-center justify-center mx-auto shadow-md group-hover:scale-105 transition-transform">
+            <Upload className="w-5 h-5" />
           </div>
 
           <div>
             <h4 className="text-xs font-black text-amber-950 uppercase tracking-tight">
-              Liquidado - Não Obedece
+              Não Obedece
+            </h4>
+          </div>
+        </div>
+
+        {/* Card 4: Detalhamento de Pagamentos (Listar OB) */}
+        <div
+          onDragOver={handleDragOver}
+          onDrop={(e) => handleDropStage(e, 'ordem_bancaria')}
+          onClick={() => obInputRef.current?.click()}
+          className="bg-teal-50/60 hover:bg-teal-100/60 border-2 border-dashed border-teal-300 hover:border-teal-500 rounded-2xl p-4 text-center cursor-pointer transition-all space-y-2.5 relative group"
+        >
+          <div className="flex items-center justify-between">
+            <span className="px-2 py-0.5 bg-teal-100 text-teal-900 border border-teal-300 rounded-lg text-[10px] font-black uppercase tracking-wider flex items-center gap-1">
+              <FileCheck2 className="w-3 h-3 text-teal-700" />
+              Pagamentos / OB
+            </span>
+            {obCount > 0 && (
+              <span className="bg-teal-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full">
+                {obCount}
+              </span>
+            )}
+          </div>
+
+          <div className="w-10 h-10 rounded-xl bg-teal-600 text-white flex items-center justify-center mx-auto shadow-md group-hover:scale-105 transition-transform">
+            <Upload className="w-5 h-5" />
+          </div>
+
+          <div>
+            <h4 className="text-xs font-black text-teal-950 uppercase tracking-tight">
+              Detalhamento Pagamentos
+            </h4>
+          </div>
+        </div>
+
+        {/* Card 5: Naturezas de Despesa (Empenhos) */}
+        <div
+          onDragOver={handleDragOver}
+          onDrop={(e) => handleDropStage(e, 'natureza_despesa')}
+          onClick={() => naturezaInputRef.current?.click()}
+          className="bg-violet-50/60 hover:bg-violet-100/60 border-2 border-dashed border-violet-300 hover:border-violet-500 rounded-2xl p-4 text-center cursor-pointer transition-all space-y-2.5 relative group"
+        >
+          <div className="flex items-center justify-between">
+            <span className="px-2 py-0.5 bg-violet-100 text-violet-900 border border-violet-300 rounded-lg text-[10px] font-black uppercase tracking-wider flex items-center gap-1">
+              <FileSpreadsheet className="w-3 h-3 text-violet-700" />
+              Naturezas
+            </span>
+            {naturezaCount > 0 && (
+              <span className="bg-violet-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full">
+                {naturezaCount}
+              </span>
+            )}
+          </div>
+
+          <div className="w-10 h-10 rounded-xl bg-violet-600 text-white flex items-center justify-center mx-auto shadow-md group-hover:scale-105 transition-transform">
+            <Upload className="w-5 h-5" />
+          </div>
+
+          <div>
+            <h4 className="text-xs font-black text-violet-950 uppercase tracking-tight">
+              Naturezas Despesa
+            </h4>
+          </div>
+        </div>
+
+        {/* Card 6: NLs para Publicação */}
+        <div
+          onDragOver={handleDragOver}
+          onDrop={(e) => handleDropStage(e, 'publicacao')}
+          onClick={() => publicacaoInputRef.current?.click()}
+          className="bg-indigo-50/60 hover:bg-indigo-100/60 border-2 border-dashed border-indigo-300 hover:border-indigo-500 rounded-2xl p-4 text-center cursor-pointer transition-all space-y-2.5 relative group"
+        >
+          <div className="flex items-center justify-between">
+            <span className="px-2 py-0.5 bg-indigo-100 text-indigo-900 border border-indigo-300 rounded-lg text-[10px] font-black uppercase tracking-wider flex items-center gap-1">
+              <FileSpreadsheet className="w-3 h-3 text-indigo-700" />
+              Publicação
+            </span>
+            {publicacaoCount > 0 && (
+              <span className="bg-indigo-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full">
+                {publicacaoCount}
+              </span>
+            )}
+          </div>
+
+          <div className="w-10 h-10 rounded-xl bg-indigo-600 text-white flex items-center justify-center mx-auto shadow-md group-hover:scale-105 transition-transform">
+            <Upload className="w-5 h-5" />
+          </div>
+
+          <div>
+            <h4 className="text-xs font-black text-indigo-950 uppercase tracking-tight">
+              Para Publicação
             </h4>
           </div>
         </div>
@@ -251,7 +368,7 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             {files.map((fileData) => {
               const currentStage = fileData.stage || 'outros';
-              const stageConfig = STAGES_CONFIG[currentStage];
+              const stageConfig = STAGES_CONFIG[currentStage] || STAGES_CONFIG.outros;
 
               return (
                 <div
@@ -292,11 +409,14 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
                         onChange={(e) =>
                           onChangeFileStage && onChangeFileStage(fileData.id, e.target.value as StageKey)
                         }
-                        className={`text-[10px] font-bold px-2 py-1 rounded-lg border cursor-pointer ${stageConfig.badgeText}`}
+                        className={`text-[10px] font-bold px-2 py-1 rounded-lg border cursor-pointer ${stageConfig?.badgeText || 'bg-slate-100 text-slate-800'}`}
                       >
                         <option value="base_pps">📁 Base de PPs (Relatório SIGEF)</option>
                         <option value="obedece">🔵 Liquidação - Obedece</option>
                         <option value="nao_obedece">🟠 Liquidação - Não Obedece</option>
+                        <option value="ordem_bancaria">🟢 Detalhamento de Pagamentos (Listar OB)</option>
+                        <option value="natureza_despesa">🟣 Natureza da Despesa</option>
+                        <option value="publicacao">📜 NLs para Publicação</option>
                         <option value="outros">⚪ Outras / Geral</option>
                       </select>
                     </div>

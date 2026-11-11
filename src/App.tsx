@@ -3,6 +3,7 @@ import { FileSpreadsheet, ArrowRight } from 'lucide-react';
 import { FileData, DashboardMetrics, StageKey, ColumnMappingConfig } from './types';
 import {
   parseExcelFile,
+  parseWorkbookIntoFileDatas,
   processUploadedFiles,
   generateSampleFiles,
   detectStageFromFileName,
@@ -15,13 +16,15 @@ import { Header } from './components/Header';
 import { KpiCards } from './components/KpiCards';
 import { DetailedConsolidationTable } from './components/DetailedConsolidationTable';
 import { ColumnMappingModal } from './components/ColumnMappingModal';
+import { ErrorBoundary } from './components/ErrorBoundary';
 
 import { ImportacoesView } from './components/views/ImportacoesView';
 import { CategoriasView } from './components/views/CategoriasView';
 import { RecorrenciaView } from './components/views/RecorrenciaView';
 import { FornecedoresMesView } from './components/views/FornecedoresMesView';
-import { QuebraOrdemView } from './components/views/QuebraOrdemView';
 import { PagamentosPorFonteView } from './components/views/PagamentosPorFonteView';
+import { PublicacaoView } from './components/views/PublicacaoView';
+import { ParaPublicarView } from './components/views/ParaPublicarView';
 import { ExtratoAuditoriaEmpresaModal } from './components/ExtratoAuditoriaEmpresaModal';
 import { ToastAlertContainer } from './components/ToastAlertContainer';
 import { ModalAuditoriaML } from './components/ModalAuditoriaML';
@@ -29,14 +32,23 @@ import { ModalVerificacaoNotificacao } from './components/ModalVerificacaoNotifi
 import { ModalHistoricoNotificacoes } from './components/ModalHistoricoNotificacoes';
 import { toastAlertService } from './utils/toastAlertService';
 import { mlInferenceService, getPendingInferences } from './utils/machineLearningInferenceService';
-import { RawPagamentoEmitido, ToastAlert } from './types';
+import { ToastAlert } from './types';
 import {
   OrdemBancariaItem,
   enrichSuppliersWithOrdensBancarias,
   saveOrdensBancariasToStorage,
   loadOrdensBancariasFromStorage,
   loadOrdensBancariasAsync,
+  isObFileName,
+  parseListarOrdemBancariaMatrixAsync,
+  extractOrdensBancariasFromFileData,
 } from './utils/ordemBancariaParser';
+import { readSpreadsheetAsMatrix } from './utils/excelParser';
+import { googleDriveService, GoogleDriveState } from './utils/googleDriveService';
+import { cloudSyncService, CloudSyncState } from './utils/cloudSyncService';
+import { indexAppKnowledge } from './utils/appKnowledgeDirectory';
+import { paraPublicarService } from './utils/paraPublicarService';
+import { auth } from './firebase';
 
 const initialMetrics: DashboardMetrics = {
   grandTotalValue: 0,
@@ -51,12 +63,10 @@ const initialMetrics: DashboardMetrics = {
 
 export function App() {
   const [activeTab, setActiveTab] = useState('painel');
-  const [visitedTabs, setVisitedTabs] = useState<Record<string, boolean>>({ painel: true });
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [lastProcessedAt, setLastProcessedAt] = useState<Date | null>(null);
 
   const handleTabChange = useCallback((newTab: string) => {
-    setVisitedTabs((prev) => (prev[newTab] ? prev : { ...prev, [newTab]: true }));
     startTransition(() => {
       setActiveTab(newTab);
     });
@@ -69,17 +79,23 @@ export function App() {
   const [metrics, setMetrics] = useState<DashboardMetrics>(initialMetrics);
 
   const [isProcessing, setIsProcessing] = useState(false);
+  const [processingProgress, setProcessingProgress] = useState<number>(0);
   const [processingMessage, setProcessingMessage] = useState<string>('Processando dados...');
   const [activeMappingFileId, setActiveMappingFileId] = useState<string | null>(null);
   const [isStorageLoaded, setIsStorageLoaded] = useState(false);
 
-  // State for Relatório de Pagamentos Emitidos (Quebra de Ordem)
-  const [rawPagamentosList, setRawPagamentosList] = useState<RawPagamentoEmitido[] | null>(null);
-  const [pagamentosFileName, setPagamentosFileName] = useState<string>('');
-
   // State for Relatório "Listar Ordem Bancária" (Pagos / Detalhamento por Fonte e Mês)
   const [ordensBancariasList, setOrdensBancariasList] = useState<OrdemBancariaItem[] | null>(null);
   const [ordensBancariasFileName, setOrdensBancariasFileName] = useState<string>('');
+
+  // Google Drive & Sheets Integration State
+  const [driveState, setDriveState] = useState<GoogleDriveState>(googleDriveService.getState());
+  const [isDriveSyncing, setIsDriveSyncing] = useState(false);
+
+  // Cloud Multi-Device Synchronization State (Tablet & PC)
+  const [cloudSyncState, setCloudSyncState] = useState<CloudSyncState>(cloudSyncService.getState());
+
+
 
   // Helper to re-enrich metrics whenever files or OB list changes
   const applyEnrichment = useCallback((baseMetrics: DashboardMetrics, obList: OrdemBancariaItem[] | null): DashboardMetrics => {
@@ -223,54 +239,116 @@ export function App() {
   // Load saved state on mount
   useEffect(() => {
     async function initStorage() {
+      let stored: any = null;
+      let obStored: { items: OrdemBancariaItem[] | null; fileName: string } = { items: null, fileName: '' };
       try {
-        const stored = await loadAppState();
-        const obStored = await loadOrdensBancariasAsync();
-        if (obStored.items && obStored.items.length > 0) {
+
+        try {
+          stored = await loadAppState();
+        } catch (e) {
+          console.warn('Falha ao ler loadAppState:', e);
+        }
+
+        try {
+          obStored = await loadOrdensBancariasAsync();
+        } catch (e) {
+          console.warn('Falha ao ler loadOrdensBancariasAsync:', e);
+        }
+
+        if (obStored && obStored.items && obStored.items.length > 0) {
           setOrdensBancariasList(obStored.items);
-          setOrdensBancariasFileName(obStored.fileName);
+          setOrdensBancariasFileName(obStored.fileName || '');
         }
 
         const realFiles = (stored?.files || []).filter(
-          (f) => f.id !== 'sample_file_1' && !f.fileName?.includes('Relatorio_Credores_Valor_Total.xlsx')
+          (f: any) => {
+            if (!f || f.id === 'sample_file_1' || f.fileName?.includes('Relatorio_Credores_Valor_Total.xlsx')) return false;
+            // Purge extraneous auxiliary tabs from "Processamento de dados": only keep 'obedece' and 'nao_obedece'
+            const lower = (f.fileName || '').toLowerCase();
+            if (lower.includes('processamento') && lower.includes('dados')) {
+              const isOb = f.stage === 'obedece' || (lower.includes('obedece') && !lower.includes('nao') && !lower.includes('não'));
+              const isNaoOb = f.stage === 'nao_obedece' || lower.includes('nao obedece') || lower.includes('não obedece');
+              if (!isOb && !isNaoOb) return false;
+            }
+            return true;
+          }
         );
+
+        // Auto-extract OBs from existing files if ordensBancariasList was not loaded
+        if ((!obStored?.items || obStored.items.length === 0) && realFiles.length > 0) {
+          const obMap = new Map<string, OrdemBancariaItem>();
+          realFiles.forEach((f: any) => {
+            if (isObFileName(f.fileName) || f.stage === 'ordem_bancaria' || f.detectedObCol) {
+              const extracted = extractOrdensBancariasFromFileData(f);
+              extracted.forEach((item) => {
+                const k = item.ob ? ('OB_' + item.ob.trim().toUpperCase()) : (item.pp ? ('PP_' + item.pp.trim().toUpperCase()) : item.id);
+                obMap.set(k, item);
+              });
+            }
+          });
+          const allExtracted = Array.from(obMap.values());
+          if (allExtracted.length > 0) {
+            setOrdensBancariasList(allExtracted);
+            setOrdensBancariasFileName('Consolidado de Arquivos');
+            saveOrdensBancariasToStorage(allExtracted, 'Consolidado de Arquivos');
+            obStored = { items: allExtracted, fileName: 'Consolidado de Arquivos' };
+          }
+        }
 
         if (realFiles.length > 0) {
           setFiles(realFiles);
           const ts = stored?.lastProcessedAt ? new Date(stored.lastProcessedAt) : new Date();
           setLastProcessedAt(ts);
-          const processed = processUploadedFiles(realFiles);
-          const enriched = applyEnrichment(processed, obStored.items);
-          setMetrics(enriched);
-          toastAlertService.syncConfirmations(realFiles, obStored.items, false);
-          mlInferenceService.processFilesForInference(realFiles, obStored.items);
-        } else if (obStored.items && obStored.items.length > 0) {
-          toastAlertService.syncConfirmations([], obStored.items, false);
-          mlInferenceService.processFilesForInference([], obStored.items);
+          try {
+            const processed = processUploadedFiles(realFiles);
+            const enriched = applyEnrichment(processed, obStored?.items || null);
+            setMetrics(enriched);
+          } catch (procErr) {
+            console.error('Erro ao reprocessar dados salvos:', procErr);
+          }
+
+          try {
+            toastAlertService.syncConfirmations(realFiles, obStored?.items || null, false);
+          } catch (tErr) {
+            console.warn('Erro ao sincronizar confirmações no boot:', tErr);
+          }
+
+          try {
+            mlInferenceService.processFilesForInference(realFiles, obStored?.items || null);
+          } catch (mlErr) {
+            console.warn('Erro ao inferir ML no boot:', mlErr);
+          }
+        } else if (obStored?.items && obStored.items.length > 0) {
+          try {
+            toastAlertService.syncConfirmations([], obStored.items, false);
+            mlInferenceService.processFilesForInference([], obStored.items);
+          } catch (_) {}
         } else {
           setFiles([]);
-          const initial = {
-            grandTotalValue: 0,
-            grandTotalCount: 0,
-            totalPpProntas: 0,
-            totalLiqObedece: 0,
-            totalLiqNaoObedece: 0,
-            totalOutros: 0,
-            consolidatedSuppliers: [],
-            isProcessed: false,
-          };
-          setMetrics(initial);
+          setMetrics(initialMetrics);
         }
       } catch (err) {
         console.error('Erro ao carregar do armazenamento:', err);
       } finally {
         setIsStorageLoaded(true);
+        // Index app knowledge across loaded files and OBs
+        try {
+          indexAppKnowledge(stored?.files || [], obStored?.items || null);
+        } catch (_) {}
+        // Automatic cloud sync verification: pulls updates made from other devices (e.g. tablet to PC) if authenticated
+        setTimeout(() => {
+          if (auth.currentUser) {
+            cloudSyncService.checkAndAutoSync().catch((e) => {
+              console.warn('Auto-sync na inicialização:', e);
+            });
+          }
+        }, 1200);
       }
     }
     initStorage();
   }, []);
 
-  // Auto-save to storage ONLY when user actually makes changes (debounced to keep UI fluid)
+  // Auto-save to local storage (IndexedDB) ONLY when user actually makes changes (debounced to keep UI fluid)
   useEffect(() => {
     if (!isStorageLoaded) return;
     if (!hasUserChangesRef.current) return;
@@ -281,6 +359,12 @@ export function App() {
     }, 1000);
     return () => clearTimeout(timer);
   }, [files, lastProcessedAt, isStorageLoaded]);
+
+  const filesRef = useRef<FileData[]>(files);
+  useEffect(() => {
+    filesRef.current = files;
+  }, [files]);
+  const activeUploadsCountRef = useRef(0);
 
   // Trigger alert and ML inference analysis whenever files are uploaded, changed, or processed
   const alertAnalysisTimeoutRef = useRef<any>(null);
@@ -297,24 +381,95 @@ export function App() {
 
   // Upload file action
   const handleFileUpload = async (file: File, stage?: StageKey) => {
+    activeUploadsCountRef.current++;
+    setIsProcessing(true);
+    setProcessingProgress(20);
+    setProcessingMessage(`Lendo e processando "${file.name}"...`);
+
     try {
-      setIsProcessing(true);
-      setProcessingMessage(`Lendo e processando "${file.name}"...`);
-      // Brief pause to allow the animated spinner to appear cleanly
-      await new Promise((res) => setTimeout(res, 80));
-      const parsedFileData = await parseExcelFile(file);
-      parsedFileData.stage = stage || detectStageFromFileName(file.name);
+      await new Promise((res) => setTimeout(res, 60));
+      const parsedFiles = await parseWorkbookIntoFileDatas(file, stage);
+      setProcessingProgress(55);
 
       hasUserChangesRef.current = true;
-      setFiles((prev) => {
-        const updated = [...prev, parsedFileData];
+
+      // Ensure baseline captures current state before updating/replacing files
+      if (filesRef.current.length > 0) {
+        toastAlertService.ensureBaseline(filesRef.current, ordensBancariasList);
+      }
+
+      let updated = [...filesRef.current];
+      let targetOBs = ordensBancariasList;
+
+      for (const parsedFileData of parsedFiles) {
+        // If a file with the same name already exists, replace it instead of duplicating
+        const existingIdx = updated.findIndex((f) => f.fileName === parsedFileData.fileName);
+        if (existingIdx >= 0) {
+          updated = updated.map((f, i) => (i === existingIdx ? parsedFileData : f));
+        } else {
+          updated = [...updated, parsedFileData];
+        }
+
+        // Automatically detect and parse OB spreadsheet OR pull OBs directly from the SIGEF PP spreadsheet
+        if (isObFileName(parsedFileData.fileName) || parsedFileData.stage === 'ordem_bancaria') {
+          try {
+            const matrix = await readSpreadsheetAsMatrix(file);
+            const parsedOBs = await parseListarOrdemBancariaMatrixAsync(matrix);
+            if (parsedOBs.length > 0) {
+              targetOBs = parsedOBs;
+              handleUpdateOrdensBancariasList(parsedOBs, parsedFileData.fileName);
+            } else {
+              const extracted = extractOrdensBancariasFromFileData(parsedFileData);
+              if (extracted.length > 0) {
+                targetOBs = extracted;
+                handleUpdateOrdensBancariasList(extracted, parsedFileData.fileName);
+              }
+            }
+          } catch (obErr) {
+            console.warn('Erro ao auto-processar planilha de OBs:', obErr);
+            const extracted = extractOrdensBancariasFromFileData(parsedFileData);
+            if (extracted.length > 0) {
+              targetOBs = extracted;
+              handleUpdateOrdensBancariasList(extracted, parsedFileData.fileName);
+            }
+          }
+        } else if (parsedFileData.stage === 'base_pps' || parsedFileData.detectedObCol) {
+          // PULL OBs DIRECTLY FROM THE PP SPREADSHEET EXTRACTED FROM SIGEF
+          const extracted = extractOrdensBancariasFromFileData(parsedFileData);
+          if (extracted.length > 0) {
+            if (targetOBs && targetOBs.length > 0) {
+              const obMap = new Map<string, OrdemBancariaItem>();
+              targetOBs.forEach((item) => {
+                const k = item.ob ? ('OB_' + item.ob.trim().toUpperCase()) : (item.pp ? ('PP_' + item.pp.trim().toUpperCase()) : item.id);
+                obMap.set(k, item);
+              });
+              extracted.forEach((item) => {
+                const k = item.ob ? ('OB_' + item.ob.trim().toUpperCase()) : (item.pp ? ('PP_' + item.pp.trim().toUpperCase()) : item.id);
+                obMap.set(k, item);
+              });
+              targetOBs = Array.from(obMap.values());
+            } else {
+              targetOBs = extracted;
+            }
+            handleUpdateOrdensBancariasList(targetOBs, parsedFileData.fileName);
+          }
+        }
+      }
+
+      filesRef.current = updated;
+      setFiles(updated);
+
+      if (activeUploadsCountRef.current <= 1) {
+        setProcessingMessage('Consolidando dados...');
+        setProcessingProgress(78);
+        await new Promise((res) => setTimeout(res, 30));
         const newMetrics = processUploadedFiles(updated);
-        const enriched = applyEnrichment(newMetrics, ordensBancariasList);
+        const enriched = applyEnrichment(newMetrics, targetOBs);
         setMetrics(enriched);
         setLastProcessedAt(new Date());
-        triggerAlertAnalysis(updated, ordensBancariasList);
-        return updated;
-      });
+        setProcessingProgress(92);
+        triggerAlertAnalysis(updated, targetOBs);
+      }
     } catch (error: any) {
       toastAlertService.addToast({
         tipo: 'critico',
@@ -322,33 +477,244 @@ export function App() {
         mensagem: error.message || 'Arquivo corrompido ou formato inválido.',
       });
     } finally {
-      setIsProcessing(false);
+      activeUploadsCountRef.current = Math.max(0, activeUploadsCountRef.current - 1);
+      if (activeUploadsCountRef.current === 0) {
+        const finalFiles = filesRef.current;
+        const finalOBs = ordensBancariasList;
+        setTimeout(() => {
+          const finalMetrics = processUploadedFiles(finalFiles);
+          const finalEnriched = applyEnrichment(finalMetrics, finalOBs);
+          setMetrics(finalEnriched);
+          triggerAlertAnalysis(finalFiles, finalOBs);
+          saveAppState(finalFiles, lastProcessedAt);
+          setProcessingProgress(100);
+          setTimeout(() => {
+            setIsProcessing(false);
+            setProcessingProgress(0);
+          }, 350);
+        }, 50);
+      }
+    }
+  };
+
+  // Google Drive Integration: register file delivery callback and subscription
+  useEffect(() => {
+    const unsubscribe = googleDriveService.subscribe((state) => {
+      setDriveState(state);
+    });
+
+    // When Google Drive delivers a file (either manual sync or 20-minute background auto-polling)
+    googleDriveService.registerNewFileCallback(async (file: File, isAuto: boolean) => {
+      if (isAuto) {
+        toastAlertService.addToast({
+          tipo: 'info',
+          titulo: 'Atualização Automática do Google Drive',
+          mensagem: `Nova versão da planilha "${file.name}" detectada e sincronizada.`,
+        });
+      }
+      await handleFileUpload(file);
+    });
+
+    return () => {
+      unsubscribe();
+      googleDriveService.stopAutoPolling();
+    };
+  }, []);
+
+  // Cloud Multi-Device Sync: subscribe and register dataset reload handler
+  useEffect(() => {
+    const unsubscribe = cloudSyncService.subscribe((state) => {
+      setCloudSyncState(state);
+    });
+
+    cloudSyncService.registerDatasetReloadCallback((reloadedFiles, reloadedOBs) => {
+      if (reloadedFiles && reloadedFiles.length > 0) {
+        setFiles(reloadedFiles);
+        filesRef.current = reloadedFiles;
+        if (reloadedOBs && reloadedOBs.length > 0) {
+          setOrdensBancariasList(reloadedOBs);
+        }
+        try {
+          const processed = processUploadedFiles(reloadedFiles);
+          const enriched = applyEnrichment(processed, reloadedOBs || ordensBancariasList);
+          setMetrics(enriched);
+          setLastProcessedAt(new Date());
+          toastAlertService.addToast({
+            tipo: 'info',
+            titulo: 'Sincronização em Nuvem Concluída',
+            mensagem: `${reloadedFiles.length} planilhas sincronizadas a partir de seus outros dispositivos.`,
+          });
+        } catch (e) {
+          console.warn('Erro ao processar dados recarregados da nuvem:', e);
+        }
+      }
+    });
+
+    return () => {
+      unsubscribe();
+    };
+  }, [applyEnrichment, ordensBancariasList]);
+
+  const handleConnectDrive = async () => {
+    try {
+      const ok = await googleDriveService.connectGoogleDrive();
+      if (ok) {
+        // Automatically link Cloud Sync (Firestore) with Google account as well
+        try {
+          if (!cloudSyncService.getState().isAuthenticated) {
+            await cloudSyncService.loginWithGoogle();
+          } else {
+            await cloudSyncService.checkAndAutoSync();
+          }
+        } catch (cloudErr) {
+          console.warn('Sincronização em nuvem automática:', cloudErr);
+        }
+
+        toastAlertService.addToast({
+          tipo: 'sucesso',
+          titulo: 'Conta Google Conectada',
+          mensagem: 'Sincronização em nuvem (Tablet/PC) e Google Drive ativadas com sucesso.',
+        });
+        // Immediately fetch the latest financial report from Drive and sync cloud state
+        await handleSyncDriveNow();
+      }
+    } catch (err: any) {
+      toastAlertService.addToast({
+        tipo: 'critico',
+        titulo: 'Falha ao Conectar Conta Google',
+        mensagem: err?.message || 'Verifique as permissões de acesso ao Google Cloud.',
+      });
+    }
+  };
+
+  const handleDisconnectDrive = async () => {
+    googleDriveService.disconnectGoogleDrive();
+    try {
+      await cloudSyncService.logout();
+    } catch {
+      // ignore
+    }
+    toastAlertService.addToast({
+      tipo: 'info',
+      titulo: 'Conta Google Desconectada',
+      mensagem: 'A sincronização com o Google Drive e a nuvem foi encerrada.',
+    });
+  };
+
+  const handleSyncDriveNow = async () => {
+    if (isDriveSyncing) return;
+    setIsDriveSyncing(true);
+    setIsProcessing(true);
+    setProcessingProgress(20);
+    setProcessingMessage('Sincronizando com Google Drive e Nuvem...');
+    try {
+      setProcessingProgress(40);
+      const result = await googleDriveService.syncNow(true);
+      
+      // Also sync Firestore cloud state across Tablet & PC
+      try {
+        setProcessingProgress(70);
+        await cloudSyncService.checkAndAutoSync();
+      } catch (cloudErr) {
+        console.warn('Sincronização em nuvem:', cloudErr);
+      }
+
+      setProcessingProgress(90);
+      if (result.success) {
+        toastAlertService.addToast({
+          tipo: 'sucesso',
+          titulo: 'Sincronização Concluída',
+          mensagem: `${result.message} Dados em nuvem atualizados para todos os seus dispositivos.`,
+        });
+      } else {
+        toastAlertService.addToast({
+          tipo: 'sucesso',
+          titulo: 'Nuvem e Dispositivos Atualizados',
+          mensagem: 'Planilhas e dados sincronizados com sucesso entre Tablet e PC.',
+        });
+      }
+    } catch (err: any) {
+      toastAlertService.addToast({
+        tipo: 'critico',
+        titulo: 'Erro ao Sincronizar',
+        mensagem: err?.message || 'Falha ao buscar planilhas no Google Drive.',
+      });
+    } finally {
+      setIsDriveSyncing(false);
+      setProcessingProgress(100);
+      setTimeout(() => {
+        setIsProcessing(false);
+        setProcessingProgress(0);
+      }, 400);
     }
   };
 
   // Change file stage tag
   const handleChangeFileStage = (fileId: string, stage: StageKey) => {
     hasUserChangesRef.current = true;
-    setFiles((prev) => {
-      const updated = prev.map((f) => (f.id === fileId ? { ...f, stage } : f));
-      const newMetrics = processUploadedFiles(updated);
-      const enriched = applyEnrichment(newMetrics, ordensBancariasList);
-      setMetrics(enriched);
-      triggerAlertAnalysis(updated, ordensBancariasList);
-      return updated;
+    let targetUpdatedFile: FileData | null = null;
+    const updated = filesRef.current.map((f) => {
+      if (f.id === fileId) {
+        const up = { ...f, stage };
+        targetUpdatedFile = up;
+        return up;
+      }
+      return f;
     });
+    filesRef.current = updated;
+    setFiles(updated);
+
+    let targetOBs = ordensBancariasList;
+    if (stage === 'ordem_bancaria' && targetUpdatedFile) {
+      const extracted = extractOrdensBancariasFromFileData(targetUpdatedFile);
+      if (extracted.length > 0) {
+        targetOBs = extracted;
+        handleUpdateOrdensBancariasList(extracted, (targetUpdatedFile as FileData).fileName);
+      }
+    }
+
+    const newMetrics = processUploadedFiles(updated);
+    const enriched = applyEnrichment(newMetrics, targetOBs);
+    setMetrics(enriched);
+    triggerAlertAnalysis(updated, targetOBs);
   };
 
   // Remove file action
   const handleRemoveFile = (fileId: string) => {
     hasUserChangesRef.current = true;
-    setFiles((prev) => {
-      const updated = prev.filter((f) => f.id !== fileId);
+    const removed = filesRef.current.find((f) => f.id === fileId);
+    const updated = filesRef.current.filter((f) => f.id !== fileId);
+    filesRef.current = updated;
+    setFiles(updated);
+
+    // Delete directly from Cloud Firestore to keep all devices in sync
+    cloudSyncService.deleteFileFromCloud(fileId);
+
+    let targetOBs = ordensBancariasList;
+    if (
+      removed &&
+      (removed.stage === 'ordem_bancaria' ||
+        removed.fileName === ordensBancariasFileName ||
+        isObFileName(removed.fileName))
+    ) {
+      const remainingOb = updated.find((f) => f.stage === 'ordem_bancaria' || isObFileName(f.fileName));
+      if (remainingOb) {
+        const extracted = extractOrdensBancariasFromFileData(remainingOb);
+        targetOBs = extracted.length > 0 ? extracted : null;
+        handleUpdateOrdensBancariasList(targetOBs, remainingOb.fileName);
+      } else {
+        targetOBs = null;
+        handleUpdateOrdensBancariasList(null, '');
+      }
+    }
+
+    // Use non-blocking schedule for consolidation so UI never stutters or freezes
+    setTimeout(() => {
       const newMetrics = processUploadedFiles(updated);
-      const enriched = applyEnrichment(newMetrics, ordensBancariasList);
+      const enriched = applyEnrichment(newMetrics, targetOBs);
       setMetrics(enriched);
-      return updated;
-    });
+      saveAppState(updated, lastProcessedAt);
+    }, 10);
   };
 
   // Process data button handler
@@ -388,6 +754,10 @@ export function App() {
       const enriched = applyEnrichment(newMetrics, ordensBancariasList);
       setMetrics(enriched);
       await saveAppState(files, now);
+      // Synchronize dataset to the Cloud for multi-device access (Tablet & PC)
+      cloudSyncService.pushToCloud(files, ordensBancariasList, ordensBancariasFileName).catch((e) => {
+        console.warn('Sincronização em nuvem durante salvamento:', e);
+      });
       // Scans for alerts strictly when user clicks on save button
       toastAlertService.analyzeFileTransitions(files, ordensBancariasList);
       mlInferenceService.processFilesForInference(files, ordensBancariasList);
@@ -424,32 +794,59 @@ export function App() {
       : mappingOrFav;
 
     hasUserChangesRef.current = true;
-    setFiles((prev) => {
-      const updated = prev.map((f) => {
-        if (f.id === fileId) {
-          return {
-            ...f,
-            detectedFavorecidoCol: mapping.favorecidoCol,
-            detectedValorCol: mapping.valorCol,
-            stage: mapping.stage || f.stage,
-            detectedCnpjCol: mapping.cnpjCol || undefined,
-            detectedSituacaoCol: mapping.situacaoCol || undefined,
-            detectedNumeroCol: mapping.numeroCol || undefined,
-            detectedPpCol: mapping.numeroCol || undefined,
-            detectedObCol: mapping.obCol || undefined,
-            detectedNotaEmpenhoCol: mapping.notaEmpenhoCol || undefined,
-            detectedFavorecidoNECol: mapping.favorecidoNECol || undefined,
-            detectedProcessoCol: mapping.processoCol || undefined,
-            detectedFonteCol: mapping.fonteCol || undefined,
-          };
-        }
-        return f;
-      });
-      const newMetrics = processUploadedFiles(updated);
-      setMetrics(newMetrics);
-      saveAppState(updated, lastProcessedAt || new Date());
-      return updated;
+    let targetUpdatedFile: FileData | null = null;
+    const updated = filesRef.current.map((f) => {
+      if (f.id === fileId) {
+        const up: FileData = {
+          ...f,
+          detectedFavorecidoCol: mapping.favorecidoCol,
+          detectedValorCol: mapping.valorCol,
+          stage: mapping.stage || f.stage,
+          detectedCnpjCol: mapping.cnpjCol || undefined,
+          detectedSituacaoCol: mapping.situacaoCol || undefined,
+          detectedSituacaoObCol: mapping.situacaoObCol || (f as any).detectedSituacaoObCol || undefined,
+          detectedNumeroCol: mapping.numeroCol || undefined,
+          detectedPpCol: mapping.numeroCol || undefined,
+          detectedObCol: mapping.obCol || undefined,
+          detectedNotaEmpenhoCol: mapping.notaEmpenhoCol || undefined,
+          detectedFavorecidoNECol: mapping.favorecidoNECol || undefined,
+          detectedProcessoCol: mapping.processoCol || undefined,
+          detectedFonteCol: mapping.fonteCol || undefined,
+          detectedNaturezaCol: mapping.naturezaCol || undefined,
+          detectedDataCol: mapping.dataCol || undefined,
+        };
+        targetUpdatedFile = up;
+        return up;
+      }
+      return f;
     });
+    filesRef.current = updated;
+    setFiles(updated);
+
+    // If the updated file is an OB spreadsheet or PP spreadsheet with OBs, re-extract OB items using user's explicit column mapping
+    let targetOBs = ordensBancariasList;
+    if (targetUpdatedFile) {
+      const uf: FileData = targetUpdatedFile;
+      if (
+        uf.stage === 'ordem_bancaria' ||
+        uf.stage === 'base_pps' ||
+        isObFileName(uf.fileName) ||
+        uf.fileName === ordensBancariasFileName ||
+        Boolean(uf.detectedObCol)
+      ) {
+        const reExtracted = extractOrdensBancariasFromFileData(uf);
+        if (reExtracted.length > 0) {
+          targetOBs = reExtracted;
+          handleUpdateOrdensBancariasList(reExtracted, uf.fileName);
+        }
+      }
+    }
+
+    const newMetrics = processUploadedFiles(updated);
+    const enriched = applyEnrichment(newMetrics, targetOBs);
+    setMetrics(enriched);
+    saveAppState(updated, lastProcessedAt || new Date());
+    triggerAlertAnalysis(updated, targetOBs);
   };
 
   const activeMappingFile = files.find((f) => f.id === activeMappingFileId) || null;
@@ -495,126 +892,136 @@ export function App() {
           unreadAlertsCount={alertsCount}
           isProcessed={metrics.isProcessed}
           lastProcessedAt={lastProcessedAt}
+          driveState={driveState}
+          onConnectDrive={handleConnectDrive}
+          onDisconnectDrive={handleDisconnectDrive}
+          onSyncDriveNow={handleSyncDriveNow}
+          isDriveSyncing={isDriveSyncing}
+          cloudSyncState={cloudSyncState}
+          isProcessing={isProcessing}
+          processingProgress={processingProgress}
+          processingMessage={processingMessage}
         />
 
         {/* Dynamic Workspace (Expanded Layout to 98% Screen Width) */}
         <main className="p-4 sm:p-6 md:p-8 space-y-8 w-full max-w-[98%] mx-auto flex-1">
-          <div className="space-y-8">
-            {visitedTabs['painel'] && (
-              <div className={activeTab === 'painel' ? 'space-y-8 animate-in fade-in-50 duration-150' : 'hidden'}>
-                {!metrics.isProcessed ? (
-                  <div className="bg-[#061d15] border border-emerald-900/80 text-white rounded-3xl p-8 md:p-12 shadow-xl text-center space-y-6 max-w-3xl mx-auto my-8">
-                    <div className="w-16 h-16 bg-emerald-600/20 text-emerald-400 rounded-2xl flex items-center justify-center mx-auto border border-emerald-500/30">
-                      <FileSpreadsheet className="w-8 h-8" />
+          <ErrorBoundary fallbackTitle="Falha ao carregar o módulo selecionado">
+            <div className="space-y-8">
+              {activeTab === 'painel' && (
+                <div className="space-y-8 animate-in fade-in-50 duration-150">
+                  {!metrics.isProcessed ? (
+                    <div className="bg-[#061d15] border border-emerald-900/80 text-white rounded-3xl p-8 md:p-12 shadow-xl text-center space-y-6 max-w-3xl mx-auto my-8">
+                      <div className="w-16 h-16 bg-emerald-600/20 text-emerald-400 rounded-2xl flex items-center justify-center mx-auto border border-emerald-500/30">
+                        <FileSpreadsheet className="w-8 h-8" />
+                      </div>
+                      <div className="space-y-2">
+                        <h2 className="text-2xl font-black tracking-tight text-white">
+                          Nenhuma Planilha Importada
+                        </h2>
+                      </div>
+                      <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
+                        <button
+                          onClick={() => handleTabChange('importacoes')}
+                          className="w-full sm:w-auto px-6 py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm rounded-xl transition flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/20 cursor-pointer active:scale-98"
+                        >
+                          <span>Ir para Importação de Planilhas</span>
+                          <ArrowRight className="w-4 h-4" />
+                        </button>
+                      </div>
                     </div>
-                    <div className="space-y-2">
-                      <h2 className="text-2xl font-black tracking-tight text-white">
-                        Nenhuma Planilha Importada
-                      </h2>
-                    </div>
-                    <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
-                      <button
-                        onClick={() => handleTabChange('importacoes')}
-                        className="w-full sm:w-auto px-6 py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm rounded-xl transition flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/20 cursor-pointer active:scale-98"
-                      >
-                        <span>Ir para Importação de Planilhas</span>
-                        <ArrowRight className="w-4 h-4" />
-                      </button>
-                    </div>
-                  </div>
-                ) : (
-                  <>
-                    {/* KPI Cards */}
-                    <KpiCards metrics={metrics} />
+                  ) : (
+                    <>
+                      {/* KPI Cards */}
+                      <KpiCards metrics={metrics} />
 
-                    {/* Clean Main Creditors Table */}
-                    <DetailedConsolidationTable
-                      metrics={metrics}
-                      files={files}
-                      onOpenCompanyAudit={(s) => setAuditedSupplier(s)}
-                    />
-                  </>
-                )}
-              </div>
-            )}
+                      {/* Clean Main Creditors Table */}
+                      <DetailedConsolidationTable
+                        metrics={metrics}
+                        files={files}
+                        ordensBancariasList={ordensBancariasList}
+                        onOpenCompanyAudit={(s) => setAuditedSupplier(s)}
+                      />
+                    </>
+                  )}
+                </div>
+              )}
 
-            {visitedTabs['pagamentos_fonte'] && (
-              <div className={activeTab === 'pagamentos_fonte' ? 'space-y-8 animate-in fade-in-50 duration-150' : 'hidden'}>
-                <PagamentosPorFonteView
-                  files={files}
-                  ordensBancariasList={ordensBancariasList}
-                  ordensBancariasFileName={ordensBancariasFileName}
-                  onUpdateOrdensBancariasList={handleUpdateOrdensBancariasList}
-                  onOpenCompanyAudit={(s) => setAuditedSupplier(s)}
-                  onNavigateToImportacoes={() => handleTabChange('importacoes')}
-                />
-              </div>
-            )}
+              {activeTab === 'pagamentos_fonte' && (
+                <div className="space-y-8 animate-in fade-in-50 duration-150">
+                  <PagamentosPorFonteView
+                    files={files}
+                    ordensBancariasList={ordensBancariasList}
+                    ordensBancariasFileName={ordensBancariasFileName}
+                    onUpdateOrdensBancariasList={handleUpdateOrdensBancariasList}
+                    onOpenCompanyAudit={(s) => setAuditedSupplier(s)}
+                    onNavigateToImportacoes={() => handleTabChange('importacoes')}
+                    onOpenColumnMapModal={(fileId) => setActiveMappingFileId(fileId)}
+                    onFileUpload={handleFileUpload}
+                  />
+                </div>
+              )}
 
-            {visitedTabs['quebra_ordem'] && (
-              <div className={activeTab === 'quebra_ordem' ? 'space-y-8 animate-in fade-in-50 duration-150' : 'hidden'}>
-                <QuebraOrdemView
-                  files={files}
-                  rawPagamentosList={rawPagamentosList}
-                  onUpdatePagamentosList={(list, fn) => {
-                    setRawPagamentosList(list);
-                    if (fn) setPagamentosFileName(fn);
-                  }}
-                  onOpenCompanyAudit={(s) => setAuditedSupplier(s)}
-                  onNavigateToImportacoes={() => handleTabChange('importacoes')}
-                />
-              </div>
-            )}
+              {activeTab === 'publicacao' && (
+                <div className="space-y-8 animate-in fade-in-50 duration-150">
+                  <PublicacaoView
+                    files={files}
+                    ordensBancariasList={ordensBancariasList}
+                    onFileUpload={handleFileUpload}
+                    onNavigateToImportacoes={() => handleTabChange('importacoes')}
+                  />
+                </div>
+              )}
 
-            {visitedTabs['recorrencia'] && (
-              <div className={activeTab === 'recorrencia' ? 'space-y-8 animate-in fade-in-50 duration-150' : 'hidden'}>
-                <RecorrenciaView metrics={metrics} files={files} />
-              </div>
-            )}
+              {activeTab === 'para_publicar' && (
+                <div className="space-y-8 animate-in fade-in-50 duration-150">
+                  <ParaPublicarView />
+                </div>
+              )}
 
-            {visitedTabs['fornecedores_mes'] && (
-              <div className={activeTab === 'fornecedores_mes' ? 'space-y-8 animate-in fade-in-50 duration-150' : 'hidden'}>
-                <FornecedoresMesView
-                  metrics={metrics}
-                  files={files}
-                  onOpenCompanyAudit={(s) => setAuditedSupplier(s)}
-                  onNavigateToTab={(tab) => handleTabChange(tab)}
-                />
-              </div>
-            )}
+              {activeTab === 'recorrencia' && (
+                <div className="space-y-8 animate-in fade-in-50 duration-150">
+                  <RecorrenciaView metrics={metrics} files={files} />
+                </div>
+              )}
 
-            {visitedTabs['categorias'] && (
-              <div className={activeTab === 'categorias' ? 'space-y-8 animate-in fade-in-50 duration-150' : 'hidden'}>
-                <CategoriasView metrics={metrics} />
-              </div>
-            )}
+              {activeTab === 'fornecedores_mes' && (
+                <div className="space-y-8 animate-in fade-in-50 duration-150">
+                  <FornecedoresMesView
+                    metrics={metrics}
+                    files={files}
+                    onOpenCompanyAudit={(s) => setAuditedSupplier(s)}
+                    onNavigateToTab={(tab) => handleTabChange(tab)}
+                  />
+                </div>
+              )}
 
-            {visitedTabs['importacoes'] && (
-              <div className={activeTab === 'importacoes' ? 'space-y-8 animate-in fade-in-50 duration-150' : 'hidden'}>
-                <ImportacoesView
-                  files={files}
-                  onFileUpload={handleFileUpload}
-                  onRemoveFile={handleRemoveFile}
-                  onChangeFileStage={handleChangeFileStage}
-                  onProcessData={handleProcessData}
-                  onSaveData={handleSaveData}
-                  onOpenColumnMapModal={(fileId) => setActiveMappingFileId(fileId)}
-                  isProcessing={isProcessing}
-                  metrics={metrics}
-                  onNavigateToTab={(tab) => handleTabChange(tab)}
-                  rawPagamentosList={rawPagamentosList}
-                  pagamentosFileName={pagamentosFileName}
-                  onUpdatePagamentosList={(list, fn) => {
-                    setRawPagamentosList(list);
-                    if (fn) setPagamentosFileName(fn);
-                  }}
-                  ordensBancariasList={ordensBancariasList}
-                  ordensBancariasFileName={ordensBancariasFileName}
-                  onUpdateOrdensBancariasList={handleUpdateOrdensBancariasList}
-                />
-              </div>
-            )}
-          </div>
+              {activeTab === 'categorias' && (
+                <div className="space-y-8 animate-in fade-in-50 duration-150">
+                  <CategoriasView metrics={metrics} />
+                </div>
+              )}
+
+              {activeTab === 'importacoes' && (
+                <div className="space-y-8 animate-in fade-in-50 duration-150">
+                  <ImportacoesView
+                    files={files}
+                    onFileUpload={handleFileUpload}
+                    onRemoveFile={handleRemoveFile}
+                    onChangeFileStage={handleChangeFileStage}
+                    onProcessData={handleProcessData}
+                    onSaveData={handleSaveData}
+                    onOpenColumnMapModal={(fileId) => setActiveMappingFileId(fileId)}
+                    isProcessing={isProcessing}
+                    metrics={metrics}
+                    onNavigateToTab={(tab) => handleTabChange(tab)}
+                    ordensBancariasList={ordensBancariasList}
+                    ordensBancariasFileName={ordensBancariasFileName}
+                    onUpdateOrdensBancariasList={handleUpdateOrdensBancariasList}
+                  />
+                </div>
+              )}
+            </div>
+          </ErrorBoundary>
         </main>
 
         {/* Footer */}
@@ -641,8 +1048,11 @@ export function App() {
           supplier={auditedSupplier}
           onClose={() => setAuditedSupplier(null)}
           files={files}
+          ordensBancariasList={ordensBancariasList}
         />
       )}
+
+
 
       {/* Toast Alert Notification System */}
       <ToastAlertContainer onSelectToast={(t) => setSelectedToastForVerification(t)} />
