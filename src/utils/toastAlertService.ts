@@ -38,10 +38,18 @@ export function getAlertUniqueKey(a: {
   const nlClean = (a.nl || '').trim().toUpperCase().replace(/[\s\.\-\/]/g, '');
   const cnpjClean = (a.cnpj || '').replace(/\D/g, '');
   const valKey = a.valor !== undefined && a.valor > 0 ? `_${a.valor.toFixed(0)}` : '';
-  const doc = obClean || ppClean || nlClean || neClean || (cnpjClean ? `${cnpjClean}${valKey}` : '') || (a.fornecedor ? `${a.fornecedor.trim().toUpperCase()}${valKey}` : 'DOC');
-  const sit = (a.situacaoNova || '').trim().toUpperCase();
-  const tipo = (a.tipo || '').trim().toLowerCase();
-  return `${doc}__${obClean}__${sit}__${tipo}`;
+
+  const doc = ppClean || obClean || nlClean || neClean || (cnpjClean ? `${cnpjClean}${valKey}` : 'DOC');
+  const rawSit = (a.situacaoNova || '').trim().toUpperCase();
+
+  // Agrupa CB, PPCB, CM e PAGO sob a mesma chave lógica para nunca duplicar alerta entre planilhas diferentes
+  const sitGroup = isSituacaoConfirmadaBanco(rawSit).isMatch
+    ? 'CONF_BANCO'
+    : isSituacaoRejeitadaBanco(rawSit).isMatch
+    ? 'REJ_BANCO'
+    : rawSit;
+
+  return `${doc}__${sitGroup}`;
 }
 
 function isValidOBString(s?: string): boolean {
@@ -241,6 +249,10 @@ export function isSituacaoConfirmadaBanco(situacaoRaw: any): { isMatch: boolean;
     str.includes('CREDITAD')
   ) {
     return { isMatch: true, normalized: 'PAGO' };
+  }
+
+  if (str === 'CM' || str.startsWith('CM ') || str.startsWith('CM-') || str.includes('CONFIRMADA MANUAL')) {
+    return { isMatch: true, normalized: 'CM' };
   }
 
   return { isMatch: false, normalized: '' };
@@ -734,10 +746,10 @@ class ToastAlertManager {
         const fonteRecurso = (obItem.fonteRecurso || '').trim() || 'OUTRAS';
         const isFonte600 = isFonte600OuDerivada(fonteRecurso);
 
-        const key = obNum
-          ? `OB_${obNum}`
-          : ppNum
+        const key = ppNum
           ? `PP_${ppNum}`
+          : obNum
+          ? `OB_${obNum}`
           : cnpjNum
           ? `CNPJ_${cnpjNum}_${Math.round(valNum)}`
           : `FORN_${cleanDocStr(obItem.favorecidoName)}_${Math.round(valNum)}`;
@@ -761,8 +773,6 @@ class ToastAlertManager {
         };
 
         records[key] = itemRecord;
-        if (obNum && !records[`OB_${obNum}`]) records[`OB_${obNum}`] = itemRecord;
-        if (ppNum && !records[`PP_${ppNum}`]) records[`PP_${ppNum}`] = itemRecord;
       });
     }
 
@@ -934,10 +944,10 @@ class ToastAlertManager {
 
         const rowDateInfo = extractRowDate(row);
 
-        const key = obNum
-          ? `OB_${obNum}`
-          : ppNum
+        const key = ppNum
           ? `PP_${ppNum}`
+          : obNum
+          ? `OB_${obNum}`
           : neNum
           ? `NE_${neNum}`
           : cnpjNum
@@ -974,7 +984,10 @@ class ToastAlertManager {
           const trueFonte = (rawFonte && rawFonte !== 'OUTRAS') ? rawFonte : (existing.fonteRecurso || 'OUTRAS');
           const trueIsF600 = isFonte600 || existing.isFonte600;
 
-          const isBetterSit = (isSituacaoAOOuVazia(existing.situacao) && (isConclusivo || isRejected)) || (isConclusivo && !existing.isConclusivo);
+          const isBetterSit =
+            (isSituacaoAOOuVazia(existing.situacao) && !isSituacaoAOOuVazia(rawSit)) ||
+            (isConclusivo && !existing.isConclusivo) ||
+            (!existing.isConclusivo && Boolean(rawSit && rawSit !== existing.situacao));
 
           return {
             ...existing,
@@ -994,8 +1007,6 @@ class ToastAlertManager {
         };
 
         records[key] = mergeRecord(records[key]);
-        if (obNum) records[`OB_${obNum}`] = mergeRecord(records[`OB_${obNum}`]);
-        if (ppNum) records[`PP_${ppNum}`] = mergeRecord(records[`PP_${ppNum}`]);
       });
     });
 
@@ -1110,93 +1121,74 @@ class ToastAlertManager {
       // É necessário ter ao menos identificação de OB ou PP para monitorar a resolução bancária
       if (!currOB && !currPP) continue;
 
-      // Busca o registro correspondente no snapshot anterior
       let prev = previousSnapshot ? previousSnapshot[key] : undefined;
-      if (!prev && previousSnapshot && currOB) {
-        prev = previousSnapshot[`OB_${currOB}`];
-      }
-      if (!prev && previousSnapshot && currPP) {
-        prev = previousSnapshot[`PP_${currPP}`];
-      }
+      if (!prev && previousSnapshot && currPP) prev = previousSnapshot[`PP_${currPP}`];
+      if (!prev && previousSnapshot && currOB) prev = previousSnapshot[`OB_${currOB}`];
 
       const prevSituacao = prev ? (prev.situacao || '').trim().toUpperCase() : '';
       const currSit = (curr.situacao || '').trim().toUpperCase();
       if (!currSit) continue;
 
-      // Se existia no snapshot anterior e a situação mudou (qualquer transição: AP -> AO, AO -> PPNC, PPNC -> PPCB, AO -> PPCB, etc.)
-      const hasSituationChanged = prev ? (prevSituacao !== currSit) : false;
-
-      // Se não mudou de situação (e não é forceRefresh de um item conclusivo), ignora
-      if (prev && !hasSituationChanged && !forceRefresh) {
-        continue;
-      }
-      // Se é um registro novo que ainda não estava no snapshot anterior, só alerta se já entrar em situação alterada relevante ou se forceRefresh estiver ativo
-      if (!prev && !forceRefresh) {
-        continue;
-      }
-
       const confInfo = isSituacaoConfirmadaBanco(currSit);
       const rejInfo = isSituacaoRejeitadaBanco(currSit);
+      const prevConf = isSituacaoConfirmadaBanco(prevSituacao);
+      const prevRej = isSituacaoRejeitadaBanco(prevSituacao);
 
-      const situacaoNovaNorm = currSit;
+      // Se já estava confirmada no banco antes e continua confirmada (ex: CB -> PPCB), não alertar novamente
+      if (prev && prevConf.isMatch && confInfo.isMatch) continue;
+      if (prev && prevRej.isMatch && rejInfo.isMatch) continue;
 
-      // VERIFICAÇÃO DE DUPLICIDADE NO HISTÓRICO:
-      // Verifica apenas se a combinação exata PP_${currPP}_${situacaoNovaNorm} ou OB_${currOB}_${situacaoNovaNorm} já foi notificada,
-      // permitindo que uma mesma PP gere um novo alerta caso mude novamente de situação no futuro.
+      const hasSituationChanged = prev ? prevSituacao !== currSit : false;
+      if (prev && !hasSituationChanged && !forceRefresh) continue;
+      if (!prev && !forceRefresh) continue;
+
+      const situacaoNova = confInfo.isMatch
+        ? currSit || confInfo.normalized
+        : rejInfo.isMatch
+        ? currSit || rejInfo.normalized
+        : currSit;
+      const situacaoNovaNorm = situacaoNova.trim().toUpperCase();
+
+      // Bloqueio estrito de duplicidade no histórico (mesmo em forceRefresh)
       let isAlreadyInHistory = false;
-      if (currOB && historyDocSituations.has(`OB_${currOB}_${situacaoNovaNorm}`)) {
-        isAlreadyInHistory = true;
+      if (currOB) {
+        if (historyDocSituations.has(`OB_${currOB}_${situacaoNovaNorm}`)) isAlreadyInHistory = true;
+        if (confInfo.isMatch && historyConfDocs.has(`OB_${currOB}`)) isAlreadyInHistory = true;
+        if (rejInfo.isMatch && historyRejDocs.has(`OB_${currOB}`)) isAlreadyInHistory = true;
       }
-      if (!isAlreadyInHistory && currPP && historyDocSituations.has(`PP_${currPP}_${situacaoNovaNorm}`)) {
-        isAlreadyInHistory = true;
+      if (!isAlreadyInHistory && currPP) {
+        if (historyDocSituations.has(`PP_${currPP}_${situacaoNovaNorm}`)) isAlreadyInHistory = true;
+        if (confInfo.isMatch && historyConfDocs.has(`PP_${currPP}`)) isAlreadyInHistory = true;
+        if (rejInfo.isMatch && historyRejDocs.has(`PP_${currPP}`)) isAlreadyInHistory = true;
       }
+      if (isAlreadyInHistory) continue;
 
-      if (isAlreadyInHistory && !forceRefresh) {
-        continue;
-      }
+      const batchGroup = confInfo.isMatch ? 'CONF_BANCO' : rejInfo.isMatch ? 'REJ_BANCO' : situacaoNovaNorm;
+      const bKeyOB = currOB ? `${currOB}__${batchGroup}` : '';
+      const bKeyPP = currPP ? `${currPP}__${batchGroup}` : '';
 
-      // Evita duplicação dentro do mesmo lote
-      const bKeyOB = currOB ? `${currOB}__${situacaoNovaNorm}` : '';
-      const bKeyPP = currPP ? `${currPP}__${situacaoNovaNorm}` : '';
-
-      if ((bKeyOB && batchNotifiedKeys.has(bKeyOB)) || (bKeyPP && batchNotifiedKeys.has(bKeyPP))) {
-        continue;
-      }
+      if ((bKeyOB && batchNotifiedKeys.has(bKeyOB)) || (bKeyPP && batchNotifiedKeys.has(bKeyPP))) continue;
       if (bKeyOB) batchNotifiedKeys.add(bKeyOB);
       if (bKeyPP) batchNotifiedKeys.add(bKeyPP);
 
-      if (currOB) historyDocSituations.add(`OB_${currOB}_${situacaoNovaNorm}`);
-      if (currPP) historyDocSituations.add(`PP_${currPP}_${situacaoNovaNorm}`);
-
-      const docDesc =
-        curr.ob && curr.pp
-          ? `OB ${curr.ob} (PP ${curr.pp})`
-          : curr.ob
-          ? `OB ${curr.ob}`
-          : `PP ${curr.pp}`;
-
+      const docDesc = curr.ob && curr.pp ? `OB ${curr.ob} (PP ${curr.pp})` : curr.ob ? `OB ${curr.ob}` : `PP ${curr.pp}`;
       const isValidExpenseVal =
         typeof curr.valor === 'number' &&
         curr.valor > 0 &&
         curr.valor < 1e11 &&
         !isFonteString(curr.valor) &&
-        curr.valor !== 600 &&
-        curr.valor !== 500 &&
-        curr.valor !== 1500 &&
-        curr.valor !== 1600 &&
-        curr.valor !== 0.6 &&
-        curr.valor !== 0.5;
+        ![600, 500, 1500, 1600, 0.6, 0.5].includes(curr.valor);
 
       const valorFormatado = isValidExpenseVal ? ` (${formatBRL(curr.valor)})` : '';
       const finalValor = isValidExpenseVal ? curr.valor : 0;
+      const sitAnteriorLabel = prevSituacao || 'AO';
 
-      // 1. Confirmada no Banco (PPCB, CB, PAGO)
       if (confInfo.isMatch) {
-        const payAlert = {
+        toastsToBatch.push({
           id: `toast_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
           tipo: 'sucesso' as const,
           titulo: 'Pagamento Confirmado no Banco',
-          mensagem: `${docDesc} de ${curr.fornecedor || 'Credor'}${valorFormatado} foi confirmada no banco (${prevSituacao || 'Anterior'} → ${currSit}).`,
+          mensagem: `${docDesc} de ${curr.fornecedor || 'Credor'}${valorFormatado} mudou de ${sitAnteriorLabel} para ${situacaoNova}.`,
           fornecedor: curr.fornecedor,
           cnpj: curr.cnpj,
           ob: curr.ob,
@@ -1206,24 +1198,22 @@ class ToastAlertManager {
           fonteRecurso: curr.fonteRecurso,
           isFonte600: curr.isFonte600,
           etapaOrigem: curr.etapaOrigem,
-          situacaoAnterior: prevSituacao || 'Anterior',
-          situacaoNova: currSit,
+          situacaoAnterior: sitAnteriorLabel,
+          situacaoNova,
           dataReferencia: curr.dataReferencia,
           dataHora: new Date(),
           showPopup: countUpdates < 5,
-        };
-        toastsToBatch.push(payAlert);
+        });
         countUpdates++;
         continue;
       }
 
-      // 2. Rejeitada / Cancelada no Banco (PPRJ, RJ, C, CBNC)
       if (rejInfo.isMatch) {
-        const rejAlert = {
+        toastsToBatch.push({
           id: `toast_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
           tipo: 'critico' as const,
           titulo: 'Pagamento Rejeitado / Cancelado',
-          mensagem: `Atenção: ${docDesc} de ${curr.fornecedor || 'Credor'}${valorFormatado} foi rejeitada/cancelada no banco (${prevSituacao || 'Anterior'} → ${currSit}).`,
+          mensagem: `Atenção: ${docDesc} de ${curr.fornecedor || 'Credor'}${valorFormatado} mudou de ${sitAnteriorLabel} para ${situacaoNova}.`,
           fornecedor: curr.fornecedor,
           cnpj: curr.cnpj,
           ob: curr.ob,
@@ -1233,23 +1223,22 @@ class ToastAlertManager {
           fonteRecurso: curr.fonteRecurso,
           isFonte600: curr.isFonte600,
           etapaOrigem: curr.etapaOrigem,
-          situacaoAnterior: prevSituacao || 'Anterior',
-          situacaoNova: currSit,
+          situacaoAnterior: sitAnteriorLabel,
+          situacaoNova,
           dataReferencia: curr.dataReferencia,
           dataHora: new Date(),
           showPopup: countUpdates < 5,
-        };
-        toastsToBatch.push(rejAlert);
+        });
         countUpdates++;
         continue;
       }
 
-      // 3. Qualquer outra mudança de situação (AP → AO, AO → PPNC, AO → LD, EN, REPP, RENE, etc.)
-      const mudancaAlert = {
+      // Qualquer outra alteração de situação (AO -> LI, EI, LD, EN, II, SD, SI, PPNC, AP -> AO, REPP, RENE, etc.)
+      toastsToBatch.push({
         id: `toast_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
-        tipo: currSit === 'PPNC' ? ('aviso' as const) : ('info' as const),
-        titulo: 'Alteração de Situação da PP',
-        mensagem: `${docDesc} de ${curr.fornecedor || 'Credor'}${valorFormatado} mudou de situação: ${prevSituacao || 'S/N'} → ${currSit}.`,
+        tipo: 'info' as const,
+        titulo: 'Alteração de Situação da PP / OB',
+        mensagem: `${docDesc} de ${curr.fornecedor || 'Credor'}${valorFormatado} mudou de situação: ${sitAnteriorLabel} → ${situacaoNova}.`,
         fornecedor: curr.fornecedor,
         cnpj: curr.cnpj,
         ob: curr.ob,
@@ -1259,13 +1248,12 @@ class ToastAlertManager {
         fonteRecurso: curr.fonteRecurso,
         isFonte600: curr.isFonte600,
         etapaOrigem: curr.etapaOrigem,
-        situacaoAnterior: prevSituacao || 'Anterior',
-        situacaoNova: currSit,
+        situacaoAnterior: sitAnteriorLabel,
+        situacaoNova,
         dataReferencia: curr.dataReferencia,
         dataHora: new Date(),
         showPopup: countUpdates < 5,
-      };
-      toastsToBatch.push(mudancaAlert);
+      });
       countUpdates++;
     }
 

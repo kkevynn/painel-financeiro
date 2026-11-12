@@ -335,14 +335,10 @@ export function App() {
         try {
           indexAppKnowledge(stored?.files || [], obStored?.items || null);
         } catch (_) {}
-        // Automatic cloud sync verification: pulls updates made from other devices (e.g. tablet to PC) if authenticated
-        setTimeout(() => {
-          if (auth.currentUser) {
-            cloudSyncService.checkAndAutoSync().catch((e) => {
-              console.warn('Auto-sync na inicialização:', e);
-            });
-          }
-        }, 1200);
+        // Automatic cloud sync verification: pulls updates directly from the cloud on startup
+        cloudSyncService.checkAndAutoSync().catch((e) => {
+          console.warn('Auto-sync na inicialização:', e);
+        });
       }
     }
     initStorage();
@@ -487,6 +483,10 @@ export function App() {
           setMetrics(finalEnriched);
           triggerAlertAnalysis(finalFiles, finalOBs);
           saveAppState(finalFiles, lastProcessedAt);
+          // Auto-save automatically to Cloud Firestore
+          cloudSyncService.pushToCloud(finalFiles, finalOBs, ordensBancariasFileName).catch((e) => {
+            console.warn('Auto-save na nuvem pós-upload:', e);
+          });
           setProcessingProgress(100);
           setTimeout(() => {
             setIsProcessing(false);
@@ -527,7 +527,7 @@ export function App() {
       setCloudSyncState(state);
     });
 
-    cloudSyncService.registerDatasetReloadCallback((reloadedFiles, reloadedOBs) => {
+    cloudSyncService.registerDatasetReloadCallback((reloadedFiles, reloadedOBs, syncDate) => {
       if (reloadedFiles && reloadedFiles.length > 0) {
         setFiles(reloadedFiles);
         filesRef.current = reloadedFiles;
@@ -538,7 +538,7 @@ export function App() {
           const processed = processUploadedFiles(reloadedFiles);
           const enriched = applyEnrichment(processed, reloadedOBs || ordensBancariasList);
           setMetrics(enriched);
-          setLastProcessedAt(new Date());
+          setLastProcessedAt(syncDate || new Date());
           toastAlertService.addToast({
             tipo: 'info',
             titulo: 'Sincronização em Nuvem Concluída',
@@ -677,6 +677,9 @@ export function App() {
     const enriched = applyEnrichment(newMetrics, targetOBs);
     setMetrics(enriched);
     triggerAlertAnalysis(updated, targetOBs);
+    cloudSyncService.pushToCloud(updated, targetOBs, ordensBancariasFileName).catch((e) => {
+      console.warn('Auto-save na nuvem alteração de etapa:', e);
+    });
   };
 
   // Remove file action
@@ -729,6 +732,9 @@ export function App() {
         const now = new Date();
         setLastProcessedAt(now);
         saveAppState(files, now);
+        cloudSyncService.pushToCloud(files, ordensBancariasList, ordensBancariasFileName).catch((e) => {
+          console.warn('Auto-save na nuvem processamento de dados:', e);
+        });
         toastAlertService.analyzeFileTransitions(files, ordensBancariasList);
         mlInferenceService.processFilesForInference(files, ordensBancariasList);
       } catch (err: any) {
@@ -746,23 +752,36 @@ export function App() {
   // Explicit Save Data handler
   const handleSaveData = async () => {
     setIsProcessing(true);
-    setProcessingMessage('Salvando alterações e verificando transições...');
+    setProcessingMessage('Salvando alterações...');
     try {
       const now = new Date();
       setLastProcessedAt(now);
       const newMetrics = processUploadedFiles(files);
       const enriched = applyEnrichment(newMetrics, ordensBancariasList);
       setMetrics(enriched);
+
+      // 1. Salva no armazenamento local primeiro (garantia imediata)
       await saveAppState(files, now);
-      // Synchronize dataset to the Cloud for multi-device access (Tablet & PC)
-      cloudSyncService.pushToCloud(files, ordensBancariasList, ordensBancariasFileName).catch((e) => {
-        console.warn('Sincronização em nuvem durante salvamento:', e);
-      });
-      // Scans for alerts strictly when user clicks on save button
+
+      // 2. Analisa transições de alertas e aprendizado de máquina
       toastAlertService.analyzeFileTransitions(files, ordensBancariasList);
       mlInferenceService.processFilesForInference(files, ordensBancariasList);
-      // Brief pause so the user visualizes the confirmation animation
-      await new Promise((res) => setTimeout(res, 450));
+
+      toastAlertService.addToast({
+        tipo: 'sucesso',
+        titulo: 'Alterações Salvas',
+        mensagem: 'Dados gravados localmente com sucesso.',
+      });
+
+      // 3. Sincronização na nuvem protegida para não travar a interface em caso de latência
+      try {
+        await cloudSyncService.pushToCloud(files, ordensBancariasList, ordensBancariasFileName);
+      } catch (cloudErr) {
+        console.warn('Sincronização na nuvem em segundo plano:', cloudErr);
+      }
+
+      // Breve pausa para visualização da confirmação
+      await new Promise((res) => setTimeout(res, 200));
     } finally {
       setIsProcessing(false);
     }
@@ -777,6 +796,7 @@ export function App() {
       setMetrics(initialMetrics);
       setLastProcessedAt(null);
       await clearAppState();
+      await cloudSyncService.clearCloudWorkspace();
       await new Promise((res) => setTimeout(res, 350));
     } finally {
       setIsProcessing(false);
@@ -847,6 +867,9 @@ export function App() {
     setMetrics(enriched);
     saveAppState(updated, lastProcessedAt || new Date());
     triggerAlertAnalysis(updated, targetOBs);
+    cloudSyncService.pushToCloud(updated, targetOBs, ordensBancariasFileName).catch((e) => {
+      console.warn('Auto-save na nuvem mapeamento de colunas:', e);
+    });
   };
 
   const activeMappingFile = files.find((f) => f.id === activeMappingFileId) || null;

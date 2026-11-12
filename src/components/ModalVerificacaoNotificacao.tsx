@@ -28,13 +28,25 @@ interface ModalVerificacaoNotificacaoProps {
 
 const SITUACOES_SUGERIDAS = [
   { value: 'AO', label: 'AO - Associada 2 Ordenadores (PP Pronta)' },
-  { value: 'PPCB', label: 'PPCB - Confirmado no Banco' },
-  { value: 'PPNC', label: 'PPNC - Não Confirmado no Banco' },
+  { value: 'AP', label: 'AP - Aguardando Pagamento' },
+  { value: 'LD', label: 'LD - Liquidada' },
+  { value: 'LI', label: 'LI - Liquidada com Inconsistência' },
+  { value: 'II', label: 'II - Inconsistência de Informação' },
+  { value: 'EI', label: 'EI - Em Instrução' },
+  { value: 'EN', label: 'EN - Encaminhada' },
+  { value: 'SD', label: 'SD - Saldo Disponível' },
+  { value: 'SI', label: 'SI - Saldo Insuficiente' },
+  { value: 'OB', label: 'OB - Ordem Bancária Gerada' },
+  { value: 'CM', label: 'CM - Confirmada Manualmente' },
+  { value: 'CB', label: 'CB - Confirmada Banco' },
+  { value: 'PPCB', label: 'PPCB - Pagamento Confirmado Banco' },
+  { value: 'PPNC', label: 'PPNC - Não Confirmada Banco' },
+  { value: 'CBNC', label: 'CBNC - Confirmada Banco Não Compensada' },
   { value: 'PPRJ', label: 'PPRJ - Rejeitada pelo Banco' },
   { value: 'RJ', label: 'RJ - Rejeitada' },
-  { value: 'PAGA', label: 'PAGA - Paga' },
-  { value: 'CANCELADA', label: 'CANCELADA' },
-  { value: 'LIQUIDADA', label: 'LIQUIDADA' },
+  { value: 'C', label: 'C - Cancelada' },
+  { value: 'REPP', label: 'REPP - Retorno de PP' },
+  { value: 'RENE', label: 'RENE - Retorno de NE' },
 ];
 
 export const ModalVerificacaoNotificacao: React.FC<ModalVerificacaoNotificacaoProps> = ({

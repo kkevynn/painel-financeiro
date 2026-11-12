@@ -1131,7 +1131,10 @@ export function autoDetectColumns(
     // Heuristic for situacaoCol if not detected from headers
     // (no relatório .xls do SIGEF, a última coluna contém a sigla da situação mas o cabeçalho vem em branco, gerando Coluna_7 ou Coluna_14)
     if (!situacaoCol) {
-      const siglaExact = new Set(['AO', 'PPCB', 'PPNC', 'PPRJ', 'CB', 'C', 'AP', 'RJ', 'PAGA']);
+      const siglaExact = new Set([
+        'AO', 'PPCB', 'PPNC', 'PPRJ', 'CB', 'C', 'AP', 'RJ', 'PAGA', 'PAGO',
+        'LD', 'LI', 'II', 'EI', 'EN', 'CM', 'CBNC', 'SD', 'SI', 'OB', 'REPP', 'RENE'
+      ]);
       let bestSitCol = '';
       let bestSitMatches = 0;
 

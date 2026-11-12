@@ -11,6 +11,7 @@ import {
   getDocs,
   onSnapshot,
   deleteDoc,
+  writeBatch,
 } from 'firebase/firestore';
 import {
   signInWithPopup,
@@ -25,6 +26,7 @@ import {
   saveStoredOrdensBancarias,
   getStoredOrdensBancarias,
   OrdemBancariaItem,
+  extractOrdensBancariasFromFileData,
 } from './ordemBancariaParser';
 import { paraPublicarService, ParaPublicarItem } from './paraPublicarService';
 import { mlInferenceService } from './machineLearningInferenceService';
@@ -103,17 +105,16 @@ class CloudSyncService {
   private listeners = new Set<SyncListener>();
   private unsubscribeSnapshot: (() => void) | null = null;
   private isProcessingSync = false;
-  private onDatasetReloadCallback: ((files: FileData[], obs: OrdemBancariaItem[] | null) => void) | null = null;
+  private onDatasetReloadCallback: ((files: FileData[], obs: OrdemBancariaItem[] | null, syncDate?: Date) => void) | null = null;
 
   constructor() {
     this.initAuthListener();
+    this.startRealtimeListener();
     setTimeout(() => {
-      if (auth.currentUser) {
-        this.checkAndAutoSync().catch((e) => {
-          console.warn('Auto-sync inicial:', e);
-        });
-      }
-    }, 1200);
+      this.checkAndAutoSync().catch((e) => {
+        console.warn('Auto-sync inicial da nuvem:', e);
+      });
+    }, 500);
   }
 
   private initAuthListener() {
@@ -125,13 +126,8 @@ class CloudSyncService {
           syncStatus: 'synced',
           errorMessage: null,
         });
-        this.startRealtimeListener();
         this.checkAndAutoSync();
       } else {
-        if (this.unsubscribeSnapshot) {
-          this.unsubscribeSnapshot();
-          this.unsubscribeSnapshot = null;
-        }
         this.updateState({
           isAuthenticated: false,
           user: null,
@@ -142,7 +138,7 @@ class CloudSyncService {
     });
   }
 
-  public registerDatasetReloadCallback(cb: (files: FileData[], obs: OrdemBancariaItem[] | null) => void) {
+  public registerDatasetReloadCallback(cb: (files: FileData[], obs: OrdemBancariaItem[] | null, syncDate?: Date) => void) {
     this.onDatasetReloadCallback = cb;
   }
 
@@ -242,9 +238,38 @@ class CloudSyncService {
   }
 
   /**
-   * Pushes current local dataset (files, OBs, publication queue, ML patterns) to Firestore
+   * Pushes the entire local dataset (spreadsheets in chunks,
+   * OBs, publication queue, ML patterns) to Firestore with collision avoidance and safety timeout
    */
   public async pushToCloud(
+    files: FileData[],
+    obsList?: OrdemBancariaItem[] | null,
+    obFileName?: string
+  ): Promise<boolean> {
+    // Avoid concurrency collisions: wait up to 2s if a sync is currently in progress
+    let waitCycles = 0;
+    while (this.isProcessingSync && waitCycles < 10) {
+      await new Promise((r) => setTimeout(r, 200));
+      waitCycles++;
+    }
+
+    return Promise.race([
+      this.executePushToCloud(files, obsList, obFileName),
+      new Promise<boolean>((resolve) => {
+        setTimeout(() => {
+          console.warn('Timeout de segurança ao sincronizar com a nuvem (18s). Liberando interface.');
+          this.isProcessingSync = false;
+          this.updateState({ isSyncing: false, syncStatus: 'idle' });
+          resolve(false);
+        }, 18000);
+      }),
+    ]);
+  }
+
+  /**
+   * Internal execution of cloud synchronization using Firestore writeBatch and deduplication
+   */
+  private async executePushToCloud(
     files: FileData[],
     obsList?: OrdemBancariaItem[] | null,
     obFileName?: string
@@ -258,7 +283,160 @@ class CloudSyncService {
       const userEmail = auth.currentUser?.email || '';
       const userId = auth.currentUser?.uid || 'workspace_user';
 
-      // 1. Update metadata
+      // 1. Fetch existing file docs from Firestore and delete files that were removed locally
+      const currentFileIds = new Set(files.map((f) => f.id));
+      try {
+        const remoteFilesSnap = await getDocs(collection(db, 'workspaces', 'default', 'imported_files'));
+        for (const docSnap of remoteFilesSnap.docs) {
+          if (!currentFileIds.has(docSnap.id)) {
+            // Delete subcollection chunks first
+            try {
+              const oldChunksSnap = await getDocs(collection(db, 'workspaces', 'default', 'imported_files', docSnap.id, 'chunks'));
+              await Promise.all(oldChunksSnap.docs.map((c) => deleteDoc(c.ref)));
+            } catch (chunkCleanErr) {
+              console.warn('Erro ao limpar chunks do arquivo removido:', chunkCleanErr);
+            }
+            await deleteDoc(doc(db, 'workspaces', 'default', 'imported_files', docSnap.id));
+          }
+        }
+      } catch (cleanErr) {
+        console.warn('Limpeza de arquivos remotos deletados:', cleanErr);
+      }
+
+      // 2. Prepare atomic write operations using writeBatch (up to 10 chunks/docs per batch)
+      interface PendingWrite {
+        ref: any;
+        data: any;
+      }
+      const pendingWrites: PendingWrite[] = [];
+
+      // A) Save each active file and its chunks (subcollection chunks, max 800 rows each)
+      // Removed slow getDocs on subcollections before saving to prevent network stalls
+      const CHUNK_SIZE = 800;
+      for (const file of files) {
+        const fileRef = doc(db, 'workspaces', 'default', 'imported_files', file.id);
+        const headersStr = JSON.stringify(file.headers || []);
+        const fileRows = file.rows || [];
+        const totalChunks = Math.ceil(fileRows.length / CHUNK_SIZE);
+
+        pendingWrites.push({
+          ref: fileRef,
+          data: {
+            id: file.id,
+            fileName: file.fileName,
+            stage: file.stage || 'outros',
+            headersJson: headersStr,
+            detectedFavorecidoCol: file.detectedFavorecidoCol || '',
+            detectedValorCol: file.detectedValorCol || '',
+            detectedNumeroCol: file.detectedNumeroCol || '',
+            detectedPpCol: file.detectedPpCol || '',
+            detectedCnpjCol: file.detectedCnpjCol || '',
+            detectedSituacaoCol: file.detectedSituacaoCol || '',
+            detectedFonteCol: file.detectedFonteCol || '',
+            rowCount: fileRows.length,
+            totalChunks,
+            chunkSize: CHUNK_SIZE,
+            updatedAt: nowIso,
+          },
+        });
+
+        for (let i = 0; i < totalChunks; i++) {
+          const chunk = fileRows.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+          const chunkRef = doc(db, 'workspaces', 'default', 'imported_files', file.id, 'chunks', `chunk_${i}`);
+          pendingWrites.push({
+            ref: chunkRef,
+            data: {
+              chunkId: `chunk_${i}`,
+              chunkIndex: i,
+              rowCount: chunk.length,
+              rowsJson: JSON.stringify(chunk),
+              updatedAt: nowIso,
+            },
+          });
+        }
+      }
+
+      // B) Eliminate duplication: if files.length > 0, OBs are already inside imported_files.
+      // Only write ordens_bancarias_store when files.length === 0 and standalone OBs exist.
+      const effectiveOBs = obsList || getStoredOrdensBancarias().items || [];
+      const effectiveOBFileName = obFileName || getStoredOrdensBancarias().fileName || '';
+
+      if (files.length === 0 && effectiveOBs.length > 0) {
+        const obChunkSize = 800;
+        const totalChunks = Math.ceil(effectiveOBs.length / obChunkSize);
+
+        for (let i = 0; i < totalChunks; i++) {
+          const chunk = effectiveOBs.slice(i * obChunkSize, (i + 1) * obChunkSize);
+          const chunkRef = doc(db, 'workspaces', 'default', 'ordens_bancarias_store', `chunk_${i}`);
+          pendingWrites.push({
+            ref: chunkRef,
+            data: {
+              chunkId: `chunk_${i}`,
+              chunkIndex: i,
+              fileName: effectiveOBFileName,
+              totalItems: effectiveOBs.length,
+              itemsJson: JSON.stringify(chunk),
+              updatedAt: nowIso,
+            },
+          });
+        }
+      }
+
+      // C) Save "Para Publicar" queue items
+      const paraPublicarItems = paraPublicarService.getItems();
+      for (const item of paraPublicarItems) {
+        const itemDocId = item.id.replace(/[^a-zA-Z0-9_-]/g, '_');
+        const itemRef = doc(db, 'workspaces', 'default', 'para_publicar', itemDocId);
+        pendingWrites.push({
+          ref: itemRef,
+          data: {
+            id: item.id,
+            nlNumero: item.nlNumero || item.documentNumber || '',
+            documentNumber: item.documentNumber || item.nlNumero || '',
+            fornecedor: item.fornecedor || item.supplierName || '',
+            supplierName: item.supplierName || item.fornecedor || '',
+            cnpj: item.cnpj,
+            valor: typeof item.valor === 'number' ? item.valor : (item.value || 0),
+            value: typeof item.value === 'number' ? item.value : (item.valor || 0),
+            fonteRecurso: item.fonteRecurso || '0.6.00',
+            stageOrigem: item.stageOrigem || 'obedece',
+            status: item.status || '',
+            dataSelecao: item.dataSelecao || nowIso,
+            updatedAt: nowIso,
+          },
+        });
+      }
+
+      // D) Save learned ML patterns and exact NL mappings across all devices
+      try {
+        const learnedPatterns = mlInferenceService.getAllLearnedPatterns();
+        const exactMappings = mlInferenceService.getExactNlMappings();
+        const mlDocRef = doc(db, 'workspaces', 'default', 'ml_patterns', 'patterns');
+        pendingWrites.push({
+          ref: mlDocRef,
+          data: {
+            patternsJson: JSON.stringify(learnedPatterns || {}),
+            exactMappingsJson: JSON.stringify(exactMappings || {}),
+            updatedAt: nowIso,
+          },
+        });
+      } catch (mlSaveErr) {
+        console.warn('Erro ao salvar padrões de ML na nuvem:', mlSaveErr);
+      }
+
+      // E) Execute writes using writeBatch in groups of up to 10 operations per batch
+      const BATCH_OP_LIMIT = 10;
+      for (let i = 0; i < pendingWrites.length; i += BATCH_OP_LIMIT) {
+        const batchSlice = pendingWrites.slice(i, i + BATCH_OP_LIMIT);
+        const batch = writeBatch(db);
+        for (const op of batchSlice) {
+          batch.set(op.ref, op.data);
+        }
+        await batch.commit();
+      }
+
+      // CRUCIAL: Save workspace metadata as the VERY LAST STEP so remote listeners
+      // are only triggered when 100% of chunks and records are completely saved in Firestore!
       const metaRef = doc(db, 'workspaces', 'default');
       await setDoc(
         metaRef,
@@ -272,139 +450,6 @@ class CloudSyncService {
         },
         { merge: true }
       );
-
-      // 2. Fetch existing file docs from Firestore and delete files that were removed locally
-      const currentFileIds = new Set(files.map((f) => f.id));
-      try {
-        const remoteFilesSnap = await getDocs(collection(db, 'workspaces', 'default', 'imported_files'));
-        for (const docSnap of remoteFilesSnap.docs) {
-          if (!currentFileIds.has(docSnap.id)) {
-            // Delete subcollection chunks first
-            try {
-              const oldChunksSnap = await getDocs(collection(db, 'workspaces', 'default', 'imported_files', docSnap.id, 'chunks'));
-              for (const cSnap of oldChunksSnap.docs) {
-                await deleteDoc(cSnap.ref);
-              }
-            } catch (chunkCleanErr) {
-              console.warn('Erro ao limpar chunks do arquivo removido:', chunkCleanErr);
-            }
-            await deleteDoc(doc(db, 'workspaces', 'default', 'imported_files', docSnap.id));
-          }
-        }
-      } catch (cleanErr) {
-        console.warn('Limpeza de arquivos remotos deletados:', cleanErr);
-      }
-
-      // 3. Save each active file into /workspaces/default/imported_files/{id} with subcollection chunking (max 1000 rows each)
-      const CHUNK_SIZE = 1000;
-      for (const file of files) {
-        const fileRef = doc(db, 'workspaces', 'default', 'imported_files', file.id);
-        const headersStr = JSON.stringify(file.headers || []);
-        const fileRows = file.rows || [];
-        const totalChunks = Math.ceil(fileRows.length / CHUNK_SIZE);
-
-        // Save main file document with metadata only (bypassing Firestore 1MB document limit)
-        await setDoc(fileRef, {
-          id: file.id,
-          fileName: file.fileName,
-          stage: file.stage || 'outros',
-          headersJson: headersStr,
-          detectedFavorecidoCol: file.detectedFavorecidoCol || '',
-          detectedValorCol: file.detectedValorCol || '',
-          detectedNumeroCol: file.detectedNumeroCol || '',
-          detectedPpCol: file.detectedPpCol || '',
-          detectedCnpjCol: file.detectedCnpjCol || '',
-          detectedSituacaoCol: file.detectedSituacaoCol || '',
-          detectedFonteCol: file.detectedFonteCol || '',
-          rowCount: fileRows.length,
-          totalChunks,
-          chunkSize: CHUNK_SIZE,
-          updatedAt: nowIso,
-        });
-
-        // Clean up any surplus chunks if row count was reduced
-        try {
-          const existingChunksSnap = await getDocs(collection(db, 'workspaces', 'default', 'imported_files', file.id, 'chunks'));
-          for (const cSnap of existingChunksSnap.docs) {
-            const idx = parseInt(cSnap.id.replace('chunk_', ''), 10);
-            if (!isNaN(idx) && idx >= totalChunks) {
-              await deleteDoc(cSnap.ref);
-            }
-          }
-        } catch (_) {}
-
-        // Save row blocks in subcollection /workspaces/default/imported_files/{file.id}/chunks/chunk_{i}
-        for (let i = 0; i < totalChunks; i++) {
-          const chunk = fileRows.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
-          const chunkRef = doc(db, 'workspaces', 'default', 'imported_files', file.id, 'chunks', `chunk_${i}`);
-          await setDoc(chunkRef, {
-            chunkId: `chunk_${i}`,
-            chunkIndex: i,
-            rowCount: chunk.length,
-            rowsJson: JSON.stringify(chunk),
-            updatedAt: nowIso,
-          });
-        }
-      }
-
-      // 4. Save OBs dataset in chunks if present
-      const effectiveOBs = obsList || getStoredOrdensBancarias().items || [];
-      const effectiveOBFileName = obFileName || getStoredOrdensBancarias().fileName || '';
-
-      if (effectiveOBs.length > 0) {
-        const chunkSize = 400;
-        const totalChunks = Math.ceil(effectiveOBs.length / chunkSize);
-
-        for (let i = 0; i < totalChunks; i++) {
-          const chunk = effectiveOBs.slice(i * chunkSize, (i + 1) * chunkSize);
-          const chunkRef = doc(db, 'workspaces', 'default', 'ordens_bancarias_store', `chunk_${i}`);
-
-          await setDoc(chunkRef, {
-            chunkId: `chunk_${i}`,
-            chunkIndex: i,
-            fileName: effectiveOBFileName,
-            totalItems: effectiveOBs.length,
-            itemsJson: JSON.stringify(chunk),
-            updatedAt: nowIso,
-          });
-        }
-      }
-
-      // 5. Save "Para Publicar" queue items
-      const paraPublicarItems = paraPublicarService.getItems();
-      for (const item of paraPublicarItems) {
-        const itemDocId = item.id.replace(/[^a-zA-Z0-9_-]/g, '_');
-        const itemRef = doc(db, 'workspaces', 'default', 'para_publicar', itemDocId);
-        await setDoc(itemRef, {
-          id: item.id,
-          nlNumero: item.nlNumero || item.documentNumber || '',
-          documentNumber: item.documentNumber || item.nlNumero || '',
-          fornecedor: item.fornecedor || item.supplierName || '',
-          supplierName: item.supplierName || item.fornecedor || '',
-          cnpj: item.cnpj,
-          valor: typeof item.valor === 'number' ? item.valor : (item.value || 0),
-          value: typeof item.value === 'number' ? item.value : (item.valor || 0),
-          fonteRecurso: item.fonteRecurso || '0.6.00',
-          stageOrigem: item.stageOrigem || 'obedece',
-          status: item.status || '',
-          dataSelecao: item.dataSelecao || nowIso,
-          updatedAt: nowIso,
-        });
-      }
-
-      // 6. Save learned ML patterns and exact NL mappings across all devices
-      try {
-        const learnedPatterns = mlInferenceService.getAllLearnedPatterns();
-        const exactMappings = mlInferenceService.getExactNlMappings();
-        const mlDocRef = doc(db, 'workspaces', 'default', 'ml_patterns', 'patterns');
-        await setDoc(mlDocRef, {
-          patternsJson: JSON.stringify(learnedPatterns || {}),
-          exactMappingsJson: JSON.stringify(exactMappings || {}),
-          updatedAt: nowIso,
-        });
-      } catch (mlSaveErr) {
-        console.warn('Erro ao salvar padrões de ML na nuvem:', mlSaveErr);
-      }
 
       this.updateState({
         isSyncing: false,
@@ -489,7 +534,7 @@ class CloudSyncService {
           const chunksSnap = await getDocs(chunksColRef);
 
           if (!chunksSnap.empty) {
-            const chunkList: { index: number; rows: any[] }[] = [];
+            let chunkList: { index: number; rows: any[] }[] = [];
             chunksSnap.forEach((cDoc) => {
               const cd = cDoc.data();
               let chunkRows: any[] = [];
@@ -503,6 +548,7 @@ class CloudSyncService {
                 rows: chunkRows,
               });
             });
+            chunkList = chunkList.filter((c) => !d.totalChunks || c.index < d.totalChunks);
             chunkList.sort((a, b) => a.index - b.index);
             rows = chunkList.flatMap((c) => c.rows);
           } else if (d.rowsJson) {
@@ -558,7 +604,27 @@ class CloudSyncService {
 
       obChunks.sort((a, b) => a.index - b.index);
       const allOBItems: OrdemBancariaItem[] = obChunks.flatMap((c) => c.items);
-      const obFileName = obChunks[0]?.fileName || 'OBs - sigef - Principal';
+      let obFileName = obChunks[0]?.fileName || 'OBs - sigef - Principal';
+
+      // If allOBItems is empty from ordens_bancarias_store, auto-reconstruct from loadedFiles
+      if (allOBItems.length === 0 && loadedFiles.length > 0) {
+        const obMap = new Map<string, OrdemBancariaItem>();
+        loadedFiles.forEach((f) => {
+          const lower = (f.fileName || '').toLowerCase();
+          const isObFile = lower.includes('ordem') || lower.includes('ob') || lower.includes('banco') || f.stage === 'ordem_bancaria' || f.detectedObCol;
+          if (isObFile) {
+            const extracted = extractOrdensBancariasFromFileData(f);
+            extracted.forEach((item) => {
+              const k = item.ob ? ('OB_' + item.ob.trim().toUpperCase()) : (item.pp ? ('PP_' + item.pp.trim().toUpperCase()) : item.id);
+              obMap.set(k, item);
+            });
+          }
+        });
+        if (obMap.size > 0) {
+          allOBItems.push(...Array.from(obMap.values()));
+          obFileName = 'Consolidado de Arquivos';
+        }
+      }
 
       // 3. Fetch "Para Publicar" items
       const pubColRef = collection(db, 'workspaces', 'default', 'para_publicar');
@@ -629,7 +695,7 @@ class CloudSyncService {
 
       // Notify App to reload UI with updated files
       if (this.onDatasetReloadCallback) {
-        this.onDatasetReloadCallback(loadedFiles, allOBItems.length > 0 ? allOBItems : null);
+        this.onDatasetReloadCallback(loadedFiles, allOBItems.length > 0 ? allOBItems : null, syncDate);
       }
 
       console.log(`Dados da nuvem restaurados localmente (${loadedFiles.length} planilhas sincronizadas)`);
@@ -648,7 +714,7 @@ class CloudSyncService {
   }
 
   /**
-   * Evaluates cloud vs local state and triggers automatic sync
+   * Evaluates cloud vs local state and triggers automatic sync with cloud priority
    */
   public async checkAndAutoSync(): Promise<void> {
     if (this.isProcessingSync) return;
@@ -667,13 +733,14 @@ class CloudSyncService {
         const localSavedTime = localState?.savedAt ? new Date(localState.savedAt).getTime() : 0;
         const remoteFilesCount = remoteData.totalFiles || 0;
 
-        // If cloud is newer OR local is empty while cloud has files, pull!
-        if (remoteTime > localSavedTime + 2000 || (localFiles.length === 0 && remoteFilesCount > 0)) {
-          console.log('Nuvem possui versão mais recente ou dados remotos. Sincronizando para este dispositivo...');
+        // Se metaSnap.exists() e remoteData.totalFiles > 0, compare remoteTime com o tempo local.
+        // Se remoteTime !== localSavedTime (ou se a nuvem tiver dados/versão diferente), execute pullFromCloud() imediatamente!
+        if (remoteFilesCount > 0 && (remoteTime !== localSavedTime || remoteTime > localSavedTime || localFiles.length === 0)) {
+          console.log('Nuvem possui versão mais recente ou diferente. Sincronizando para este dispositivo...');
           await this.pullFromCloud();
         } else if (localFiles.length > 0 && localSavedTime > remoteTime + 3000) {
           // If local has newer files/adjustments, push!
-          console.log('Este dispositivo possui atualizações mais recentes. Enviando para a nuvem...');
+          console.log('Este dispositivo possui atualizações locais mais recentes. Enviando para a nuvem...');
           await this.pushToCloud(localFiles, localOBs);
         }
       } else {
@@ -685,6 +752,52 @@ class CloudSyncService {
       }
     } catch (err) {
       console.warn('Verificação de sincronização automática:', err);
+    }
+  }
+
+  /**
+   * Cleans all cloud documents from workspaces/default when user clicks Clear in the panel
+   */
+  public async clearCloudWorkspace(): Promise<void> {
+    try {
+      this.isProcessingSync = true;
+      // 1. Delete imported files and chunks
+      const filesSnap = await getDocs(collection(db, 'workspaces', 'default', 'imported_files'));
+      for (const docSnap of filesSnap.docs) {
+        try {
+          const chunksSnap = await getDocs(collection(db, 'workspaces', 'default', 'imported_files', docSnap.id, 'chunks'));
+          await Promise.all(chunksSnap.docs.map((c) => deleteDoc(c.ref)));
+        } catch (_) {}
+        await deleteDoc(docSnap.ref);
+      }
+
+      // 2. Delete OB chunks
+      const obSnap = await getDocs(collection(db, 'workspaces', 'default', 'ordens_bancarias_store'));
+      await Promise.all(obSnap.docs.map((c) => deleteDoc(c.ref)));
+
+      // 3. Reset workspace metadata to totalFiles: 0
+      const metaRef = doc(db, 'workspaces', 'default');
+      const nowIso = new Date().toISOString();
+      await setDoc(
+        metaRef,
+        {
+          lastSyncAt: nowIso,
+          totalFiles: 0,
+          version: Date.now(),
+        },
+        { merge: true }
+      );
+
+      this.updateState({
+        remoteFilesCount: 0,
+        lastSyncAt: new Date(),
+        syncStatus: 'synced',
+      });
+      console.log('Workspace na nuvem limpo com sucesso.');
+    } catch (err) {
+      console.warn('Erro ao limpar workspace na nuvem:', err);
+    } finally {
+      this.isProcessingSync = false;
     }
   }
 
