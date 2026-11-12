@@ -12,7 +12,7 @@ const databaseId = (firebaseConfig as any).firestoreDatabaseId;
 export const db = initializeFirestore(
   app,
   {
-    experimentalForceLongPolling: true,
+    experimentalAutoDetectLongPolling: true,
   },
   databaseId
 );

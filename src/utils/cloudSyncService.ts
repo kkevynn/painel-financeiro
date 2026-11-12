@@ -257,17 +257,17 @@ class CloudSyncService {
       this.executePushToCloud(files, obsList, obFileName),
       new Promise<boolean>((resolve) => {
         setTimeout(() => {
-          console.warn('Timeout de segurança ao sincronizar com a nuvem (18s). Liberando interface.');
+          console.warn('Timeout de segurança ao sincronizar com a nuvem (90s). Liberando interface.');
           this.isProcessingSync = false;
           this.updateState({ isSyncing: false, syncStatus: 'idle' });
           resolve(false);
-        }, 18000);
+        }, 90000);
       }),
     ]);
   }
 
   /**
-   * Internal execution of cloud synchronization using Firestore writeBatch and deduplication
+   * Internal execution of cloud synchronization using parallel batch writes and deduplication
    */
   private async executePushToCloud(
     files: FileData[],
@@ -283,7 +283,23 @@ class CloudSyncService {
       const userEmail = auth.currentUser?.email || '';
       const userId = auth.currentUser?.uid || 'workspace_user';
 
-      // 1. Fetch existing file docs from Firestore and delete files that were removed locally
+      // 1. Grava workspaces/default IMEDIATAMENTE no Passo 1 para garantir que o documento
+      // sempre exista no Firestore mesmo enquanto os chunks estão sendo enviados
+      const metaRef = doc(db, 'workspaces', 'default');
+      await setDoc(
+        metaRef,
+        {
+          lastSyncAt: nowIso,
+          lastUpdatedBy: userEmail || userId,
+          userEmail: userEmail,
+          deviceType: device,
+          totalFiles: files.length,
+          version: Date.now(),
+        },
+        { merge: true }
+      );
+
+      // 2. Fetch existing file docs from Firestore and delete files that were removed locally
       const currentFileIds = new Set(files.map((f) => f.id));
       try {
         const remoteFilesSnap = await getDocs(collection(db, 'workspaces', 'default', 'imported_files'));
@@ -303,16 +319,16 @@ class CloudSyncService {
         console.warn('Limpeza de arquivos remotos deletados:', cleanErr);
       }
 
-      // 2. Prepare atomic write operations using writeBatch (up to 10 chunks/docs per batch)
+      // 3. Prepare atomic write operations (up to 10 chunks/docs per parallel batch)
       interface PendingWrite {
         ref: any;
         data: any;
       }
       const pendingWrites: PendingWrite[] = [];
 
-      // A) Save each active file and its chunks (subcollection chunks, max 800 rows each)
+      // A) Save each active file and its chunks (subcollection chunks, max 500 rows each to guarantee < 300KB)
       // Removed slow getDocs on subcollections before saving to prevent network stalls
-      const CHUNK_SIZE = 800;
+      const CHUNK_SIZE = 500;
       for (const file of files) {
         const fileRef = doc(db, 'workspaces', 'default', 'imported_files', file.id);
         const headersStr = JSON.stringify(file.headers || []);
@@ -322,10 +338,10 @@ class CloudSyncService {
         pendingWrites.push({
           ref: fileRef,
           data: {
-            id: file.id,
-            fileName: file.fileName,
+            id: file.id || '',
+            fileName: file.fileName || '',
             stage: file.stage || 'outros',
-            headersJson: headersStr,
+            headersJson: headersStr || '[]',
             detectedFavorecidoCol: file.detectedFavorecidoCol || '',
             detectedValorCol: file.detectedValorCol || '',
             detectedNumeroCol: file.detectedNumeroCol || '',
@@ -333,8 +349,8 @@ class CloudSyncService {
             detectedCnpjCol: file.detectedCnpjCol || '',
             detectedSituacaoCol: file.detectedSituacaoCol || '',
             detectedFonteCol: file.detectedFonteCol || '',
-            rowCount: fileRows.length,
-            totalChunks,
+            rowCount: fileRows.length || 0,
+            totalChunks: totalChunks || 0,
             chunkSize: CHUNK_SIZE,
             updatedAt: nowIso,
           },
@@ -348,8 +364,8 @@ class CloudSyncService {
             data: {
               chunkId: `chunk_${i}`,
               chunkIndex: i,
-              rowCount: chunk.length,
-              rowsJson: JSON.stringify(chunk),
+              rowCount: chunk.length || 0,
+              rowsJson: JSON.stringify(chunk) || '[]',
               updatedAt: nowIso,
             },
           });
@@ -362,7 +378,7 @@ class CloudSyncService {
       const effectiveOBFileName = obFileName || getStoredOrdensBancarias().fileName || '';
 
       if (files.length === 0 && effectiveOBs.length > 0) {
-        const obChunkSize = 800;
+        const obChunkSize = 500;
         const totalChunks = Math.ceil(effectiveOBs.length / obChunkSize);
 
         for (let i = 0; i < totalChunks; i++) {
@@ -373,29 +389,29 @@ class CloudSyncService {
             data: {
               chunkId: `chunk_${i}`,
               chunkIndex: i,
-              fileName: effectiveOBFileName,
-              totalItems: effectiveOBs.length,
-              itemsJson: JSON.stringify(chunk),
+              fileName: effectiveOBFileName || '',
+              totalItems: effectiveOBs.length || 0,
+              itemsJson: JSON.stringify(chunk) || '[]',
               updatedAt: nowIso,
             },
           });
         }
       }
 
-      // C) Save "Para Publicar" queue items
+      // C) Save "Para Publicar" queue items (zero undefined)
       const paraPublicarItems = paraPublicarService.getItems();
       for (const item of paraPublicarItems) {
-        const itemDocId = item.id.replace(/[^a-zA-Z0-9_-]/g, '_');
+        const itemDocId = (item.id || '').replace(/[^a-zA-Z0-9_-]/g, '_');
         const itemRef = doc(db, 'workspaces', 'default', 'para_publicar', itemDocId);
         pendingWrites.push({
           ref: itemRef,
           data: {
-            id: item.id,
+            id: item.id || '',
             nlNumero: item.nlNumero || item.documentNumber || '',
             documentNumber: item.documentNumber || item.nlNumero || '',
             fornecedor: item.fornecedor || item.supplierName || '',
             supplierName: item.supplierName || item.fornecedor || '',
-            cnpj: item.cnpj,
+            cnpj: item.cnpj || '',
             valor: typeof item.valor === 'number' ? item.valor : (item.value || 0),
             value: typeof item.value === 'number' ? item.value : (item.valor || 0),
             fonteRecurso: item.fonteRecurso || '0.6.00',
@@ -424,24 +440,19 @@ class CloudSyncService {
         console.warn('Erro ao salvar padrões de ML na nuvem:', mlSaveErr);
       }
 
-      // E) Execute writes using writeBatch in groups of up to 10 operations per batch
-      const BATCH_OP_LIMIT = 10;
-      for (let i = 0; i < pendingWrites.length; i += BATCH_OP_LIMIT) {
-        const batchSlice = pendingWrites.slice(i, i + BATCH_OP_LIMIT);
-        const batch = writeBatch(db);
-        for (const op of batchSlice) {
-          batch.set(op.ref, op.data);
-        }
-        await batch.commit();
+      // E) Gravar os documentos em lotes paralelos de 10 com await Promise.all(...)
+      const PARALLEL_BATCH_SIZE = 10;
+      for (let i = 0; i < pendingWrites.length; i += PARALLEL_BATCH_SIZE) {
+        const batchSlice = pendingWrites.slice(i, i + PARALLEL_BATCH_SIZE);
+        await Promise.all(batchSlice.map((op) => setDoc(op.ref, op.data)));
       }
 
-      // CRUCIAL: Save workspace metadata as the VERY LAST STEP so remote listeners
-      // are only triggered when 100% of chunks and records are completely saved in Firestore!
-      const metaRef = doc(db, 'workspaces', 'default');
+      // Repete a gravação de workspaces/default no final com o timestamp e versão finais
+      const finishIso = new Date().toISOString();
       await setDoc(
         metaRef,
         {
-          lastSyncAt: nowIso,
+          lastSyncAt: finishIso,
           lastUpdatedBy: userEmail || userId,
           userEmail: userEmail,
           deviceType: device,
@@ -462,6 +473,7 @@ class CloudSyncService {
       console.log(`Dados sincronizados com a nuvem com sucesso a partir do ${device}`);
       return true;
     } catch (err: any) {
+      console.error('ERRO FIRESTORE:', err);
       handleFirestoreError(err, OperationType.WRITE, 'workspaces/default');
       this.updateState({
         isSyncing: false,
@@ -504,17 +516,25 @@ class CloudSyncService {
       this.updateState({ isSyncing: true, syncStatus: 'syncing', errorMessage: null });
 
       const metaRef = doc(db, 'workspaces', 'default');
-      const metaSnap = await getDoc(metaRef);
-      if (!metaSnap.exists()) {
-        this.updateState({ isSyncing: false, syncStatus: 'idle' });
-        return false;
+      let metaSnap: any = null;
+      try {
+        metaSnap = await getDoc(metaRef);
+      } catch (metaErr) {
+        console.warn('Aviso ao consultar metadados do workspace:', metaErr);
       }
 
-      const metaData = metaSnap.data();
+      const metaExists = metaSnap && typeof metaSnap.exists === 'function' ? metaSnap.exists() : false;
+      const metaData = metaExists ? metaSnap.data() : {};
 
       // 1. Fetch all imported files and reassemble their chunks from subcollections
       const filesColRef = collection(db, 'workspaces', 'default', 'imported_files');
       const filesSnap = await getDocs(filesColRef);
+
+      // Fallback: se não há metadados E a coleção de arquivos estiver vazia, encerra idle
+      if (!metaExists && filesSnap.empty) {
+        this.updateState({ isSyncing: false, syncStatus: 'idle' });
+        return false;
+      }
 
       const loadedFiles: FileData[] = [];
       for (const docSnap of filesSnap.docs) {
@@ -744,6 +764,16 @@ class CloudSyncService {
           await this.pushToCloud(localFiles, localOBs);
         }
       } else {
+        // Fallback: se metaSnap ainda não existir, verifica se imported_files já possui dados
+        try {
+          const filesSnap = await getDocs(collection(db, 'workspaces', 'default', 'imported_files'));
+          if (!filesSnap.empty) {
+            console.log('Arquivos encontrados na nuvem sem metadados. Sincronizando para este dispositivo...');
+            await this.pullFromCloud();
+            return;
+          }
+        } catch (_) {}
+
         // Cloud is empty: if local has data, seed cloud!
         if (localFiles.length > 0 || localOBs.length > 0) {
           console.log('Iniciando primeiro upload de sincronização na nuvem para este workspace...');
