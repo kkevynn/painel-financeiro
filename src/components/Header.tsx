@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { GoogleDriveState } from '../utils/googleDriveService';
 import { CloudSyncState } from '../utils/cloudSyncService';
+import { UserRole } from '../utils/authService';
 
 interface HeaderProps {
   activeTab: string;
@@ -42,6 +43,11 @@ interface HeaderProps {
   isProcessing?: boolean;
   processingProgress?: number;
   processingMessage?: string;
+
+  // RBAC Profile & Session
+  userRole?: UserRole;
+  userName?: string;
+  onLogout?: () => void;
 }
 
 const TAB_TITLES: Record<string, { title: string; subtitle: string }> = {
@@ -100,6 +106,9 @@ export const Header: React.FC<HeaderProps> = ({
   isProcessing,
   processingProgress,
   processingMessage,
+  userRole,
+  userName,
+  onLogout,
 }) => {
   const [isSaving, setIsSaving] = useState(false);
   const [savedNotification, setSavedNotification] = useState(false);
@@ -226,8 +235,37 @@ export const Header: React.FC<HeaderProps> = ({
             </button>
           )}
 
-          {/* Google Integration Controls (Drive + Cloud Sync Tablet & PC) */}
-          {driveState && (
+          {/* User Role Badge & Logout Button */}
+          {userRole && (
+            <div className="flex items-center gap-2">
+              <span
+                className={`px-3 py-1.5 rounded-xl text-xs font-black border flex items-center gap-1.5 ${
+                  userRole === 'admin'
+                    ? 'bg-emerald-50 text-emerald-900 border-emerald-300'
+                    : 'bg-sky-50 text-sky-900 border-sky-300'
+                }`}
+                title={`Perfil ativo: ${userName || (userRole === 'admin' ? 'Administrador' : 'Modo Consulta')}`}
+              >
+                <span className={`w-2 h-2 rounded-full ${userRole === 'admin' ? 'bg-emerald-500' : 'bg-sky-500'}`} />
+                <span>{userRole === 'admin' ? 'Administrador' : 'Modo Consulta'}</span>
+              </span>
+
+              {onLogout && (
+                <button
+                  type="button"
+                  onClick={onLogout}
+                  className="px-3 py-1.5 bg-white hover:bg-rose-50 text-slate-600 hover:text-rose-700 border border-slate-300 hover:border-rose-300 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer active:scale-95 shadow-2xs"
+                  title="Trocar de conta / Sair do sistema"
+                >
+                  <LogOut className="w-3.5 h-3.5 text-slate-500 hover:text-rose-600" />
+                  <span className="hidden sm:inline">Sair</span>
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* Google Integration Controls (Drive + Cloud Sync Tablet & PC) - Admin Only */}
+          {driveState && userRole !== 'viewer' && (
             <div className="flex items-center gap-2">
               {!driveState.isConnected ? (
                 <button
@@ -264,7 +302,6 @@ export const Header: React.FC<HeaderProps> = ({
                     </span>
                   </div>
 
-
                   {/* Desconectar */}
                   {onDisconnectDrive && (
                     <button
@@ -281,38 +318,40 @@ export const Header: React.FC<HeaderProps> = ({
             </div>
           )}
 
-          {/* Salvar Button */}
-          <button
-            onClick={handleSaveClick}
-            disabled={isSaving}
-            className={`px-3.5 py-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5 border shadow-xs active:scale-95 ${
-              savedNotification
-                ? 'bg-emerald-600 text-white border-emerald-600'
-                : isSaving
-                ? 'bg-slate-100 text-emerald-800 border-emerald-300 cursor-wait'
-                : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50 hover:border-slate-400 cursor-pointer'
-            }`}
-          >
-            {isSaving ? (
-              <>
-                <Loader2 className="w-4 h-4 animate-spin text-emerald-600" />
-                <span>Salvando...</span>
-              </>
-            ) : savedNotification ? (
-              <>
-                <Check className="w-4 h-4 text-white" />
-                <span>Salvo!</span>
-              </>
-            ) : (
-              <>
-                <Save className="w-4 h-4 text-slate-600" />
-                <span>Salvar</span>
-              </>
-            )}
-          </button>
+          {/* Salvar Button - Admin Only */}
+          {userRole !== 'viewer' && onSaveData && (
+            <button
+              onClick={handleSaveClick}
+              disabled={isSaving}
+              className={`px-3.5 py-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5 border shadow-xs active:scale-95 ${
+                savedNotification
+                  ? 'bg-emerald-600 text-white border-emerald-600'
+                  : isSaving
+                  ? 'bg-slate-100 text-emerald-800 border-emerald-300 cursor-wait'
+                  : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50 hover:border-slate-400 cursor-pointer'
+              }`}
+            >
+              {isSaving ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin text-emerald-600" />
+                  <span>Salvando...</span>
+                </>
+              ) : savedNotification ? (
+                <>
+                  <Check className="w-4 h-4 text-white" />
+                  <span>Salvo!</span>
+                </>
+              ) : (
+                <>
+                  <Save className="w-4 h-4 text-slate-600" />
+                  <span>Salvar</span>
+                </>
+              )}
+            </button>
+          )}
 
-          {/* Clear Button */}
-          {isProcessed && (
+          {/* Clear Button - Admin Only */}
+          {isProcessed && userRole !== 'viewer' && (
             confirmClear ? (
               <div className="flex items-center gap-1.5 bg-rose-50 border border-rose-300 rounded-xl px-2.5 py-1.5 animate-in fade-in duration-100">
                 <span className="text-[11px] font-bold text-rose-800">Limpar tudo?</span>

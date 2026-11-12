@@ -24,6 +24,7 @@ import { OrdemBancariaItem } from '../../utils/ordemBancariaParser';
 import { analyzePublicacaoRecords, saveManualPublicacaoResolution } from '../../utils/publicacaoService';
 import { exportPublicacaoToExcel, exportPublicacaoToPdf } from '../../utils/publicacaoExporter';
 import { formatBRL } from '../../utils/excelParser';
+import { isAdmin } from '../../utils/authService';
 import { SuggestionInput } from '../common/SuggestionInput';
 import { resolveCnpj, resolveSupplierName } from '../../utils/appKnowledgeDirectory';
 import {
@@ -445,15 +446,17 @@ export const PublicacaoView: React.FC<PublicacaoViewProps> = ({
             onChange={handleFileChange}
           />
 
-          <button
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            className="inline-flex items-center gap-2 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold transition shadow-lg shadow-emerald-950/20 cursor-pointer active:scale-98"
-            title="Importar planilha de NLs para Publicação (ex: Publicação - 05/11.xlsx)"
-          >
-            <Upload className="w-4 h-4" />
-            <span>Adicionar Planilha de Publicação</span>
-          </button>
+          {isAdmin() && (
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="inline-flex items-center gap-2 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold transition shadow-lg shadow-emerald-950/20 cursor-pointer active:scale-98"
+              title="Importar planilha de NLs para Publicação (ex: Publicação - 05/11.xlsx)"
+            >
+              <Upload className="w-4 h-4" />
+              <span>Adicionar Planilha de Publicação</span>
+            </button>
+          )}
 
           <button
             type="button"
@@ -839,24 +842,26 @@ export const PublicacaoView: React.FC<PublicacaoViewProps> = ({
                 irá organizar as NLs por dia, verificar a permanência ou saída de Obedece e localizar PPs e OBs emitidas em situação <strong>AO</strong> no SIGEF.
               </p>
             </div>
-            <div className="pt-2 flex flex-wrap items-center justify-center gap-3">
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition shadow-md flex items-center gap-2 cursor-pointer active:scale-98"
-              >
-                <Upload className="w-4 h-4" />
-                <span>Carregar Planilha de Publicação</span>
-              </button>
-              <button
-                type="button"
-                onClick={onNavigateToImportacoes}
-                className="px-5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition flex items-center gap-2 cursor-pointer active:scale-98"
-              >
-                <span>Ir para Central de Importações</span>
-                <ArrowRight className="w-4 h-4" />
-              </button>
-            </div>
+            {isAdmin() && (
+              <div className="pt-2 flex flex-wrap items-center justify-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition shadow-md flex items-center gap-2 cursor-pointer active:scale-98"
+                >
+                  <Upload className="w-4 h-4" />
+                  <span>Carregar Planilha de Publicação</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={onNavigateToImportacoes}
+                  className="px-5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition flex items-center gap-2 cursor-pointer active:scale-98"
+                >
+                  <span>Ir para Central de Importações</span>
+                  <ArrowRight className="w-4 h-4" />
+                </button>
+              </div>
+            )}
           </div>
         ) : filteredItems.length === 0 ? (
           <div className="p-12 text-center text-slate-400 space-y-2">

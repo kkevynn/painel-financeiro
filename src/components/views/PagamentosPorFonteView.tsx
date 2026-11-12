@@ -27,6 +27,7 @@ import {
 } from '../../utils/ordemBancariaParser';
 import { readSpreadsheetAsMatrix, formatBRL, parseCurrencyValue } from '../../utils/excelParser';
 import { FileData } from '../../types';
+import { isAdmin } from '../../utils/authService';
 
 interface PagamentosPorFonteViewProps {
   files?: FileData[];
@@ -597,17 +598,19 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
 
         {/* Action Buttons */}
         <div className="flex flex-wrap items-center gap-3">
-          <label className="inline-flex items-center gap-2 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold transition shadow-lg shadow-emerald-950/20 cursor-pointer active:scale-98">
-            <Upload className="w-4 h-4" />
-            <span>{isUploading ? 'Processando...' : 'Atualizar Planilha'}</span>
-            <input
-              type="file"
-              accept=".xlsx, .xls, .csv"
-              onChange={handleFileUpload}
-              disabled={isUploading}
-              className="hidden"
-            />
-          </label>
+          {isAdmin() && (
+            <label className="inline-flex items-center gap-2 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold transition shadow-lg shadow-emerald-950/20 cursor-pointer active:scale-98">
+              <Upload className="w-4 h-4" />
+              <span>{isUploading ? 'Processando...' : 'Atualizar Planilha'}</span>
+              <input
+                type="file"
+                accept=".xlsx, .xls, .csv"
+                onChange={handleFileUpload}
+                disabled={isUploading}
+                className="hidden"
+              />
+            </label>
+          )}
 
           <button
             type="button"
@@ -619,7 +622,7 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
             <span>Exportar Excel</span>
           </button>
 
-          {activeObFile && onOpenColumnMapModal && (
+          {isAdmin() && activeObFile && onOpenColumnMapModal && (
             <button
               type="button"
               onClick={() => onOpenColumnMapModal(activeObFile.id)}
@@ -631,7 +634,7 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
             </button>
           )}
 
-          {onUpdateOrdensBancariasList && (
+          {isAdmin() && onUpdateOrdensBancariasList && (
             confirmClear ? (
               <div className="flex items-center gap-1.5 bg-rose-950/70 border border-rose-700/60 rounded-xl px-2.5 py-1.5 animate-in fade-in duration-100">
                 <span className="text-[11px] text-rose-300 font-semibold">Remover OBs?</span>

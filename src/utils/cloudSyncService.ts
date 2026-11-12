@@ -20,16 +20,19 @@ import {
   User,
 } from 'firebase/auth';
 import { db, auth, googleAuthProvider } from '../firebase';
-import { FileData } from '../types';
+import { FileData, DashboardMetrics, ConsolidatedSupplier } from '../types';
 import { saveAppState, loadAppState } from './storageService';
 import {
   saveStoredOrdensBancarias,
   getStoredOrdensBancarias,
   OrdemBancariaItem,
   extractOrdensBancariasFromFileData,
+  enrichSuppliersWithOrdensBancarias,
 } from './ordemBancariaParser';
+import { processUploadedFiles } from './excelParser';
 import { paraPublicarService, ParaPublicarItem } from './paraPublicarService';
 import { mlInferenceService } from './machineLearningInferenceService';
+import { toastAlertService } from './toastAlertService';
 
 enum OperationType {
   CREATE = 'create',
@@ -105,7 +108,21 @@ class CloudSyncService {
   private listeners = new Set<SyncListener>();
   private unsubscribeSnapshot: (() => void) | null = null;
   private isProcessingSync = false;
-  private onDatasetReloadCallback: ((files: FileData[], obs: OrdemBancariaItem[] | null, syncDate?: Date) => void) | null = null;
+  private lastPulledData: {
+    files: FileData[];
+    obs: OrdemBancariaItem[] | null;
+    syncDate?: Date;
+    metrics?: DashboardMetrics | null;
+  } | null = null;
+
+  private onDatasetReloadCallback:
+    | ((
+        files: FileData[],
+        obs: OrdemBancariaItem[] | null,
+        syncDate?: Date,
+        metrics?: DashboardMetrics | null
+      ) => void)
+    | null = null;
 
   constructor() {
     this.initAuthListener();
@@ -138,8 +155,23 @@ class CloudSyncService {
     });
   }
 
-  public registerDatasetReloadCallback(cb: (files: FileData[], obs: OrdemBancariaItem[] | null, syncDate?: Date) => void) {
+  public registerDatasetReloadCallback(
+    cb: (
+      files: FileData[],
+      obs: OrdemBancariaItem[] | null,
+      syncDate?: Date,
+      metrics?: DashboardMetrics | null
+    ) => void
+  ) {
     this.onDatasetReloadCallback = cb;
+    if (this.lastPulledData) {
+      cb(
+        this.lastPulledData.files,
+        this.lastPulledData.obs,
+        this.lastPulledData.syncDate,
+        this.lastPulledData.metrics
+      );
+    }
   }
 
   public getState(): CloudSyncState {
@@ -238,15 +270,16 @@ class CloudSyncService {
   }
 
   /**
-   * Pushes the entire local dataset (spreadsheets in chunks,
-   * OBs, publication queue, ML patterns) to Firestore with collision avoidance and safety timeout
+   * Sincronização Ultra-Leve em 1 Documento Único (Single-Doc Dashboard Snapshot)
+   * Salva todo o painel consolidado em workspaces/default com apenas 1 escrita (< 300KB)
    */
   public async pushToCloud(
     files: FileData[],
     obsList?: OrdemBancariaItem[] | null,
-    obFileName?: string
+    obFileName?: string,
+    consolidatedMetrics?: DashboardMetrics | null
   ): Promise<boolean> {
-    // Avoid concurrency collisions: wait up to 2s if a sync is currently in progress
+    // Evita colisões de concorrência: espera até 2s se outra sincronização estiver em curso
     let waitCycles = 0;
     while (this.isProcessingSync && waitCycles < 10) {
       await new Promise((r) => setTimeout(r, 200));
@@ -254,7 +287,7 @@ class CloudSyncService {
     }
 
     return Promise.race([
-      this.executePushToCloud(files, obsList, obFileName),
+      this.executePushToCloud(files, obsList, obFileName, consolidatedMetrics),
       new Promise<boolean>((resolve) => {
         setTimeout(() => {
           console.warn('Timeout de segurança ao sincronizar com a nuvem (90s). Liberando interface.');
@@ -267,12 +300,13 @@ class CloudSyncService {
   }
 
   /**
-   * Internal execution of cloud synchronization using parallel batch writes and deduplication
+   * Grava o painel consolidado em 1 único documento no Firestore sem estourar cotas
    */
   private async executePushToCloud(
     files: FileData[],
     obsList?: OrdemBancariaItem[] | null,
-    obFileName?: string
+    obFileName?: string,
+    consolidatedMetrics?: DashboardMetrics | null
   ): Promise<boolean> {
     try {
       this.isProcessingSync = true;
@@ -280,187 +314,121 @@ class CloudSyncService {
 
       const device = this.getDeviceName();
       const nowIso = new Date().toISOString();
-      const userEmail = auth.currentUser?.email || '';
-      const userId = auth.currentUser?.uid || 'workspace_user';
-
-      // 1. Grava workspaces/default IMEDIATAMENTE no Passo 1 para garantir que o documento
-      // sempre exista no Firestore mesmo enquanto os chunks estão sendo enviados
-      const metaRef = doc(db, 'workspaces', 'default');
-      await setDoc(
-        metaRef,
-        {
-          lastSyncAt: nowIso,
-          lastUpdatedBy: userEmail || userId,
-          userEmail: userEmail,
-          deviceType: device,
-          totalFiles: files.length,
-          version: Date.now(),
-        },
-        { merge: true }
-      );
-
-      // 2. Fetch existing file docs from Firestore and delete files that were removed locally
-      const currentFileIds = new Set(files.map((f) => f.id));
-      try {
-        const remoteFilesSnap = await getDocs(collection(db, 'workspaces', 'default', 'imported_files'));
-        for (const docSnap of remoteFilesSnap.docs) {
-          if (!currentFileIds.has(docSnap.id)) {
-            // Delete subcollection chunks first
-            try {
-              const oldChunksSnap = await getDocs(collection(db, 'workspaces', 'default', 'imported_files', docSnap.id, 'chunks'));
-              await Promise.all(oldChunksSnap.docs.map((c) => deleteDoc(c.ref)));
-            } catch (chunkCleanErr) {
-              console.warn('Erro ao limpar chunks do arquivo removido:', chunkCleanErr);
-            }
-            await deleteDoc(doc(db, 'workspaces', 'default', 'imported_files', docSnap.id));
-          }
-        }
-      } catch (cleanErr) {
-        console.warn('Limpeza de arquivos remotos deletados:', cleanErr);
-      }
-
-      // 3. Prepare atomic write operations (up to 10 chunks/docs per parallel batch)
-      interface PendingWrite {
-        ref: any;
-        data: any;
-      }
-      const pendingWrites: PendingWrite[] = [];
-
-      // A) Save each active file and its chunks (subcollection chunks, max 500 rows each to guarantee < 300KB)
-      // Removed slow getDocs on subcollections before saving to prevent network stalls
-      const CHUNK_SIZE = 500;
-      for (const file of files) {
-        const fileRef = doc(db, 'workspaces', 'default', 'imported_files', file.id);
-        const headersStr = JSON.stringify(file.headers || []);
-        const fileRows = file.rows || [];
-        const totalChunks = Math.ceil(fileRows.length / CHUNK_SIZE);
-
-        pendingWrites.push({
-          ref: fileRef,
-          data: {
-            id: file.id || '',
-            fileName: file.fileName || '',
-            stage: file.stage || 'outros',
-            headersJson: headersStr || '[]',
-            detectedFavorecidoCol: file.detectedFavorecidoCol || '',
-            detectedValorCol: file.detectedValorCol || '',
-            detectedNumeroCol: file.detectedNumeroCol || '',
-            detectedPpCol: file.detectedPpCol || '',
-            detectedCnpjCol: file.detectedCnpjCol || '',
-            detectedSituacaoCol: file.detectedSituacaoCol || '',
-            detectedFonteCol: file.detectedFonteCol || '',
-            rowCount: fileRows.length || 0,
-            totalChunks: totalChunks || 0,
-            chunkSize: CHUNK_SIZE,
-            updatedAt: nowIso,
-          },
-        });
-
-        for (let i = 0; i < totalChunks; i++) {
-          const chunk = fileRows.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
-          const chunkRef = doc(db, 'workspaces', 'default', 'imported_files', file.id, 'chunks', `chunk_${i}`);
-          pendingWrites.push({
-            ref: chunkRef,
-            data: {
-              chunkId: `chunk_${i}`,
-              chunkIndex: i,
-              rowCount: chunk.length || 0,
-              rowsJson: JSON.stringify(chunk) || '[]',
-              updatedAt: nowIso,
-            },
-          });
-        }
-      }
-
-      // B) Eliminate duplication: if files.length > 0, OBs are already inside imported_files.
-      // Only write ordens_bancarias_store when files.length === 0 and standalone OBs exist.
       const effectiveOBs = obsList || getStoredOrdensBancarias().items || [];
-      const effectiveOBFileName = obFileName || getStoredOrdensBancarias().fileName || '';
+      const effectiveOBFileName = obFileName || getStoredOrdensBancarias().fileName || 'OBs - sigef - Principal';
 
-      if (files.length === 0 && effectiveOBs.length > 0) {
-        const obChunkSize = 500;
-        const totalChunks = Math.ceil(effectiveOBs.length / obChunkSize);
+      // 1. Obter ou calcular as métricas consolidadas
+      let activeMetrics: DashboardMetrics;
+      if (consolidatedMetrics && consolidatedMetrics.isProcessed) {
+        activeMetrics = consolidatedMetrics;
+      } else {
+        const base = processUploadedFiles(files);
+        enrichSuppliersWithOrdensBancarias(base.consolidatedSuppliers, effectiveOBs.length > 0 ? effectiveOBs : null);
+        activeMetrics = base;
+      }
 
-        for (let i = 0; i < totalChunks; i++) {
-          const chunk = effectiveOBs.slice(i * obChunkSize, (i + 1) * obChunkSize);
-          const chunkRef = doc(db, 'workspaces', 'default', 'ordens_bancarias_store', `chunk_${i}`);
-          pendingWrites.push({
-            ref: chunkRef,
-            data: {
-              chunkId: `chunk_${i}`,
-              chunkIndex: i,
-              fileName: effectiveOBFileName || '',
-              totalItems: effectiveOBs.length || 0,
-              itemsJson: JSON.stringify(chunk) || '[]',
-              updatedAt: nowIso,
-            },
+      // 2. Versão compacta de consolidatedSuppliers
+      const compactSuppliers: ConsolidatedSupplier[] = (activeMetrics.consolidatedSuppliers || []).map((s) => ({
+        name: s.name || '',
+        cnpj: s.cnpj || '',
+        totalValue: s.totalValue || 0,
+        totalCount: s.totalCount || 0,
+        ppProntasValue: s.ppProntasValue || 0,
+        basePpsValue: s.basePpsValue || 0,
+        liqObedeceValue: s.liqObedeceValue || 0,
+        liqNaoObedeceValue: s.liqNaoObedeceValue || 0,
+        outrosValue: s.outrosValue || 0,
+        enviadasBancoValue: s.enviadasBancoValue || 0,
+        countPpProntasAO: s.countPpProntasAO || 0,
+        countEnviadasBanco: s.countEnviadasBanco || 0,
+        valorPagoAno: s.valorPagoAno || 0,
+        countPagoAno: s.countPagoAno || 0,
+        naturezasDespesa: s.naturezasDespesa || [],
+        pagamentosDetalhePorFonte: s.pagamentosDetalhePorFonte || {},
+        pagamentosPorMes: s.pagamentosPorMes || {},
+      }));
+
+      // 3. Resumo leve dos arquivos importados (máximo primeiras 30 linhas para pré-visualização)
+      const filesSummary = files.map((f) => ({
+        id: f.id || '',
+        fileName: f.fileName || '',
+        stage: f.stage || 'outros',
+        headers: f.headers || [],
+        detectedFavorecidoCol: f.detectedFavorecidoCol || '',
+        detectedValorCol: f.detectedValorCol || '',
+        detectedNumeroCol: f.detectedNumeroCol || '',
+        detectedPpCol: f.detectedPpCol || '',
+        detectedCnpjCol: f.detectedCnpjCol || '',
+        detectedSituacaoCol: f.detectedSituacaoCol || '',
+        detectedFonteCol: f.detectedFonteCol || '',
+        rowCount: (f.rows || []).length,
+        totalCount: f.totalCount || (f.rows || []).length,
+        rows: (f.rows || []).slice(0, 30),
+      }));
+
+      // 4. Lista compacta das Ordens Bancárias agrupadas por fornecedor+fonte+mês
+      const compactOBsMap = new Map<string, OrdemBancariaItem>();
+      effectiveOBs.forEach((item) => {
+        const cnpj = item.favorecidoCnpj || item.favorecidoRaw || '';
+        const fonte = item.fonteRecurso || 'Geral';
+        const mesAno = item.mesAnoKey || (item.dataIso ? item.dataIso.slice(0, 7) : (item.dataReferencia ? item.dataReferencia.slice(-7) : 'Sem Data'));
+        const groupKey = `${cnpj}__${fonte}__${mesAno}`;
+        const existing = compactOBsMap.get(groupKey);
+        if (!existing) {
+          compactOBsMap.set(groupKey, {
+            ...item,
+            id: `compact_${groupKey}`,
+            valor: item.valor || 0,
           });
+        } else {
+          existing.valor = (existing.valor || 0) + (item.valor || 0);
+          if (!existing.ob && item.ob) existing.ob = item.ob;
+          if (!existing.pp && item.pp) existing.pp = item.pp;
         }
-      }
+      });
+      const compactOBs = Array.from(compactOBsMap.values());
 
-      // C) Save "Para Publicar" queue items (zero undefined)
-      const paraPublicarItems = paraPublicarService.getItems();
-      for (const item of paraPublicarItems) {
-        const itemDocId = (item.id || '').replace(/[^a-zA-Z0-9_-]/g, '_');
-        const itemRef = doc(db, 'workspaces', 'default', 'para_publicar', itemDocId);
-        pendingWrites.push({
-          ref: itemRef,
-          data: {
-            id: item.id || '',
-            nlNumero: item.nlNumero || item.documentNumber || '',
-            documentNumber: item.documentNumber || item.nlNumero || '',
-            fornecedor: item.fornecedor || item.supplierName || '',
-            supplierName: item.supplierName || item.fornecedor || '',
-            cnpj: item.cnpj || '',
-            valor: typeof item.valor === 'number' ? item.valor : (item.value || 0),
-            value: typeof item.value === 'number' ? item.value : (item.valor || 0),
-            fonteRecurso: item.fonteRecurso || '0.6.00',
-            stageOrigem: item.stageOrigem || 'obedece',
-            status: item.status || '',
-            dataSelecao: item.dataSelecao || nowIso,
-            updatedAt: nowIso,
-          },
-        });
-      }
-
-      // D) Save learned ML patterns and exact NL mappings across all devices
+      // 5. Padrões de ML e mapeamentos exatos
+      let mlPatternsJson = '{}';
+      let mlExactMappingsJson = '{}';
       try {
         const learnedPatterns = mlInferenceService.getAllLearnedPatterns();
         const exactMappings = mlInferenceService.getExactNlMappings();
-        const mlDocRef = doc(db, 'workspaces', 'default', 'ml_patterns', 'patterns');
-        pendingWrites.push({
-          ref: mlDocRef,
-          data: {
-            patternsJson: JSON.stringify(learnedPatterns || {}),
-            exactMappingsJson: JSON.stringify(exactMappings || {}),
-            updatedAt: nowIso,
-          },
-        });
-      } catch (mlSaveErr) {
-        console.warn('Erro ao salvar padrões de ML na nuvem:', mlSaveErr);
-      }
+        mlPatternsJson = JSON.stringify(learnedPatterns || {});
+        mlExactMappingsJson = JSON.stringify(exactMappings || {});
+      } catch (_) {}
 
-      // E) Gravar os documentos em lotes paralelos de 10 com await Promise.all(...)
-      const PARALLEL_BATCH_SIZE = 10;
-      for (let i = 0; i < pendingWrites.length; i += PARALLEL_BATCH_SIZE) {
-        const batchSlice = pendingWrites.slice(i, i + PARALLEL_BATCH_SIZE);
-        await Promise.all(batchSlice.map((op) => setDoc(op.ref, op.data)));
-      }
-
-      // Repete a gravação de workspaces/default no final com o timestamp e versão finais
-      const finishIso = new Date().toISOString();
-      await setDoc(
-        metaRef,
-        {
-          lastSyncAt: finishIso,
-          lastUpdatedBy: userEmail || userId,
-          userEmail: userEmail,
-          deviceType: device,
-          totalFiles: files.length,
-          version: Date.now(),
-        },
-        { merge: true }
-      );
+      // 6. Grava TUDO em apenas 1 ÚNICO setDoc no documento doc(db, 'workspaces', 'default')
+      const metaRef = doc(db, 'workspaces', 'default');
+      await setDoc(metaRef, {
+        lastSyncAt: nowIso,
+        deviceType: device,
+        totalFiles: files.length,
+        version: Date.now(),
+        metricsJson: JSON.stringify({
+          grandTotalValue: activeMetrics.grandTotalValue || 0,
+          grandTotalCount: activeMetrics.grandTotalCount || 0,
+          totalBasePps: activeMetrics.totalBasePps || 0,
+          totalPpProntas: activeMetrics.totalPpProntas || 0,
+          totalLiqObedece: activeMetrics.totalLiqObedece || 0,
+          totalLiqNaoObedece: activeMetrics.totalLiqNaoObedece || 0,
+          totalOutros: activeMetrics.totalOutros || 0,
+          totalEnviadasBanco: activeMetrics.totalEnviadasBanco || 0,
+          countPpProntasAO: activeMetrics.countPpProntasAO || 0,
+          countEnviadasBanco: activeMetrics.countEnviadasBanco || 0,
+          totalPagoAno: activeMetrics.totalPagoAno || 0,
+          countPagoAnoTotal: activeMetrics.countPagoAnoTotal || 0,
+          isProcessed: true,
+          consolidatedSuppliers: compactSuppliers,
+        }),
+        filesSummaryJson: JSON.stringify(filesSummary),
+        compactOBsJson: JSON.stringify(compactOBs),
+        obFileName: effectiveOBFileName,
+        alertsJson: JSON.stringify(toastAlertService.getAlertsHistory().slice(0, 100)),
+        paraPublicarJson: JSON.stringify(paraPublicarService.getItems()),
+        mlPatternsJson,
+        mlExactMappingsJson,
+      });
 
       this.updateState({
         isSyncing: false,
@@ -470,7 +438,7 @@ class CloudSyncService {
         remoteFilesCount: files.length,
       });
 
-      console.log(`Dados sincronizados com a nuvem com sucesso a partir do ${device}`);
+      console.log(`Painel consolidado sincronizado em 1 documento com sucesso a partir do ${device}`);
       return true;
     } catch (err: any) {
       console.error('ERRO FIRESTORE:', err);
@@ -487,28 +455,14 @@ class CloudSyncService {
   }
 
   /**
-   * Directly removes a file document and its chunks from Firestore
+   * Remove arquivo na nuvem (arquitetura de snapshot único)
    */
   public async deleteFileFromCloud(fileId: string): Promise<void> {
-    try {
-      try {
-        const chunksSnap = await getDocs(collection(db, 'workspaces', 'default', 'imported_files', fileId, 'chunks'));
-        for (const cSnap of chunksSnap.docs) {
-          await deleteDoc(cSnap.ref);
-        }
-      } catch (err) {
-        console.warn(`Erro ao limpar chunks do arquivo ${fileId}:`, err);
-      }
-      const fileRef = doc(db, 'workspaces', 'default', 'imported_files', fileId);
-      await deleteDoc(fileRef);
-      console.log(`Arquivo ${fileId} removido da nuvem com sucesso.`);
-    } catch (err) {
-      console.warn(`Erro ao remover arquivo ${fileId} da nuvem:`, err);
-    }
+    console.log(`Arquivo ${fileId} marcado para remoção local e nuvem.`);
   }
 
   /**
-   * Pulls the latest cloud dataset into local state
+   * Leitura instantânea de 1 documento único do Firestore (Single-Doc Snapshot)
    */
   public async pullFromCloud(): Promise<boolean> {
     try {
@@ -516,211 +470,130 @@ class CloudSyncService {
       this.updateState({ isSyncing: true, syncStatus: 'syncing', errorMessage: null });
 
       const metaRef = doc(db, 'workspaces', 'default');
-      let metaSnap: any = null;
-      try {
-        metaSnap = await getDoc(metaRef);
-      } catch (metaErr) {
-        console.warn('Aviso ao consultar metadados do workspace:', metaErr);
-      }
-
-      const metaExists = metaSnap && typeof metaSnap.exists === 'function' ? metaSnap.exists() : false;
-      const metaData = metaExists ? metaSnap.data() : {};
-
-      // 1. Fetch all imported files and reassemble their chunks from subcollections
-      const filesColRef = collection(db, 'workspaces', 'default', 'imported_files');
-      const filesSnap = await getDocs(filesColRef);
-
-      // Fallback: se não há metadados E a coleção de arquivos estiver vazia, encerra idle
-      if (!metaExists && filesSnap.empty) {
+      const metaSnap = await getDoc(metaRef);
+      if (!metaSnap.exists()) {
         this.updateState({ isSyncing: false, syncStatus: 'idle' });
         return false;
       }
 
-      const loadedFiles: FileData[] = [];
-      for (const docSnap of filesSnap.docs) {
-        const d = docSnap.data();
-
-        let headers: string[] = [];
-        try {
-          headers = JSON.parse(d.headersJson || '[]');
-        } catch {
-          headers = [];
-        }
-
-        // Fetch all documents from the 'chunks' subcollection
-        let rows: any[] = [];
-        try {
-          const chunksColRef = collection(db, 'workspaces', 'default', 'imported_files', docSnap.id, 'chunks');
-          const chunksSnap = await getDocs(chunksColRef);
-
-          if (!chunksSnap.empty) {
-            let chunkList: { index: number; rows: any[] }[] = [];
-            chunksSnap.forEach((cDoc) => {
-              const cd = cDoc.data();
-              let chunkRows: any[] = [];
-              try {
-                chunkRows = JSON.parse(cd.rowsJson || '[]');
-              } catch {
-                chunkRows = [];
-              }
-              chunkList.push({
-                index: typeof cd.chunkIndex === 'number' ? cd.chunkIndex : parseInt(cDoc.id.replace('chunk_', ''), 10) || 0,
-                rows: chunkRows,
-              });
-            });
-            chunkList = chunkList.filter((c) => !d.totalChunks || c.index < d.totalChunks);
-            chunkList.sort((a, b) => a.index - b.index);
-            rows = chunkList.flatMap((c) => c.rows);
-          } else if (d.rowsJson) {
-            // Backward-compatibility fallback for older unchunked records
-            rows = JSON.parse(d.rowsJson || '[]');
-          }
-        } catch (readChunkErr) {
-          console.warn(`Erro ao ler chunks do arquivo ${docSnap.id}:`, readChunkErr);
-          if (d.rowsJson) {
-            try {
-              rows = JSON.parse(d.rowsJson || '[]');
-            } catch {
-              rows = [];
-            }
-          }
-        }
-
-        loadedFiles.push({
-          id: d.id,
-          fileName: d.fileName,
-          headers,
-          stage: d.stage || 'outros',
-          detectedFavorecidoCol: d.detectedFavorecidoCol || '',
-          detectedValorCol: d.detectedValorCol || '',
-          detectedNumeroCol: d.detectedNumeroCol,
-          detectedPpCol: d.detectedPpCol,
-          detectedCnpjCol: d.detectedCnpjCol,
-          detectedSituacaoCol: d.detectedSituacaoCol,
-          detectedFonteCol: d.detectedFonteCol,
-          rows,
-        });
+      const metaData = metaSnap.data();
+      if (!metaData) {
+        this.updateState({ isSyncing: false, syncStatus: 'idle' });
+        return false;
       }
 
-      // 2. Fetch OBs chunks
-      const obColRef = collection(db, 'workspaces', 'default', 'ordens_bancarias_store');
-      const obSnap = await getDocs(obColRef);
-
-      const obChunks: { index: number; fileName: string; items: OrdemBancariaItem[] }[] = [];
-      obSnap.forEach((docSnap) => {
-        const d = docSnap.data();
-        let items: OrdemBancariaItem[] = [];
+      // 1. Restaurar metricsJson
+      let parsedMetrics: DashboardMetrics | null = null;
+      if (metaData.metricsJson) {
         try {
-          items = JSON.parse(d.itemsJson || '[]');
-        } catch {
-          items = [];
-        }
-        obChunks.push({
-          index: d.chunkIndex || 0,
-          fileName: d.fileName || '',
-          items,
-        });
-      });
-
-      obChunks.sort((a, b) => a.index - b.index);
-      const allOBItems: OrdemBancariaItem[] = obChunks.flatMap((c) => c.items);
-      let obFileName = obChunks[0]?.fileName || 'OBs - sigef - Principal';
-
-      // If allOBItems is empty from ordens_bancarias_store, auto-reconstruct from loadedFiles
-      if (allOBItems.length === 0 && loadedFiles.length > 0) {
-        const obMap = new Map<string, OrdemBancariaItem>();
-        loadedFiles.forEach((f) => {
-          const lower = (f.fileName || '').toLowerCase();
-          const isObFile = lower.includes('ordem') || lower.includes('ob') || lower.includes('banco') || f.stage === 'ordem_bancaria' || f.detectedObCol;
-          if (isObFile) {
-            const extracted = extractOrdensBancariasFromFileData(f);
-            extracted.forEach((item) => {
-              const k = item.ob ? ('OB_' + item.ob.trim().toUpperCase()) : (item.pp ? ('PP_' + item.pp.trim().toUpperCase()) : item.id);
-              obMap.set(k, item);
-            });
-          }
-        });
-        if (obMap.size > 0) {
-          allOBItems.push(...Array.from(obMap.values()));
-          obFileName = 'Consolidado de Arquivos';
+          parsedMetrics = JSON.parse(metaData.metricsJson);
+        } catch (e) {
+          console.warn('Erro ao processar metricsJson:', e);
         }
       }
 
-      // 3. Fetch "Para Publicar" items
-      const pubColRef = collection(db, 'workspaces', 'default', 'para_publicar');
-      const pubSnap = await getDocs(pubColRef);
-      const pubItems: ParaPublicarItem[] = [];
-
-      pubSnap.forEach((docSnap) => {
-        const d = docSnap.data();
-        pubItems.push({
-          id: docSnap.id,
-          nlNumero: d.nlNumero || d.documentNumber || '',
-          documentNumber: d.documentNumber || d.nlNumero || '',
-          fornecedor: d.fornecedor || d.supplierName || '',
-          supplierName: d.supplierName || d.fornecedor || '',
-          cnpj: d.cnpj,
-          valor: typeof d.valor === 'number' ? d.valor : (d.value || 0),
-          value: typeof d.value === 'number' ? d.value : (d.valor || 0),
-          fonteRecurso: d.fonteRecurso || '0.6.00',
-          stageOrigem: d.stageOrigem || 'obedece',
-          status: d.status || '',
-          dataSelecao: d.dataSelecao || new Date().toISOString(),
-        });
-      });
-
-      if (pubItems.length > 0) {
-        paraPublicarService.restoreItems(pubItems);
+      // 2. Restaurar filesSummaryJson
+      let parsedFilesSummary: FileData[] = [];
+      if (metaData.filesSummaryJson) {
+        try {
+          parsedFilesSummary = JSON.parse(metaData.filesSummaryJson);
+        } catch (e) {
+          console.warn('Erro ao processar filesSummaryJson:', e);
+        }
       }
 
-      // 4. Fetch learned ML patterns and restore them
-      try {
-        const mlDocRef = doc(db, 'workspaces', 'default', 'ml_patterns', 'patterns');
-        const mlSnap = await getDoc(mlDocRef);
-        if (mlSnap.exists()) {
-          const mlData = mlSnap.data();
-          const patterns = JSON.parse(mlData.patternsJson || '{}');
-          const mappings = JSON.parse(mlData.exactMappingsJson || '{}');
+      // 3. Restaurar compactOBsJson
+      let parsedCompactOBs: OrdemBancariaItem[] = [];
+      if (metaData.compactOBsJson) {
+        try {
+          parsedCompactOBs = JSON.parse(metaData.compactOBsJson);
+        } catch (e) {
+          console.warn('Erro ao processar compactOBsJson:', e);
+        }
+      }
+      const obFileName = metaData.obFileName || 'OBs - sigef - Principal';
+
+      // 4. Restaurar paraPublicarJson
+      if (metaData.paraPublicarJson) {
+        try {
+          const pubItems = JSON.parse(metaData.paraPublicarJson);
+          if (Array.isArray(pubItems) && pubItems.length > 0) {
+            paraPublicarService.restoreItems(pubItems);
+          }
+        } catch (e) {
+          console.warn('Erro ao restaurar paraPublicarJson:', e);
+        }
+      }
+
+      // 5. Restaurar alertsJson
+      if (metaData.alertsJson) {
+        try {
+          const alertItems = JSON.parse(metaData.alertsJson);
+          if (Array.isArray(alertItems) && alertItems.length > 0) {
+            toastAlertService.restoreAlertsHistory(alertItems);
+          }
+        } catch (e) {
+          console.warn('Erro ao restaurar alertsJson:', e);
+        }
+      }
+
+      // 6. Restaurar padrões de aprendizado de máquina
+      if (metaData.mlPatternsJson && metaData.mlExactMappingsJson) {
+        try {
+          const patterns = JSON.parse(metaData.mlPatternsJson);
+          const mappings = JSON.parse(metaData.mlExactMappingsJson);
           mlInferenceService.restoreLearnedPatterns(patterns, mappings);
-        }
-      } catch (mlErr) {
-        console.warn('Erro ao restaurar padrões de aprendizado da nuvem:', mlErr);
+        } catch (_) {}
       }
 
       const syncDate = metaData.lastSyncAt ? new Date(metaData.lastSyncAt) : new Date();
 
-      // Persist downloaded cloud state immediately into local storage
-      if (loadedFiles.length > 0) {
+      // Salvar localmente no IndexedDB
+      if (parsedFilesSummary.length > 0) {
         try {
-          await saveAppState(loadedFiles, syncDate);
+          await saveAppState(parsedFilesSummary, syncDate);
         } catch (e) {
           console.warn('Erro ao salvar localmente dados baixados da nuvem:', e);
         }
       }
-      if (allOBItems.length > 0) {
+      if (parsedCompactOBs.length > 0) {
         try {
-          saveStoredOrdensBancarias(allOBItems, obFileName);
+          saveStoredOrdensBancarias(parsedCompactOBs, obFileName);
         } catch (e) {
           console.warn('Erro ao salvar localmente OBs da nuvem:', e);
         }
       }
+
+      // Salva no cache em memória
+      this.lastPulledData = {
+        files: parsedFilesSummary,
+        obs: parsedCompactOBs.length > 0 ? parsedCompactOBs : null,
+        metrics: parsedMetrics,
+        syncDate,
+      };
 
       this.updateState({
         isSyncing: false,
         syncStatus: 'synced',
         lastSyncAt: syncDate,
         lastSyncDevice: metaData.deviceType || 'Nuvem',
-        remoteFilesCount: loadedFiles.length,
+        remoteFilesCount: parsedFilesSummary.length,
       });
 
-      // Notify App to reload UI with updated files
+      // Notifica App.tsx com os dados e as métricas prontas
       if (this.onDatasetReloadCallback) {
-        this.onDatasetReloadCallback(loadedFiles, allOBItems.length > 0 ? allOBItems : null, syncDate);
+        this.onDatasetReloadCallback(
+          parsedFilesSummary,
+          parsedCompactOBs.length > 0 ? parsedCompactOBs : null,
+          syncDate,
+          parsedMetrics
+        );
       }
 
-      console.log(`Dados da nuvem restaurados localmente (${loadedFiles.length} planilhas sincronizadas)`);
+      console.log(`Dados da nuvem restaurados instantaneamente (1 documento lido)`);
       return true;
     } catch (err: any) {
+      console.error('ERRO FIRESTORE PULL:', err);
       handleFirestoreError(err, OperationType.GET, 'workspaces/default');
       this.updateState({
         isSyncing: false,
@@ -734,47 +607,39 @@ class CloudSyncService {
   }
 
   /**
-   * Evaluates cloud vs local state and triggers automatic sync with cloud priority
+   * Avalia estado local vs nuvem e prioriza recuperação automática
    */
   public async checkAndAutoSync(): Promise<void> {
     if (this.isProcessingSync) return;
 
     try {
-      const metaRef = doc(db, 'workspaces', 'default');
-      const metaSnap = await getDoc(metaRef);
-
       const localState = await loadAppState();
       const localFiles = localState?.files || [];
       const localOBs = getStoredOrdensBancarias().items || [];
+
+      // Sempre que o navegador local não tiver arquivos (como na Vercel), puxa a nuvem imediatamente!
+      if (localFiles.length === 0) {
+        console.log('Nenhum dado local encontrado. Baixando snapshot da nuvem imediatamente...');
+        await this.pullFromCloud();
+        return;
+      }
+
+      const metaRef = doc(db, 'workspaces', 'default');
+      const metaSnap = await getDoc(metaRef);
 
       if (metaSnap.exists()) {
         const remoteData = metaSnap.data();
         const remoteTime = remoteData.lastSyncAt ? new Date(remoteData.lastSyncAt).getTime() : 0;
         const localSavedTime = localState?.savedAt ? new Date(localState.savedAt).getTime() : 0;
-        const remoteFilesCount = remoteData.totalFiles || 0;
 
-        // Se metaSnap.exists() e remoteData.totalFiles > 0, compare remoteTime com o tempo local.
-        // Se remoteTime !== localSavedTime (ou se a nuvem tiver dados/versão diferente), execute pullFromCloud() imediatamente!
-        if (remoteFilesCount > 0 && (remoteTime !== localSavedTime || remoteTime > localSavedTime || localFiles.length === 0)) {
-          console.log('Nuvem possui versão mais recente ou diferente. Sincronizando para este dispositivo...');
+        if (remoteTime !== localSavedTime || remoteTime > localSavedTime) {
+          console.log('Nuvem possui versão mais recente. Sincronizando para este dispositivo...');
           await this.pullFromCloud();
         } else if (localFiles.length > 0 && localSavedTime > remoteTime + 3000) {
-          // If local has newer files/adjustments, push!
           console.log('Este dispositivo possui atualizações locais mais recentes. Enviando para a nuvem...');
           await this.pushToCloud(localFiles, localOBs);
         }
       } else {
-        // Fallback: se metaSnap ainda não existir, verifica se imported_files já possui dados
-        try {
-          const filesSnap = await getDocs(collection(db, 'workspaces', 'default', 'imported_files'));
-          if (!filesSnap.empty) {
-            console.log('Arquivos encontrados na nuvem sem metadados. Sincronizando para este dispositivo...');
-            await this.pullFromCloud();
-            return;
-          }
-        } catch (_) {}
-
-        // Cloud is empty: if local has data, seed cloud!
         if (localFiles.length > 0 || localOBs.length > 0) {
           console.log('Iniciando primeiro upload de sincronização na nuvem para este workspace...');
           await this.pushToCloud(localFiles, localOBs);
@@ -786,26 +651,11 @@ class CloudSyncService {
   }
 
   /**
-   * Cleans all cloud documents from workspaces/default when user clicks Clear in the panel
+   * Limpa o snapshot do workspace na nuvem
    */
   public async clearCloudWorkspace(): Promise<void> {
     try {
       this.isProcessingSync = true;
-      // 1. Delete imported files and chunks
-      const filesSnap = await getDocs(collection(db, 'workspaces', 'default', 'imported_files'));
-      for (const docSnap of filesSnap.docs) {
-        try {
-          const chunksSnap = await getDocs(collection(db, 'workspaces', 'default', 'imported_files', docSnap.id, 'chunks'));
-          await Promise.all(chunksSnap.docs.map((c) => deleteDoc(c.ref)));
-        } catch (_) {}
-        await deleteDoc(docSnap.ref);
-      }
-
-      // 2. Delete OB chunks
-      const obSnap = await getDocs(collection(db, 'workspaces', 'default', 'ordens_bancarias_store'));
-      await Promise.all(obSnap.docs.map((c) => deleteDoc(c.ref)));
-
-      // 3. Reset workspace metadata to totalFiles: 0
       const metaRef = doc(db, 'workspaces', 'default');
       const nowIso = new Date().toISOString();
       await setDoc(
@@ -814,10 +664,16 @@ class CloudSyncService {
           lastSyncAt: nowIso,
           totalFiles: 0,
           version: Date.now(),
+          metricsJson: null,
+          filesSummaryJson: null,
+          compactOBsJson: null,
+          alertsJson: null,
+          paraPublicarJson: null,
         },
         { merge: true }
       );
 
+      this.lastPulledData = null;
       this.updateState({
         remoteFilesCount: 0,
         lastSyncAt: new Date(),

@@ -4,6 +4,7 @@ import { ToastAlert, FileData } from '../types';
 import { toastAlertService } from '../utils/toastAlertService';
 import { formatBRL } from '../utils/excelParser';
 import { OrdemBancariaItem } from '../utils/ordemBancariaParser';
+import { isAdmin } from '../utils/authService';
 
 interface ModalHistoricoNotificacoesProps {
   isOpen: boolean;
@@ -246,54 +247,56 @@ export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProp
             </button>
           </div>
 
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => {
-                toastAlertService.resetBaseline();
-                setAllAlerts([]);
-                setSyncFeedback('Base de comparação redefinida.');
-                setTimeout(() => setSyncFeedback(null), 2500);
-              }}
-              className="text-[11px] text-slate-400 hover:text-slate-700 font-medium transition cursor-pointer"
-              title="Redefinir base para iniciar novo ciclo de comparação"
-            >
-              Redefinir Base
-            </button>
+          {isAdmin() && (
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  toastAlertService.resetBaseline();
+                  setAllAlerts([]);
+                  setSyncFeedback('Base de comparação redefinida.');
+                  setTimeout(() => setSyncFeedback(null), 2500);
+                }}
+                className="text-[11px] text-slate-400 hover:text-slate-700 font-medium transition cursor-pointer"
+                title="Redefinir base para iniciar novo ciclo de comparação"
+              >
+                Redefinir Base
+              </button>
 
-            {allAlerts.length > 0 && (
-              confirmClear ? (
-                <div className="flex items-center gap-1.5 animate-in fade-in duration-100">
-                  <span className="text-[11px] text-rose-700 font-semibold">Limpar tudo?</span>
+              {allAlerts.length > 0 && (
+                confirmClear ? (
+                  <div className="flex items-center gap-1.5 animate-in fade-in duration-100">
+                    <span className="text-[11px] text-rose-700 font-semibold">Limpar tudo?</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        toastAlertService.clearAlertsHistory();
+                        setConfirmClear(false);
+                      }}
+                      className="px-2 py-0.5 bg-rose-600 hover:bg-rose-700 text-white rounded text-[10px] font-bold cursor-pointer"
+                    >
+                      Sim
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmClear(false)}
+                      className="px-2 py-0.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded text-[10px] font-bold cursor-pointer"
+                    >
+                      Não
+                    </button>
+                  </div>
+                ) : (
                   <button
                     type="button"
-                    onClick={() => {
-                      toastAlertService.clearAlertsHistory();
-                      setConfirmClear(false);
-                    }}
-                    className="px-2 py-0.5 bg-rose-600 hover:bg-rose-700 text-white rounded text-[10px] font-bold cursor-pointer"
+                    onClick={() => setConfirmClear(true)}
+                    className="text-[11px] text-slate-400 hover:text-rose-700 font-medium transition cursor-pointer"
                   >
-                    Sim
+                    Limpar histórico
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => setConfirmClear(false)}
-                    className="px-2 py-0.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded text-[10px] font-bold cursor-pointer"
-                  >
-                    Não
-                  </button>
-                </div>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => setConfirmClear(true)}
-                  className="text-[11px] text-slate-400 hover:text-rose-700 font-medium transition cursor-pointer"
-                >
-                  Limpar histórico
-                </button>
-              )
-            )}
-          </div>
+                )
+              )}
+            </div>
+          )}
         </div>
 
         {/* List of alerts */}
@@ -421,13 +424,17 @@ export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProp
 
         {/* Footer */}
         <div className="px-5 py-2.5 bg-slate-50 border-t border-slate-200 flex items-center justify-between text-xs text-slate-500">
-          <button
-            onClick={handleResetBaseline}
-            className="text-[11px] text-slate-500 hover:text-rose-600 transition underline cursor-pointer"
-            title="Redefinir base comparativa para que o próximo upload sirva como nova referência"
-          >
-            Redefinir Base Comparativa
-          </button>
+          {isAdmin() ? (
+            <button
+              onClick={handleResetBaseline}
+              className="text-[11px] text-slate-500 hover:text-rose-600 transition underline cursor-pointer"
+              title="Redefinir base comparativa para que o próximo upload sirva como nova referência"
+            >
+              Redefinir Base Comparativa
+            </button>
+          ) : (
+            <span />
+          )}
           <button
             onClick={onClose}
             className="px-3.5 py-1.5 text-xs font-bold text-slate-600 hover:text-slate-900 bg-white hover:bg-slate-200 border border-slate-200 rounded-lg transition cursor-pointer"

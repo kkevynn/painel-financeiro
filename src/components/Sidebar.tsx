@@ -1,11 +1,13 @@
 import React, { useEffect } from 'react';
 import { ShieldCheck, X } from 'lucide-react';
+import { UserRole } from '../utils/authService';
 
 interface SidebarProps {
   isOpen: boolean;
   onClose: () => void;
   activeTab: string;
   setActiveTab: (tab: string) => void;
+  userRole?: UserRole;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -13,6 +15,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onClose,
   activeTab,
   setActiveTab,
+  userRole,
 }) => {
   // Close on Escape key press
   useEffect(() => {
@@ -33,7 +36,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     { id: 'fornecedores_mes', label: 'Fornecedores Atendidos' },
     { id: 'recorrencia', label: 'Fornecedores Recorrentes' },
     { id: 'categorias', label: 'Categorias' },
-    { id: 'importacoes', label: 'Importações' },
+    ...(userRole === 'viewer' ? [] : [{ id: 'importacoes', label: 'Importações' }]),
   ];
 
   return (

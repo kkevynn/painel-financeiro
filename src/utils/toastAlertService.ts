@@ -570,6 +570,15 @@ class ToastAlertManager {
     return [...this.alertsHistory];
   }
 
+  public restoreAlertsHistory(alerts: ToastAlert[]) {
+    if (!Array.isArray(alerts) || alerts.length === 0) return;
+    const existingKeys = new Set(this.alertsHistory.map((t) => getAlertUniqueKey(t)));
+    const newItems = alerts.filter((a) => !existingKeys.has(getAlertUniqueKey(a)));
+    this.alertsHistory = [...newItems, ...this.alertsHistory].slice(0, 1000);
+    this.saveAlertsHistory();
+    this.notify();
+  }
+
   public updateToast(id: string, updates: Partial<ToastAlert>) {
     this.activeToasts = this.activeToasts.map((t) => (t.id === id ? { ...t, ...updates } : t));
     this.alertsHistory = this.alertsHistory.map((t) => (t.id === id ? { ...t, ...updates } : t));
