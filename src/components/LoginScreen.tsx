@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ShieldCheck, Eye, EyeOff, Lock, User, LogIn, AlertCircle } from 'lucide-react';
+import { ShieldCheck, Eye, EyeOff, Lock, User, LogIn, AlertCircle, Loader2, CheckCircle2 } from 'lucide-react';
 import { authService, AuthSession } from '../utils/authService';
 
 interface LoginScreenProps {
@@ -12,9 +12,11 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
   const [showPassword, setShowPassword] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [isSuccess, setIsSuccess] = useState(false);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (isLoading || isSuccess) return;
     setErrorMessage(null);
 
     if (!username.trim()) {
@@ -29,11 +31,16 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
     setIsLoading(true);
     setTimeout(() => {
       const result = authService.login(username, password);
-      setIsLoading(false);
 
       if (result.success && result.session) {
-        onLoginSuccess(result.session);
+        setIsLoading(false);
+        setIsSuccess(true);
+        const session = result.session;
+        setTimeout(() => {
+          onLoginSuccess(session);
+        }, 650);
       } else {
+        setIsLoading(false);
         setErrorMessage(result.error || 'Credenciais inválidas.');
       }
     }, 150);
@@ -46,12 +53,21 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
       <div className="absolute -bottom-32 -right-32 w-96 h-96 bg-teal-500/10 rounded-full blur-3xl pointer-events-none" />
 
       {/* Main Login Card */}
-      <div className="w-full max-w-md bg-[#061d15] border border-emerald-800/60 rounded-3xl p-8 sm:p-10 shadow-2xl relative z-10 text-white">
+      <div
+        className={`w-full max-w-md bg-[#061d15] border border-emerald-800/60 rounded-3xl p-8 sm:p-10 shadow-2xl relative z-10 text-white transition-all duration-500 ${
+          isSuccess
+            ? 'scale-105 opacity-0 delay-150 pointer-events-none'
+            : 'animate-in fade-in zoom-in-95 duration-500'
+        }`}
+      >
         {/* Brand Header */}
         <div className="flex flex-col items-center text-center mb-8">
-          <div className="w-16 h-16 rounded-2xl bg-gradient-to-tr from-emerald-500 to-teal-400 p-0.5 shadow-xl shadow-emerald-500/20 flex items-center justify-center mb-4">
-            <div className="w-full h-full bg-[#061d15] rounded-[14px] flex items-center justify-center">
-              <ShieldCheck className="w-8 h-8 text-emerald-400" />
+          <div className="relative mb-4">
+            <div className="absolute -inset-1.5 rounded-2xl bg-emerald-500/25 blur-lg animate-pulse pointer-events-none" />
+            <div className="relative w-16 h-16 rounded-2xl bg-gradient-to-tr from-emerald-500 to-teal-400 p-0.5 shadow-xl shadow-emerald-500/20 flex items-center justify-center">
+              <div className="w-full h-full bg-[#061d15] rounded-[14px] flex items-center justify-center">
+                <ShieldCheck className="w-8 h-8 text-emerald-400 animate-pulse drop-shadow-[0_0_8px_rgba(52,211,153,0.45)]" />
+              </div>
             </div>
           </div>
           <h1 className="text-xl sm:text-2xl font-black text-white tracking-tight">
@@ -60,9 +76,6 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
           <p className="text-xs text-emerald-300/80 font-medium mt-1">
             SESAP - Secretaria de Estado da Saúde Pública
           </p>
-          <span className="inline-block mt-3 px-3 py-1 rounded-full text-[11px] font-semibold bg-emerald-950/80 text-emerald-300 border border-emerald-800/60">
-            Acesso Restrito ao Sistema
-          </span>
         </div>
 
         {/* Error Feedback */}
@@ -88,7 +101,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
                 type="text"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
-                placeholder="Ex: kevyn ou Usuário"
+                placeholder=""
                 autoComplete="username"
                 className="w-full pl-10 pr-4 py-2.5 bg-[#03100b] border border-emerald-900/80 rounded-xl text-sm text-white placeholder-emerald-600/50 focus:outline-hidden focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 transition"
               />
@@ -126,20 +139,31 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
           {/* Submit Button */}
           <button
             type="submit"
-            disabled={isLoading}
-            className="w-full mt-2 py-3 px-4 bg-emerald-600 hover:bg-emerald-500 active:scale-98 text-white text-sm font-bold rounded-xl transition shadow-lg shadow-emerald-950/40 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
+            disabled={isLoading || isSuccess}
+            className={`w-full mt-2 py-3 px-4 text-white text-sm font-bold rounded-xl transition-all duration-300 flex items-center justify-center gap-2 cursor-pointer ${
+              isSuccess
+                ? 'bg-emerald-500 shadow-lg shadow-emerald-500/40 ring-2 ring-emerald-300/60'
+                : 'bg-emerald-600 hover:bg-emerald-500 active:scale-98 shadow-lg shadow-emerald-950/40 disabled:opacity-60'
+            }`}
           >
-            <LogIn className="w-4 h-4" />
-            <span>{isLoading ? 'Autenticando...' : 'Entrar no Painel'}</span>
+            {isSuccess ? (
+              <>
+                <CheckCircle2 className="w-4 h-4" />
+                <span>Acesso Liberado!</span>
+              </>
+            ) : isLoading ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span>Verificando credenciais...</span>
+              </>
+            ) : (
+              <>
+                <LogIn className="w-4 h-4" />
+                <span>Entrar no Painel</span>
+              </>
+            )}
           </button>
         </form>
-
-        {/* Footer info */}
-        <div className="mt-8 pt-6 border-t border-emerald-900/60 text-center">
-          <p className="text-[11px] text-emerald-400/60 leading-relaxed">
-            Acesso autorizado para Administração e Consulta da Diretoria.
-          </p>
-        </div>
       </div>
     </div>
   );
