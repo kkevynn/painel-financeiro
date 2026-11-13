@@ -10,9 +10,12 @@
 // Production Client ID configured in Google Cloud Console
 export const GOOGLE_CLIENT_ID = '866738622063-trtjudvl95g2c3lu0fhga9q79nn4eol6.apps.googleusercontent.com';
 
-// Least-privilege read-only scopes
+export const DRIVE_DATABASE_FOLDER_NAME = 'Painel_Financeiro_SESAP_Dados';
+
+// Scopes supporting spreadsheet reading and dedicated app database folder storage
 export const GOOGLE_DRIVE_SCOPES = [
   'https://www.googleapis.com/auth/drive.readonly',
+  'https://www.googleapis.com/auth/drive.file',
   'https://www.googleapis.com/auth/spreadsheets.readonly',
 ].join(' ');
 
@@ -74,6 +77,7 @@ class GoogleDriveService {
   private tokenClient: TokenClient | null = null;
   private subscribers: Set<Subscriber> = new Set();
   private pollingTimer: any = null;
+  private cachedDatabaseFolderId: string | null = null;
   private onNewFileCallback: ((file: File, isAuto: boolean) => Promise<void> | void) | null = null;
 
   // 20 minutes polling interval
@@ -322,6 +326,7 @@ class GoogleDriveService {
     this.stopAutoPolling();
     this.accessToken = null;
     this.tokenExpiresAt = 0;
+    this.cachedDatabaseFolderId = null;
     this.setState({
       isConnected: false,
       status: 'idle',
@@ -332,6 +337,188 @@ class GoogleDriveService {
 
   public isConnected(): boolean {
     return this.state.isConnected && !!this.accessToken && Date.now() < this.tokenExpiresAt;
+  }
+
+  /**
+   * Ensures the dedicated database folder 'Painel_Financeiro_SESAP_Dados' exists in Google Drive,
+   * creating it automatically if not found, and returns its folder ID.
+   */
+  public async ensureDatabaseFolder(): Promise<string> {
+    if (!this.accessToken) {
+      throw new Error('Usuário não autenticado no Google Drive.');
+    }
+
+    if (Date.now() >= this.tokenExpiresAt) {
+      await this.connectGoogleDrive();
+      if (!this.accessToken) {
+        throw new Error('Sessão do Google Drive expirada.');
+      }
+    }
+
+    if (this.cachedDatabaseFolderId) {
+      return this.cachedDatabaseFolderId;
+    }
+
+    const searchUrl = new URL('https://www.googleapis.com/drive/v3/files');
+    searchUrl.searchParams.set(
+      'q',
+      `mimeType='application/vnd.google-apps.folder' and name='${DRIVE_DATABASE_FOLDER_NAME}' and trashed=false`
+    );
+    searchUrl.searchParams.set('spaces', 'drive');
+    searchUrl.searchParams.set('fields', 'files(id, name)');
+
+    const searchRes = await fetch(searchUrl.toString(), {
+      headers: { Authorization: `Bearer ${this.accessToken}` },
+    });
+
+    if (!searchRes.ok) {
+      const errJson = await searchRes.json().catch(() => ({}));
+      throw new Error(errJson.error?.message || `Erro ao buscar pasta no Drive (${searchRes.status})`);
+    }
+
+    const searchData = await searchRes.json();
+    if (Array.isArray(searchData.files) && searchData.files.length > 0) {
+      this.cachedDatabaseFolderId = searchData.files[0].id;
+      return this.cachedDatabaseFolderId!;
+    }
+
+    // Create dedicated database folder
+    const createRes = await fetch('https://www.googleapis.com/drive/v3/files?fields=id,name', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: DRIVE_DATABASE_FOLDER_NAME,
+        mimeType: 'application/vnd.google-apps.folder',
+      }),
+    });
+
+    if (!createRes.ok) {
+      const errJson = await createRes.json().catch(() => ({}));
+      throw new Error(errJson.error?.message || `Erro ao criar pasta "${DRIVE_DATABASE_FOLDER_NAME}" (${createRes.status})`);
+    }
+
+    const folderData = await createRes.json();
+    this.cachedDatabaseFolderId = folderData.id;
+    return this.cachedDatabaseFolderId!;
+  }
+
+  /**
+   * Saves (creates or updates) a JSON state file directly inside the dedicated Painel_Financeiro_SESAP_Dados folder.
+   */
+  public async saveStateToDriveFolder(fileName: string, jsonContent: string): Promise<boolean> {
+    try {
+      const folderId = await this.ensureDatabaseFolder();
+      const escapedName = fileName.replace(/'/g, "\\'");
+
+      const findUrl = new URL('https://www.googleapis.com/drive/v3/files');
+      findUrl.searchParams.set('q', `name='${escapedName}' and '${folderId}' in parents and trashed=false`);
+      findUrl.searchParams.set('fields', 'files(id, name)');
+
+      const findRes = await fetch(findUrl.toString(), {
+        headers: { Authorization: `Bearer ${this.accessToken}` },
+      });
+
+      if (!findRes.ok) {
+        throw new Error(`Erro ao verificar arquivo "${fileName}" na pasta (${findRes.status})`);
+      }
+
+      const findData = await findRes.json();
+      const existingFile = Array.isArray(findData.files) && findData.files.length > 0 ? findData.files[0] : null;
+
+      if (existingFile?.id) {
+        // Update existing file content inside dedicated folder
+        const patchRes = await fetch(
+          `https://www.googleapis.com/upload/drive/v3/files/${existingFile.id}?uploadType=media`,
+          {
+            method: 'PATCH',
+            headers: {
+              Authorization: `Bearer ${this.accessToken}`,
+              'Content-Type': 'application/json',
+            },
+            body: jsonContent,
+          }
+        );
+        if (!patchRes.ok) {
+          throw new Error(`Erro ao atualizar "${fileName}" no Google Drive (${patchRes.status})`);
+        }
+        return true;
+      }
+
+      // Create new file strictly inside parents: [folderId]
+      const metadata = {
+        name: fileName,
+        mimeType: 'application/json',
+        parents: [folderId],
+      };
+
+      const boundary = `-------sesap_drive_boundary_${Date.now()}`;
+      const multipartBody =
+        `--${boundary}\r\n` +
+        `Content-Type: application/json; charset=UTF-8\r\n\r\n` +
+        `${JSON.stringify(metadata)}\r\n` +
+        `--${boundary}\r\n` +
+        `Content-Type: application/json; charset=UTF-8\r\n\r\n` +
+        `${jsonContent}\r\n` +
+        `--${boundary}--`;
+
+      const createRes = await fetch(
+        'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name',
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${this.accessToken}`,
+            'Content-Type': `multipart/related; boundary="${boundary}"`,
+          },
+          body: multipartBody,
+        }
+      );
+
+      if (!createRes.ok) {
+        throw new Error(`Erro ao criar "${fileName}" na pasta do Drive (${createRes.status})`);
+      }
+
+      return true;
+    } catch (err) {
+      console.warn('[GoogleDriveService] saveStateToDriveFolder falhou:', err);
+      return false;
+    }
+  }
+
+  /**
+   * Loads a JSON state file from inside the dedicated Painel_Financeiro_SESAP_Dados folder.
+   */
+  public async loadStateFromDriveFolder(fileName: string): Promise<any | null> {
+    try {
+      const folderId = await this.ensureDatabaseFolder();
+      const escapedName = fileName.replace(/'/g, "\\'");
+
+      const findUrl = new URL('https://www.googleapis.com/drive/v3/files');
+      findUrl.searchParams.set('q', `name='${escapedName}' and '${folderId}' in parents and trashed=false`);
+      findUrl.searchParams.set('orderBy', 'modifiedTime desc');
+      findUrl.searchParams.set('fields', 'files(id, name, modifiedTime)');
+
+      const findRes = await fetch(findUrl.toString(), {
+        headers: { Authorization: `Bearer ${this.accessToken}` },
+      });
+
+      if (!findRes.ok) return null;
+      const findData = await findRes.json();
+      const targetFile = Array.isArray(findData.files) && findData.files.length > 0 ? findData.files[0] : null;
+      if (!targetFile?.id) return null;
+
+      const mediaRes = await fetch(`https://www.googleapis.com/drive/v3/files/${targetFile.id}?alt=media`, {
+        headers: { Authorization: `Bearer ${this.accessToken}` },
+      });
+      if (!mediaRes.ok) return null;
+
+      return await mediaRes.json();
+    } catch (err) {
+      console.warn('[GoogleDriveService] loadStateFromDriveFolder falhou:', err);
+      return null;
+    }
   }
 
   /**

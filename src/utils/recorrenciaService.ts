@@ -1,4 +1,4 @@
-import { FileData, StageKey, RecurringSupplier, RecurringSupplierDetail, ManualRecurringSupplierEntry } from '../types';
+import { FileData, StageKey, RecurringSupplier, RecurringSupplierDetail, ManualRecurringSupplierEntry, ConsolidatedSupplier } from '../types';
 import {
   parseFavorecidoField,
   parseCurrencyValue,
@@ -235,11 +235,12 @@ export interface ManualRecorrenciaSummary {
  */
 export function calculateManualRecurringMetrics(
   files: FileData[],
-  manualList: ManualRecurringSupplierEntry[]
+  manualList: ManualRecurringSupplierEntry[],
+  consolidatedSuppliers?: ConsolidatedSupplier[]
 ): ManualRecorrenciaSummary {
   const list = manualList.length > 0 ? manualList : getManualRecurringSuppliers();
 
-  if (list.length === 0 || files.length === 0) {
+  if (list.length === 0 || (files.length === 0 && (!consolidatedSuppliers || consolidatedSuppliers.length === 0))) {
     return {
       totalRegistered: list.length,
       totalWithTransactions: 0,
@@ -433,8 +434,39 @@ export function calculateManualRecurringMetrics(
       });
     });
 
-    const totalCount = matchedRows.length;
-    const stagesCount = stagesSet.size;
+    let totalCount = matchedRows.length;
+    let stagesCount = stagesSet.size;
+
+    if (totalValue === 0 && Array.isArray(consolidatedSuppliers) && consolidatedSuppliers.length > 0) {
+      const matchedConsolidated = consolidatedSuppliers.find((cs) => {
+        const csDigits = (cs.cnpj || '').replace(/\D/g, '');
+        if (padEntryCnpj && csDigits.length >= 11) {
+          if (csDigits.padStart(14, '0') === padEntryCnpj) return true;
+        }
+        if (normEntryName && normEntryName !== 'nao informado') {
+          const normCsName = norm(cs.name);
+          if (normCsName === normEntryName) return true;
+          if (normCsName.includes(normEntryName) || normEntryName.includes(normCsName)) return true;
+        }
+        return false;
+      });
+
+      if (matchedConsolidated && (matchedConsolidated.totalValue || 0) > 0) {
+        basePpsValue = matchedConsolidated.basePpsValue ?? matchedConsolidated.ppProntasValue ?? 0;
+        ppProntasValue = matchedConsolidated.ppProntasValue ?? matchedConsolidated.basePpsValue ?? 0;
+        liqObedeceValue = matchedConsolidated.liqObedeceValue || 0;
+        liqNaoObedeceValue = matchedConsolidated.liqNaoObedeceValue || 0;
+        outrosValue = matchedConsolidated.outrosValue || 0;
+        totalValue = matchedConsolidated.totalValue || 0;
+        totalCount = matchedConsolidated.totalCount || 0;
+        stagesCount =
+          (basePpsValue > 0 || ppProntasValue > 0 ? 1 : 0) +
+          (liqObedeceValue > 0 ? 1 : 0) +
+          (liqNaoObedeceValue > 0 ? 1 : 0) +
+          (outrosValue > 0 ? 1 : 0);
+      }
+    }
+
     const isMultiStage = stagesCount > 1;
 
     let recurrenceLevel: 'alta' | 'media' | 'moderada' = 'moderada';

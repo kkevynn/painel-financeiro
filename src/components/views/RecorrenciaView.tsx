@@ -97,16 +97,22 @@ export const RecorrenciaView: React.FC<RecorrenciaViewProps> = ({ metrics, files
     }, 3000);
   };
 
-  // Load manual list on mount
+  // Load manual list on mount and listen to cloud sync updates
   useEffect(() => {
-    const list = getManualRecurringSuppliers();
-    setManualList(list);
+    const syncList = () => {
+      setManualList(getManualRecurringSuppliers());
+    };
+    syncList();
+    window.addEventListener('finance_recurring_changed', syncList);
+    return () => {
+      window.removeEventListener('finance_recurring_changed', syncList);
+    };
   }, []);
 
   // Compute calculated metrics
   const summary = useMemo(() => {
-    return calculateManualRecurringMetrics(files, manualList);
-  }, [files, manualList]);
+    return calculateManualRecurringMetrics(files, manualList, metrics.consolidatedSuppliers);
+  }, [files, manualList, metrics.consolidatedSuppliers]);
 
   // List of all suppliers found in files for easy selection in Add modal
   const availableCreditorsFromFiles = useMemo(() => {

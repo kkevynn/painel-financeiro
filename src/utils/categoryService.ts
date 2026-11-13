@@ -106,14 +106,17 @@ export function subscribeToCategories(callback: () => void): () => void {
     callback();
   };
   window.addEventListener(CATEGORY_SYNC_EVENT, handler);
+  window.addEventListener('sigecon_categories_changed', handler);
   return () => {
     window.removeEventListener(CATEGORY_SYNC_EVENT, handler);
+    window.removeEventListener('sigecon_categories_changed', handler);
   };
 }
 
 export function notifyCategoriesChanged() {
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent(CATEGORY_SYNC_EVENT));
+    window.dispatchEvent(new Event('sigecon_categories_changed'));
   }
 }
 
@@ -193,7 +196,8 @@ let lastCategoriesRaw: string | null = null;
 
 export function getCategories(): CategoryDefinition[] {
   try {
-    const stored = localStorage.getItem(CATEGORIES_STORAGE_KEY);
+    const stored =
+      localStorage.getItem(CATEGORIES_STORAGE_KEY) || localStorage.getItem('sigecon_categories_v1');
     if (stored === lastCategoriesRaw && cachedCategories !== null) {
       return cachedCategories;
     }

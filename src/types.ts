@@ -151,6 +151,8 @@ export interface FileData {
   detectedDataCol?: string;
   stage?: StageKey;
   totalCount?: number;
+  rowCount?: number;
+  isSummaryOnly?: boolean;
 }
 
 export interface ColumnMappingConfig {

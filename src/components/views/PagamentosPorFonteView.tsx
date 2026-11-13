@@ -24,6 +24,7 @@ import {
   parseListarOrdemBancariaMatrixAsync,
   isObFileName,
   extractOrdensBancariasFromFileData,
+  isValidFonteRecursoCode,
 } from '../../utils/ordemBancariaParser';
 import { readSpreadsheetAsMatrix, formatBRL, parseCurrencyValue } from '../../utils/excelParser';
 import { FileData } from '../../types';
@@ -228,7 +229,10 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
       const favorecidoName = rawName || 'NÃO INFORMADO';
       const favorecidoCnpj = String(raw.favorecidoCnpj ?? '').trim() || 'N/I';
 
-      const fonteRecurso = String(raw.fonteRecurso ?? '').trim() || 'Fonte Não Identificada';
+      const rawFonteStr = String(raw.fonteRecurso ?? '').trim();
+      const fonteRecurso = isValidFonteRecursoCode(rawFonteStr)
+        ? rawFonteStr
+        : 'Fonte Não Identificada';
       const mesAnoKey = String(raw.mesAnoKey ?? '').trim();
       const mesAnoLabel = String(raw.mesAnoLabel ?? '').trim() || 'Sem Data';
 

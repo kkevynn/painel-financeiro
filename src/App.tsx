@@ -319,9 +319,29 @@ export function App() {
           const ts = stored?.lastProcessedAt ? new Date(stored.lastProcessedAt) : new Date();
           setLastProcessedAt(ts);
           try {
-            const processed = processUploadedFiles(realFiles);
-            const enriched = applyEnrichment(processed, obStored?.items || null);
-            setMetrics(enriched);
+            const hasPartialFiles = realFiles.some(
+              (f: any) =>
+                f.isSummaryOnly === true ||
+                (typeof f.rowCount === 'number' && (f.rows?.length || 0) < f.rowCount)
+            );
+            let restoredMetricsFromCache = false;
+            if (hasPartialFiles) {
+              try {
+                const cachedRaw = localStorage.getItem('painel_fes_metrics_cache_v1');
+                if (cachedRaw) {
+                  const cached = JSON.parse(cachedRaw);
+                  if (cached?.metrics?.isProcessed) {
+                    setMetrics(cached.metrics);
+                    restoredMetricsFromCache = true;
+                  }
+                }
+              } catch (_) {}
+            }
+            if (!restoredMetricsFromCache) {
+              const processed = processUploadedFiles(realFiles);
+              const enriched = applyEnrichment(processed, obStored?.items || null);
+              setMetrics(enriched);
+            }
           } catch (procErr) {
             console.error('Erro ao reprocessar dados salvos:', procErr);
           }
@@ -343,8 +363,27 @@ export function App() {
             mlInferenceService.processFilesForInference([], obStored.items);
           } catch (_) {}
         } else {
-          setFiles([]);
-          setMetrics(initialMetrics);
+          let restoredFromCache = false;
+          try {
+            const cachedRaw = localStorage.getItem('painel_fes_metrics_cache_v1');
+            if (cachedRaw) {
+              const cached = JSON.parse(cachedRaw);
+              if (cached?.metrics?.isProcessed) {
+                setMetrics(cached.metrics);
+                if (cached.lastSyncAt) {
+                  setLastProcessedAt(new Date(cached.lastSyncAt));
+                }
+                if (cached.obFileName) {
+                  setOrdensBancariasFileName(cached.obFileName);
+                }
+                restoredFromCache = true;
+              }
+            }
+          } catch (_) {}
+          if (!restoredFromCache) {
+            setFiles([]);
+            setMetrics(initialMetrics);
+          }
         }
       } catch (err) {
         console.error('Erro ao carregar do armazenamento:', err);
@@ -586,7 +625,7 @@ export function App() {
     return () => {
       unsubscribe();
     };
-  }, [applyEnrichment, ordensBancariasList]);
+  }, [applyEnrichment]);
 
   const handleConnectDrive = async () => {
     try {
@@ -710,9 +749,11 @@ export function App() {
     const enriched = applyEnrichment(newMetrics, targetOBs);
     setMetrics(enriched);
     triggerAlertAnalysis(updated, targetOBs);
-    cloudSyncService.pushToCloud(updated, targetOBs, ordensBancariasFileName).catch((e) => {
-      console.warn('Auto-save na nuvem alteração de etapa:', e);
-    });
+    if (session?.role === 'admin') {
+      cloudSyncService.pushToCloud(updated, targetOBs, ordensBancariasFileName, enriched).catch((e) => {
+        console.warn('Auto-save na nuvem alteração de etapa:', e);
+      });
+    }
   };
 
   // Remove file action
@@ -810,7 +851,7 @@ export function App() {
     }
 
     setIsProcessing(true);
-    setProcessingMessage('Salvando alterações...');
+    setProcessingMessage('Salvando alterações e sincronizando com o Google Drive...');
     try {
       const now = new Date();
       setLastProcessedAt(now);
@@ -825,17 +866,26 @@ export function App() {
       toastAlertService.analyzeFileTransitions(files, ordensBancariasList);
       mlInferenceService.processFilesForInference(files, ordensBancariasList);
 
-      toastAlertService.addToast({
-        tipo: 'sucesso',
-        titulo: 'Alterações Salvas',
-        mensagem: 'Dados gravados localmente e sincronizados.',
-      });
+      // 3. Aguarda sincronização completa no Google Drive antes de notificar sucesso
+      const ok = await cloudSyncService.pushToCloud(
+        files,
+        ordensBancariasList,
+        ordensBancariasFileName,
+        enriched
+      );
 
-      // 3. Sincronização na nuvem protegida em 1 documento consolidado
-      try {
-        await cloudSyncService.pushToCloud(files, ordensBancariasList, ordensBancariasFileName, enriched);
-      } catch (cloudErr) {
-        console.warn('Sincronização na nuvem em segundo plano:', cloudErr);
+      if (ok) {
+        toastAlertService.addToast({
+          tipo: 'sucesso',
+          titulo: 'Salvo e Sincronizado!',
+          mensagem: 'Dados gravados localmente e sincronizados com o Google Drive.',
+        });
+      } else {
+        toastAlertService.addToast({
+          tipo: 'aviso',
+          titulo: 'Salvo localmente',
+          mensagem: 'Dados gravados no navegador, mas não foi possível confirmar o envio ao Google Drive.',
+        });
       }
 
       // Breve pausa para visualização da confirmação
@@ -863,6 +913,9 @@ export function App() {
       setMetrics(initialMetrics);
       setLastProcessedAt(null);
       await clearAppState();
+      try {
+        localStorage.removeItem('painel_fes_metrics_cache_v1');
+      } catch (_) {}
       await cloudSyncService.clearCloudWorkspace();
       await new Promise((res) => setTimeout(res, 350));
     } finally {
@@ -945,7 +998,22 @@ export function App() {
 
   // Se não houver sessão ativa, renderiza tela institucional de login
   if (!session) {
-    return <LoginScreen onLoginSuccess={(newSession) => setSession(newSession)} />;
+    return (
+      <LoginScreen
+        onLoginSuccess={async (newSession) => {
+          setSession(newSession);
+          setIsProcessing(true);
+          setProcessingMessage('Carregando dados atualizados...');
+          try {
+            await cloudSyncService.pullFromCloud(false);
+          } catch (err) {
+            console.warn('Erro ao sincronizar dados após login:', err);
+          } finally {
+            setIsProcessing(false);
+          }
+        }}
+      />
+    );
   }
 
   return (

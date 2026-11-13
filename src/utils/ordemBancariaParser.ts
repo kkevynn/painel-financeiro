@@ -68,18 +68,30 @@ export function isFonte600OuDerivada(fonteRaw: any): boolean {
 }
 
 /**
- * Searches a row for any cell that looks like a Fonte de Recurso
+ * Strictly validates whether a cell value represents a valid Fonte de Recursos code
+ * (rejecting monetary values like 1.500,00 or 1.620,37).
+ */
+export function isValidFonteRecursoCode(val: any): boolean {
+  if (val === null || val === undefined) return false;
+  const s = String(val).trim().toUpperCase();
+  if (!s || s === '-' || s === '0') return false;
+  if (/\d+,\d{2}$/.test(s) || /^\d+\.\d{1,2}$/.test(s) || s.includes('R$')) return false;
+  if (/^[012]\.\d\.\d{2}(?:\.\d{6})?$/.test(s)) return true;
+  if (/^(?:0500|0600|1500|1600|0100|1000|600|500|F600|F500)$/i.test(s)) return true;
+  if (/^FONTE\s+[0-9.]+$/i.test(s)) return true;
+  return false;
+}
+
+/**
+ * Searches a row for any cell that is a strictly valid Fonte de Recurso code
  */
 export function findFonteRecursoInRow(row: any[]): string {
   if (!Array.isArray(row)) return '';
   for (const cell of row) {
     if (cell === null || cell === undefined) continue;
-    const s = String(cell).trim().toUpperCase();
-    if (!s || s === '-' || s === '0') continue;
-    if (isFonte600OuDerivada(s)) return s;
-    if (/\d\s*\.\s*\d\s*\.\s*\d{2}\s*\.\s*\d{6}/.test(s)) return s;
-    if (/^[012]\s*\.\s*[567]\b/.test(s)) return s;
-    if (/^FONTE\s+\d+/i.test(s) || /^F\d+/i.test(s)) return s;
+    if (isValidFonteRecursoCode(cell)) {
+      return String(cell).trim().toUpperCase();
+    }
   }
   return '';
 }
@@ -147,15 +159,12 @@ export function parseDateToMonthInfo(rawDate: any): {
 
   const str = String(rawDate).trim();
 
-  // Pattern DD/MM/YYYY or DD-MM-YYYY or DD/MM/YY
-  const brMatch = str.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
-  if (brMatch) {
-    const day = parseInt(brMatch[1], 10);
-    const month = parseInt(brMatch[2], 10);
-    let year = parseInt(brMatch[3], 10);
-    if (year < 100) {
-      year = year >= 50 ? 1900 + year : 2000 + year;
-    }
+  // Pattern YYYY-MM-DD or YYYY/MM/DD (tested FIRST to avoid matching DD-MM-YY on ISO strings)
+  const isoMatch = str.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+  if (isoMatch) {
+    const year = parseInt(isoMatch[1], 10);
+    const month = parseInt(isoMatch[2], 10);
+    const day = parseInt(isoMatch[3], 10);
     if (month >= 1 && month <= 12 && year >= 2000 && year <= 2100) {
       const monthStr = String(month).padStart(2, '0');
       const dayStr = String(day).padStart(2, '0');
@@ -165,12 +174,15 @@ export function parseDateToMonthInfo(rawDate: any): {
     }
   }
 
-  // Pattern YYYY-MM-DD or YYYY/MM/DD
-  const isoMatch = str.match(/(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
-  if (isoMatch) {
-    const year = parseInt(isoMatch[1], 10);
-    const month = parseInt(isoMatch[2], 10);
-    const day = parseInt(isoMatch[3], 10);
+  // Pattern DD/MM/YYYY or DD-MM-YYYY or DD/MM/YY
+  const brMatch = str.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
+  if (brMatch) {
+    const day = parseInt(brMatch[1], 10);
+    const month = parseInt(brMatch[2], 10);
+    let year = parseInt(brMatch[3], 10);
+    if (year < 100) {
+      year = year >= 50 ? 1900 + year : 2000 + year;
+    }
     if (month >= 1 && month <= 12 && year >= 2000 && year <= 2100) {
       const monthStr = String(month).padStart(2, '0');
       const dayStr = String(day).padStart(2, '0');
@@ -494,9 +506,8 @@ export function parseListarOrdemBancariaMatrix(matrix: any[][]): OrdemBancariaIt
       }
     }
 
-    // Capture a linha de baixo: const row2 = matrix[i + 1]. Verifique se ela existe.
+    // Verifique fonteRecurso, favorecidoRaw e pp já na row1
     let pp = '';
-    // Check row1 for PP as well
     for (let c = 0; c < row1.length; c++) {
       const cell = row1[c];
       if (cell !== null && cell !== undefined) {
@@ -509,12 +520,42 @@ export function parseListarOrdemBancariaMatrix(matrix: any[][]): OrdemBancariaIt
       }
     }
 
-    let fonteRecurso = '';
+    let fonteRecurso = findFonteRecursoInRow(row1);
     let favorecidoRaw = '';
 
+    for (let c = 0; c < row1.length; c++) {
+      const cell = row1[c];
+      if (cell === null || cell === undefined) continue;
+      const s = String(cell).trim();
+      if (/\d{2}\.\d{3}\.\d{3}\/\d{4}\-\d{2}/.test(s)) {
+        favorecidoRaw = s;
+        break;
+      }
+    }
+    if (!favorecidoRaw) {
+      for (let c = 0; c < row1.length; c++) {
+        const cell = row1[c];
+        if (cell === null || cell === undefined) continue;
+        const s = String(cell).trim();
+        if (/\b\d{4}OB\d+\b/i.test(s) || /\b\d{4}PP\d+\b/i.test(s)) continue;
+        if (/\b\d{2}\/\d{2}\/\d{4}\b/.test(s)) continue;
+        if (/\b(CB|RJ|PPCB|PPNC|PPRJ|AO|C|PAGA|LIQUIDADA)\b/i.test(s) && s.length <= 10) continue;
+        if (/\b\d{3}\s+\d{4,5}[-\s]\w\b/i.test(s) || /\b\d{3}\s\d{5}\-\d\b/i.test(s)) continue;
+        if (isValidFonteRecursoCode(s)) continue;
+        if (s.length > 10 && /[A-Za-z]/.test(s)) {
+          favorecidoRaw = s;
+          break;
+        }
+      }
+    }
+
+    // Só avança para row2 (i++) se a row1 não tiver fonte/favorecido E a row2 não contiver outra OB
     const row2 = i + 1 < matrix.length ? matrix[i + 1] : null;
-    if (row2 && Array.isArray(row2)) {
-      // Extraia da row2 se não achou na row1:
+    const row2HasOB =
+      Array.isArray(row2) &&
+      row2.some((cell) => cell !== null && cell !== undefined && /\b\d{4}OB\d+\b/i.test(String(cell)));
+
+    if (row2 && Array.isArray(row2) && (!fonteRecurso || !favorecidoRaw) && !row2HasOB) {
       if (!pp) {
         for (let c = 0; c < row2.length; c++) {
           const cell = row2[c];
@@ -529,52 +570,32 @@ export function parseListarOrdemBancariaMatrix(matrix: any[][]): OrdemBancariaIt
         }
       }
 
-      // Fonte de Recurso: A string que contenha pontos no formato de fonte (ex: .6. ou .5. ou match /\b\d\.\s?\d\.\d{2}\.\d{6}\b/).
-      for (let c = 0; c < row2.length; c++) {
-        const cell = row2[c];
-        if (cell === null || cell === undefined) continue;
-        const s = String(cell).trim();
-        if (!s || s === '-' || s === '0') continue;
-        if (/\b\d\.\s?\d\.\d{2}\.\d{6}\b/.test(s)) {
-          fonteRecurso = s;
-          break;
-        }
-        if (isFonte600OuDerivada(s)) {
-          fonteRecurso = s;
-          break;
-        }
-        if ((s.includes('.6.') || s.includes('.5.')) && s.includes('.')) {
-          fonteRecurso = s;
-          break;
-        }
-      }
       if (!fonteRecurso) {
-        const f = findFonteRecursoInRow(row2);
-        if (f) fonteRecurso = f;
+        fonteRecurso = findFonteRecursoInRow(row2);
       }
 
-      // Favorecido: Procure na row2 uma string que contenha um CNPJ /\d{2}\.\d{3}\.\d{3}\/\d{4}\-\d{2}/
-      // OU que seja um texto com mais de 10 caracteres, que contenha letras, e que NÃO seja um Domicílio Bancário (rejeite se der match em /\b\d{3}\s\d{5}\-\d\b/).
-      for (let c = 0; c < row2.length; c++) {
-        const cell = row2[c];
-        if (cell === null || cell === undefined) continue;
-        const s = String(cell).trim();
-        if (/\d{2}\.\d{3}\.\d{3}\/\d{4}\-\d{2}/.test(s)) {
-          favorecidoRaw = s;
-          break;
-        }
-      }
       if (!favorecidoRaw) {
         for (let c = 0; c < row2.length; c++) {
           const cell = row2[c];
           if (cell === null || cell === undefined) continue;
           const s = String(cell).trim();
-          if (/\b\d{3}\s+\d{4,5}[-\s]\w\b/i.test(s) || /\b\d{3}\s\d{5}\-\d\b/i.test(s)) continue;
-          if (/\b\d{4}PP\d+\b/i.test(s)) continue;
-          if (/\b\d\.\s?\d\.\d{2}\.\d{6}\b/.test(s) || isFonte600OuDerivada(s)) continue;
-          if (s.length > 10 && /[A-Za-z]/.test(s)) {
+          if (/\d{2}\.\d{3}\.\d{3}\/\d{4}\-\d{2}/.test(s)) {
             favorecidoRaw = s;
             break;
+          }
+        }
+        if (!favorecidoRaw) {
+          for (let c = 0; c < row2.length; c++) {
+            const cell = row2[c];
+            if (cell === null || cell === undefined) continue;
+            const s = String(cell).trim();
+            if (/\b\d{3}\s+\d{4,5}[-\s]\w\b/i.test(s) || /\b\d{3}\s\d{5}\-\d\b/i.test(s)) continue;
+            if (/\b\d{4}PP\d+\b/i.test(s)) continue;
+            if (isValidFonteRecursoCode(s)) continue;
+            if (s.length > 10 && /[A-Za-z]/.test(s)) {
+              favorecidoRaw = s;
+              break;
+            }
           }
         }
       }
@@ -589,6 +610,7 @@ export function parseListarOrdemBancariaMatrix(matrix: any[][]): OrdemBancariaIt
           if (/\b\d{4}PP\d+\b/i.test(s)) continue;
           if (/\b\d{3}\s+\d{4,5}/.test(s) || /^\d{4,}[-\s]\w$/.test(s)) continue;
           if (/\d{2}\.\d{3}\.\d{3}\/\d{4}\-\d{2}/.test(s)) continue;
+          if (isValidFonteRecursoCode(s)) continue;
           if (typeof cell === 'number') {
             if (cell > 0 && cell < 1e11 && cell > valor) valor = cell;
             continue;
@@ -598,7 +620,7 @@ export function parseListarOrdemBancariaMatrix(matrix: any[][]): OrdemBancariaIt
         }
       }
 
-      // CRÍTICO: Faça i++ no final do escopo deste if para "pular" a row2 no loop principal e não lê-la de novo por acidente.
+      // Avança i++ para pular a row2 consumida no bloco
       i++;
     }
 
@@ -722,8 +744,8 @@ export async function parseListarOrdemBancariaMatrixAsync(
       }
     }
 
+    // Verifique fonteRecurso, favorecidoRaw e pp já na row1
     let pp = '';
-    // Check row1 for PP as well
     for (let c = 0; c < row1.length; c++) {
       const cell = row1[c];
       if (cell !== null && cell !== undefined) {
@@ -736,11 +758,43 @@ export async function parseListarOrdemBancariaMatrixAsync(
       }
     }
 
-    let fonteRecurso = '';
+    let fonteRecurso = findFonteRecursoInRow(row1);
     let favorecidoRaw = '';
 
+    for (let c = 0; c < row1.length; c++) {
+      const cell = row1[c];
+      if (cell !== null && cell !== undefined) {
+        const s = String(cell).trim();
+        if (/\d{2}\.\d{3}\.\d{3}\/\d{4}\-\d{2}/.test(s)) {
+          favorecidoRaw = s;
+          break;
+        }
+      }
+    }
+    if (!favorecidoRaw) {
+      for (let c = 0; c < row1.length; c++) {
+        const cell = row1[c];
+        if (cell === null || cell === undefined) continue;
+        const s = String(cell).trim();
+        if (/\b\d{4}OB\d+\b/i.test(s) || /\b\d{4}PP\d+\b/i.test(s)) continue;
+        if (/\b\d{2}\/\d{2}\/\d{4}\b/.test(s)) continue;
+        if (/\b(CB|RJ|PPCB|PPNC|PPRJ|AO|C|PAGA|LIQUIDADA)\b/i.test(s) && s.length <= 10) continue;
+        if (/\b\d{3}\s+\d{4,5}[-\s]\w\b/i.test(s) || /\b\d{3}\s\d{5}\-\d\b/i.test(s)) continue;
+        if (isValidFonteRecursoCode(s)) continue;
+        if (s.length > 10 && /[A-Za-z]/.test(s)) {
+          favorecidoRaw = s;
+          break;
+        }
+      }
+    }
+
+    // Só avança para row2 (i++) se a row1 não tiver fonte/favorecido E a row2 não contiver outra OB
     const row2 = i + 1 < total ? matrix[i + 1] : null;
-    if (row2 && Array.isArray(row2)) {
+    const row2HasOB =
+      Array.isArray(row2) &&
+      row2.some((cell) => cell !== null && cell !== undefined && /\b\d{4}OB\d+\b/i.test(String(cell)));
+
+    if (row2 && Array.isArray(row2) && (!fonteRecurso || !favorecidoRaw) && !row2HasOB) {
       if (!pp) {
         for (let c = 0; c < row2.length; c++) {
           const cell = row2[c];
@@ -755,50 +809,33 @@ export async function parseListarOrdemBancariaMatrixAsync(
         }
       }
 
-      for (let c = 0; c < row2.length; c++) {
-        const cell = row2[c];
-        if (cell === null || cell === undefined) continue;
-        const s = String(cell).trim();
-        if (!s || s === '-' || s === '0') continue;
-        if (/\b\d\.\s?\d\.\d{2}\.\d{6}\b/.test(s)) {
-          fonteRecurso = s;
-          break;
-        }
-        if (isFonte600OuDerivada(s)) {
-          fonteRecurso = s;
-          break;
-        }
-        if ((s.includes('.6.') || s.includes('.5.')) && s.includes('.')) {
-          fonteRecurso = s;
-          break;
-        }
-      }
       if (!fonteRecurso) {
-        const f = findFonteRecursoInRow(row2);
-        if (f) fonteRecurso = f;
+        fonteRecurso = findFonteRecursoInRow(row2);
       }
 
-      for (let c = 0; c < row2.length; c++) {
-        const cell = row2[c];
-        if (cell !== null && cell !== undefined) {
-          const s = String(cell).trim();
-          if (/\d{2}\.\d{3}\.\d{3}\/\d{4}\-\d{2}/.test(s)) {
-            favorecidoRaw = s;
-            break;
-          }
-        }
-      }
       if (!favorecidoRaw) {
         for (let c = 0; c < row2.length; c++) {
           const cell = row2[c];
-          if (cell === null || cell === undefined) continue;
-          const s = String(cell).trim();
-          if (/\b\d{3}\s+\d{4,5}[-\s]\w\b/i.test(s) || /\b\d{3}\s\d{5}\-\d\b/i.test(s)) continue;
-          if (/\b\d{4}PP\d+\b/i.test(s)) continue;
-          if (/\b\d\.\s?\d\.\d{2}\.\d{6}\b/.test(s) || isFonte600OuDerivada(s)) continue;
-          if (s.length > 10 && /[A-Za-z]/.test(s)) {
-            favorecidoRaw = s;
-            break;
+          if (cell !== null && cell !== undefined) {
+            const s = String(cell).trim();
+            if (/\d{2}\.\d{3}\.\d{3}\/\d{4}\-\d{2}/.test(s)) {
+              favorecidoRaw = s;
+              break;
+            }
+          }
+        }
+        if (!favorecidoRaw) {
+          for (let c = 0; c < row2.length; c++) {
+            const cell = row2[c];
+            if (cell === null || cell === undefined) continue;
+            const s = String(cell).trim();
+            if (/\b\d{3}\s+\d{4,5}[-\s]\w\b/i.test(s) || /\b\d{3}\s\d{5}\-\d\b/i.test(s)) continue;
+            if (/\b\d{4}PP\d+\b/i.test(s)) continue;
+            if (isValidFonteRecursoCode(s)) continue;
+            if (s.length > 10 && /[A-Za-z]/.test(s)) {
+              favorecidoRaw = s;
+              break;
+            }
           }
         }
       }
@@ -812,6 +849,7 @@ export async function parseListarOrdemBancariaMatrixAsync(
           if (/\b\d{4}PP\d+\b/i.test(s)) continue;
           if (/\b\d{3}\s+\d{4,5}/.test(s) || /^\d{4,}[-\s]\w$/.test(s)) continue;
           if (/\d{2}\.\d{3}\.\d{3}\/\d{4}\-\d{2}/.test(s)) continue;
+          if (isValidFonteRecursoCode(s)) continue;
           if (typeof cell === 'number') {
             if (cell > 0 && cell < 1e11 && cell > valor) valor = cell;
             continue;
