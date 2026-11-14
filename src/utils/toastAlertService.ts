@@ -349,7 +349,7 @@ class ToastAlertManager {
           const seen = new Set<string>();
           const unique: ToastAlert[] = [];
           const nowMs = Date.now();
-          const MAX_AGE_MS = 180 * 24 * 60 * 60 * 1000; // 180 days max age
+          const MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // Últimos 30 dias
 
           for (const item of parsed) {
             if (!item || typeof item !== 'object') continue;
@@ -363,7 +363,7 @@ class ToastAlertManager {
               continue;
             }
 
-            // Filter out old historical events from beginning of the year or older than 45 days
+            // Descarta eventos com mais de 30 dias
             if (item.dataReferencia) {
               const dInfo = parseDateToMonthInfo(item.dataReferencia);
               if (dInfo.dateIso) {
@@ -371,6 +371,11 @@ class ToastAlertManager {
                 if (!isNaN(itemTime) && nowMs - itemTime > MAX_AGE_MS) {
                   continue;
                 }
+              }
+            } else if (item.dataHora) {
+              const dt = new Date(item.dataHora).getTime();
+              if (!isNaN(dt) && nowMs - dt > MAX_AGE_MS) {
+                continue;
               }
             }
 
@@ -403,17 +408,19 @@ class ToastAlertManager {
                   .replace(/\s*\(\s*R\$\s*0,[56]0?\s*\)/gi, '');
               }
 
+              // Alertas carregados de sessões passadas iniciam como já lidos (resolvido: true)
               unique.push({
                 ...item,
                 valor: itemVal,
                 mensagem: itemMsg,
+                resolvido: true,
                 dataHora: !isNaN(d.getTime()) ? d : new Date(),
               });
             }
           }
           unique.sort((a, b) => new Date(b.dataHora).getTime() - new Date(a.dataHora).getTime());
-          // Cap history to 1000 items to prevent UI and storage flood
-          this.alertsHistory = unique.slice(0, 1000);
+          // Limita histórico recente a no máximo 100 alertas
+          this.alertsHistory = unique.slice(0, 100);
           this.saveAlertsHistory();
         }
       }
@@ -424,7 +431,7 @@ class ToastAlertManager {
 
   private saveAlertsHistory() {
     try {
-      localStorage.setItem(ALERTS_HISTORY_KEY, JSON.stringify(this.alertsHistory.slice(0, 1000)));
+      localStorage.setItem(ALERTS_HISTORY_KEY, JSON.stringify(this.alertsHistory.slice(0, 100)));
     } catch (e) {
       // safe quota catch
     }
@@ -480,6 +487,9 @@ class ToastAlertManager {
     }
 
     this.alertsHistory.unshift(fullToast);
+    if (this.alertsHistory.length > 100) {
+      this.alertsHistory = this.alertsHistory.slice(0, 100);
+    }
     this.saveAlertsHistory();
 
     const showInToastPopup = toast.showPopup ?? (toast.tipo === 'critico');
@@ -527,7 +537,7 @@ class ToastAlertManager {
     }
 
     if (newItems.length > 0) {
-      this.alertsHistory = [...newItems, ...this.alertsHistory].slice(0, 2500);
+      this.alertsHistory = [...newItems, ...this.alertsHistory].slice(0, 100);
       const toPopup = newItems.filter((t) => (t as any).showPopup).slice(0, ACTIVE_TOASTS_MAX);
       if (toPopup.length > 0) {
         this.activeToasts = [...toPopup, ...this.activeToasts].slice(0, ACTIVE_TOASTS_MAX);
@@ -570,11 +580,55 @@ class ToastAlertManager {
     return [...this.alertsHistory];
   }
 
+  public markAllAsRead() {
+    let changed = false;
+    this.alertsHistory = this.alertsHistory.map((a) => {
+      if (!a.resolvido) {
+        changed = true;
+        return { ...a, resolvido: true };
+      }
+      return a;
+    });
+    if (changed) {
+      this.saveAlertsHistory();
+      this.notify();
+    }
+  }
+
   public restoreAlertsHistory(alerts: ToastAlert[]) {
     if (!Array.isArray(alerts) || alerts.length === 0) return;
+    const nowMs = Date.now();
+    const MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
     const existingKeys = new Set(this.alertsHistory.map((t) => getAlertUniqueKey(t)));
-    const newItems = alerts.filter((a) => !existingKeys.has(getAlertUniqueKey(a)));
-    this.alertsHistory = [...newItems, ...this.alertsHistory].slice(0, 1000);
+    const newItems: ToastAlert[] = [];
+
+    for (const a of alerts) {
+      if (!a || typeof a !== 'object') continue;
+      if (a.dataReferencia) {
+        const dInfo = parseDateToMonthInfo(a.dataReferencia);
+        if (dInfo.dateIso) {
+          const itemTime = new Date(dInfo.dateIso + 'T12:00:00').getTime();
+          if (!isNaN(itemTime) && nowMs - itemTime > MAX_AGE_MS) continue;
+        }
+      } else if (a.dataHora) {
+        const dt = new Date(a.dataHora).getTime();
+        if (!isNaN(dt) && nowMs - dt > MAX_AGE_MS) continue;
+      }
+
+      const key = getAlertUniqueKey(a);
+      if (!existingKeys.has(key)) {
+        existingKeys.add(key);
+        newItems.push({
+          ...a,
+          resolvido: true, // Alertas vindos da nuvem/sessões anteriores iniciam como lidos
+          dataHora: a.dataHora ? new Date(a.dataHora) : new Date(),
+        });
+      }
+    }
+
+    this.alertsHistory = [...this.alertsHistory, ...newItems]
+      .sort((a, b) => new Date(b.dataHora).getTime() - new Date(a.dataHora).getTime())
+      .slice(0, 100);
     this.saveAlertsHistory();
     this.notify();
   }
@@ -656,6 +710,18 @@ class ToastAlertManager {
     if (!this.hasBaseline() && files && files.length > 0) {
       const records = this.extractAllCurrentRecords(files, ordensBancariasList);
       this.saveBaselineSnapshot(records);
+    }
+  }
+
+  public forceUpdateBaseline(files: FileData[], ordensBancariasList?: OrdemBancariaItem[] | null) {
+    try {
+      if ((!files || files.length === 0) && (!ordensBancariasList || ordensBancariasList.length === 0)) {
+        return;
+      }
+      const records = this.extractAllCurrentRecords(files, ordensBancariasList);
+      this.saveBaselineSnapshot(records);
+    } catch (e) {
+      console.warn('Erro ao atualizar baseline silenciosamente:', e);
     }
   }
 
@@ -1110,15 +1176,16 @@ class ToastAlertManager {
     }
 
     for (const key of currentKeys) {
+      if (toastsToBatch.length >= 100) break;
       const curr = currentRecords[key];
       if (!curr || typeof curr !== 'object') continue;
 
-      // Ignora eventos históricos ocorridos há mais de 180 dias ou no início do ano
+      // Ignora eventos históricos ocorridos há mais de 30 dias
       if (curr.dataReferencia) {
         const dInfo = parseDateToMonthInfo(curr.dataReferencia);
         if (dInfo.dateIso) {
           const itemTime = new Date(dInfo.dateIso + 'T12:00:00').getTime();
-          if (!isNaN(itemTime) && Date.now() - itemTime > 180 * 24 * 60 * 60 * 1000) {
+          if (!isNaN(itemTime) && Date.now() - itemTime > 30 * 24 * 60 * 60 * 1000) {
             continue;
           }
         }

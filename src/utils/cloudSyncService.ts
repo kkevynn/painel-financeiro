@@ -672,6 +672,16 @@ class CloudSyncService {
         }
       }
 
+      // Atualiza silenciosamente a base comparativa (BASELINE_SNAPSHOT_KEY) sem disparar alertas falsos no login
+      try {
+        toastAlertService.forceUpdateBaseline(
+          effectiveFiles,
+          parsedCompactOBs.length > 0 ? parsedCompactOBs : null
+        );
+      } catch (e) {
+        console.warn('Erro ao atualizar baseline após pullFromCloud:', e);
+      }
+
       // Salvar cache de métricas no localStorage
       this.saveMetricsCache(parsedMetrics, validSyncDate, obFileName);
 

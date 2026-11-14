@@ -69,15 +69,35 @@ export function isFonte600OuDerivada(fonteRaw: any): boolean {
 
 /**
  * Strictly validates whether a cell value represents a valid Fonte de Recursos code
- * (rejecting monetary values like 1.500,00 or 1.620,37).
+ * (accepts SIGEF/RN dotted and numeric formats while rejecting monetary values, dates, OB/PP/NE, or 'OUTRAS').
  */
 export function isValidFonteRecursoCode(val: any): boolean {
   if (val === null || val === undefined) return false;
   const s = String(val).trim().toUpperCase();
-  if (!s || s === '-' || s === '0') return false;
+  if (
+    !s ||
+    s === '-' ||
+    s === '0' ||
+    s === 'OUTRAS' ||
+    s === 'N/I' ||
+    s === 'FONTE NÃO IDENTIFICADA' ||
+    s === 'FONTE NAO IDENTIFICADA'
+  ) {
+    return false;
+  }
+  // Rejeita valores monetários com vírgula de centavos, símbolos monetários, decimais de 1-2 casas
   if (/\d+,\d{2}$/.test(s) || /^\d+\.\d{1,2}$/.test(s) || s.includes('R$')) return false;
-  if (/^[012]\.\d\.\d{2}(?:\.\d{6})?$/.test(s)) return true;
-  if (/^(?:0500|0600|1500|1600|0100|1000|600|500|F600|F500)$/i.test(s)) return true;
+  // Rejeita datas (DD/MM/YYYY ou YYYY-MM-DD)
+  if (/\d{2}\/\d{2}\/\d{4}/.test(s) || /\d{4}-\d{2}-\d{2}/.test(s)) return false;
+  // Rejeita números de OB / PP / NE / NL / PD
+  if (/\b\d{4}(?:OB|PP|NE|NL|PD)\d+\b/i.test(s) || /^(?:OB|PP|NE|NL|PD)[\s\-_]?\d+/i.test(s)) return false;
+
+  // Formatos pontuados do SIGEF/RN: 0.5.00, 0.6.00, 0.6.00.000600, 1.5.00.000000, 2.6.00..., etc.
+  if (/^[012](?:\.\d{1,4}){1,4}(?:\.\d{1,6})?$/.test(s)) return true;
+  // Códigos numéricos de 3 a 12 dígitos começando com 0, 1 ou 2 (0500, 0600, 1500, 1600, 1601, 2500, 2600, etc.)
+  if (/^[012]\d{2,11}$/.test(s)) return true;
+  // Formatos curtos legados / prefixados
+  if (/^(?:500|600|F500|F600)$/i.test(s)) return true;
   if (/^FONTE\s+[0-9.]+$/i.test(s)) return true;
   return false;
 }
@@ -87,10 +107,19 @@ export function isValidFonteRecursoCode(val: any): boolean {
  */
 export function findFonteRecursoInRow(row: any[]): string {
   if (!Array.isArray(row)) return '';
+  // 1a passada: prioriza strings com pontos ou prefixo FONTE/F (evita confundir valor monetário inteiro com fonte)
   for (const cell of row) {
-    if (cell === null || cell === undefined) continue;
+    if (typeof cell !== 'string') continue;
+    const s = cell.trim().toUpperCase();
+    if ((s.includes('.') || s.startsWith('F')) && isValidFonteRecursoCode(s)) {
+      return s;
+    }
+  }
+  // 2a passada: qualquer string válida de fonte (ex: '0500', '0600', '1500', '1600')
+  for (const cell of row) {
+    if (typeof cell !== 'string') continue;
     if (isValidFonteRecursoCode(cell)) {
-      return String(cell).trim().toUpperCase();
+      return cell.trim().toUpperCase();
     }
   }
   return '';

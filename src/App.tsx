@@ -42,6 +42,7 @@ import {
   isObFileName,
   parseListarOrdemBancariaMatrixAsync,
   extractOrdensBancariasFromFileData,
+  isValidFonteRecursoCode,
 } from './utils/ordemBancariaParser';
 import { readSpreadsheetAsMatrix } from './utils/excelParser';
 import { googleDriveService, GoogleDriveState } from './utils/googleDriveService';
@@ -128,8 +129,26 @@ export function App() {
     return { ...baseMetrics };
   }, []);
 
+  // Ref to always access latest ordensBancariasList inside async handlers
+  const ordensBancariasListRef = useRef<OrdemBancariaItem[] | null>(ordensBancariasList);
+  useEffect(() => {
+    ordensBancariasListRef.current = ordensBancariasList;
+  }, [ordensBancariasList]);
+
   // Update ordens bancarias handler
   const handleUpdateOrdensBancariasList = (list: OrdemBancariaItem[] | null, fileName?: string) => {
+    // Proteção: nunca sobrescrever um ordensBancariasList com fontes identificadas por uma lista 100% sem fontes válidas
+    if (
+      list !== null &&
+      list.length > 0 &&
+      ordensBancariasListRef.current &&
+      ordensBancariasListRef.current.some((it) => isValidFonteRecursoCode(it.fonteRecurso)) &&
+      !list.some((it) => isValidFonteRecursoCode(it.fonteRecurso))
+    ) {
+      return;
+    }
+
+    ordensBancariasListRef.current = list;
     setOrdensBancariasList(list);
     if (fileName !== undefined) setOrdensBancariasFileName(fileName);
     saveOrdensBancariasToStorage(list, fileName);
@@ -274,7 +293,14 @@ export function App() {
           console.warn('Falha ao ler loadOrdensBancariasAsync:', e);
         }
 
-        if (obStored && obStored.items && obStored.items.length > 0) {
+        const storedHasValidFonte = Boolean(
+          obStored?.items &&
+            obStored.items.length > 0 &&
+            obStored.items.some((it) => isValidFonteRecursoCode(it.fonteRecurso))
+        );
+
+        if (obStored && obStored.items && obStored.items.length > 0 && storedHasValidFonte) {
+          ordensBancariasListRef.current = obStored.items;
           setOrdensBancariasList(obStored.items);
           setOrdensBancariasFileName(obStored.fileName || '');
         }
@@ -293,24 +319,36 @@ export function App() {
           }
         );
 
-        // Auto-extract OBs from existing files if ordensBancariasList was not loaded
-        if ((!obStored?.items || obStored.items.length === 0) && realFiles.length > 0) {
+        // Auto-extract OBs EXCLUSIVAMENTE de planilhas de Ordem Bancária se ordensBancariasList não tiver fontes válidas
+        if ((!obStored?.items || obStored.items.length === 0 || !storedHasValidFonte) && realFiles.length > 0) {
           const obMap = new Map<string, OrdemBancariaItem>();
+          let extractedObFileName = '';
           realFiles.forEach((f: any) => {
-            if (isObFileName(f.fileName) || f.stage === 'ordem_bancaria' || f.detectedObCol) {
-              const extracted = extractOrdensBancariasFromFileData(f);
-              extracted.forEach((item) => {
-                const k = item.ob ? ('OB_' + item.ob.trim().toUpperCase()) : (item.pp ? ('PP_' + item.pp.trim().toUpperCase()) : item.id);
-                obMap.set(k, item);
-              });
+            if (f.stage !== 'base_pps' && (f.stage === 'ordem_bancaria' || isObFileName(f.fileName))) {
+              const extracted = extractOrdensBancariasFromFileData(f).filter((item) =>
+                isValidFonteRecursoCode(item.fonteRecurso)
+              );
+              if (extracted.length > 0) {
+                extractedObFileName = f.fileName || extractedObFileName;
+                extracted.forEach((item) => {
+                  const k = item.ob ? ('OB_' + item.ob.trim().toUpperCase()) : (item.pp ? ('PP_' + item.pp.trim().toUpperCase()) : item.id);
+                  obMap.set(k, item);
+                });
+              }
             }
           });
           const allExtracted = Array.from(obMap.values());
           if (allExtracted.length > 0) {
+            const finalObFileName = extractedObFileName || 'Consolidado de Arquivos';
+            ordensBancariasListRef.current = allExtracted;
             setOrdensBancariasList(allExtracted);
-            setOrdensBancariasFileName('Consolidado de Arquivos');
-            saveOrdensBancariasToStorage(allExtracted, 'Consolidado de Arquivos');
-            obStored = { items: allExtracted, fileName: 'Consolidado de Arquivos' };
+            setOrdensBancariasFileName(finalObFileName);
+            saveOrdensBancariasToStorage(allExtracted, finalObFileName);
+            obStored = { items: allExtracted, fileName: finalObFileName };
+          } else if (obStored?.items && obStored.items.length > 0) {
+            ordensBancariasListRef.current = obStored.items;
+            setOrdensBancariasList(obStored.items);
+            setOrdensBancariasFileName(obStored.fileName || '');
           }
         }
 
@@ -347,9 +385,9 @@ export function App() {
           }
 
           try {
-            toastAlertService.syncConfirmations(realFiles, obStored?.items || null, false);
+            toastAlertService.forceUpdateBaseline(realFiles, obStored?.items || null);
           } catch (tErr) {
-            console.warn('Erro ao sincronizar confirmações no boot:', tErr);
+            console.warn('Erro ao atualizar baseline no boot:', tErr);
           }
 
           try {
@@ -359,7 +397,7 @@ export function App() {
           }
         } else if (obStored?.items && obStored.items.length > 0) {
           try {
-            toastAlertService.syncConfirmations([], obStored.items, false);
+            toastAlertService.forceUpdateBaseline([], obStored.items);
             mlInferenceService.processFilesForInference([], obStored.items);
           } catch (_) {}
         } else {
@@ -473,8 +511,11 @@ export function App() {
           updated = [...updated, parsedFileData];
         }
 
-        // Automatically detect and parse OB spreadsheet OR pull OBs directly from the SIGEF PP spreadsheet
-        if (isObFileName(parsedFileData.fileName) || parsedFileData.stage === 'ordem_bancaria') {
+        // Extrai ordensBancariasList EXCLUSIVAMENTE de planilhas de Ordem Bancária (jamais de base_pps)
+        if (
+          parsedFileData.stage !== 'base_pps' &&
+          (parsedFileData.stage === 'ordem_bancaria' || isObFileName(parsedFileData.fileName))
+        ) {
           try {
             const matrix = await readSpreadsheetAsMatrix(file);
             const parsedOBs = await parseListarOrdemBancariaMatrixAsync(matrix);
@@ -495,26 +536,6 @@ export function App() {
               targetOBs = extracted;
               handleUpdateOrdensBancariasList(extracted, parsedFileData.fileName);
             }
-          }
-        } else if (parsedFileData.stage === 'base_pps' || parsedFileData.detectedObCol) {
-          // PULL OBs DIRECTLY FROM THE PP SPREADSHEET EXTRACTED FROM SIGEF
-          const extracted = extractOrdensBancariasFromFileData(parsedFileData);
-          if (extracted.length > 0) {
-            if (targetOBs && targetOBs.length > 0) {
-              const obMap = new Map<string, OrdemBancariaItem>();
-              targetOBs.forEach((item) => {
-                const k = item.ob ? ('OB_' + item.ob.trim().toUpperCase()) : (item.pp ? ('PP_' + item.pp.trim().toUpperCase()) : item.id);
-                obMap.set(k, item);
-              });
-              extracted.forEach((item) => {
-                const k = item.ob ? ('OB_' + item.ob.trim().toUpperCase()) : (item.pp ? ('PP_' + item.pp.trim().toUpperCase()) : item.id);
-                obMap.set(k, item);
-              });
-              targetOBs = Array.from(obMap.values());
-            } else {
-              targetOBs = extracted;
-            }
-            handleUpdateOrdensBancariasList(targetOBs, parsedFileData.fileName);
           }
         }
       }
@@ -543,7 +564,7 @@ export function App() {
       activeUploadsCountRef.current = Math.max(0, activeUploadsCountRef.current - 1);
       if (activeUploadsCountRef.current === 0) {
         const finalFiles = filesRef.current;
-        const finalOBs = ordensBancariasList;
+        const finalOBs = ordensBancariasListRef.current;
         setTimeout(() => {
           const finalMetrics = processUploadedFiles(finalFiles);
           const finalEnriched = applyEnrichment(finalMetrics, finalOBs);
@@ -963,16 +984,13 @@ export function App() {
     filesRef.current = updated;
     setFiles(updated);
 
-    // If the updated file is an OB spreadsheet or PP spreadsheet with OBs, re-extract OB items using user's explicit column mapping
+    // Re-extrai OB items EXCLUSIVAMENTE se o arquivo atualizado for planilha de Ordem Bancária (nunca base_pps)
     let targetOBs = ordensBancariasList;
     if (targetUpdatedFile) {
       const uf: FileData = targetUpdatedFile;
       if (
-        uf.stage === 'ordem_bancaria' ||
-        uf.stage === 'base_pps' ||
-        isObFileName(uf.fileName) ||
-        uf.fileName === ordensBancariasFileName ||
-        Boolean(uf.detectedObCol)
+        uf.stage !== 'base_pps' &&
+        (uf.stage === 'ordem_bancaria' || isObFileName(uf.fileName))
       ) {
         const reExtracted = extractOrdensBancariasFromFileData(uf);
         if (reExtracted.length > 0) {

@@ -50,9 +50,10 @@ export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProp
     };
   }, [isOpen]);
 
-  // Load alerts when modal opens
+  // Load alerts and mark all as read when modal opens
   useEffect(() => {
     if (isOpen) {
+      toastAlertService.markAllAsRead();
       setAllAlerts([...toastAlertService.getAlertsHistory()]);
     }
   }, [isOpen]);

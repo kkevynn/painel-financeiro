@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import {
   Upload,
   Download,
@@ -183,16 +183,76 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
   const [confirmClear, setConfirmClear] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  // Consolidated items: direct, fast, linear reading of ordensBancariasList
+  const userClearedRef = useRef(false);
+  const autoHealedObRef = useRef<string | null>(null);
+
+  const explicitObFile = useMemo(() => {
+    if (!Array.isArray(files) || files.length === 0) return null;
+    return (
+      files.find(
+        (f) =>
+          f &&
+          f.stage !== 'base_pps' &&
+          (f.stage === 'ordem_bancaria' || (typeof f.fileName === 'string' && isObFileName(f.fileName)))
+      ) || null
+    );
+  }, [files]);
+
+  const hasValidFonteInCurrentList = useMemo(() => {
+    if (!Array.isArray(ordensBancariasList) || ordensBancariasList.length === 0) return false;
+    return ordensBancariasList.some((item) => {
+      if (!item) return false;
+      const f = String(item.fonteRecurso ?? '').trim();
+      const upper = f.toUpperCase();
+      if (
+        !f ||
+        upper === 'OUTRAS' ||
+        upper === 'FONTE NÃO IDENTIFICADA' ||
+        upper === 'FONTE NAO IDENTIFICADA'
+      ) {
+        return false;
+      }
+      return isValidFonteRecursoCode(f);
+    });
+  }, [ordensBancariasList]);
+
+  useEffect(() => {
+    userClearedRef.current = false;
+  }, [explicitObFile]);
+
+  useEffect(() => {
+    if (userClearedRef.current || !explicitObFile || !onUpdateOrdensBancariasList) return;
+    if (Array.isArray(ordensBancariasList) && ordensBancariasList.length > 0 && hasValidFonteInCurrentList) {
+      return;
+    }
+    const healKey = `${explicitObFile.id}_${explicitObFile.rows?.length || 0}`;
+    if (autoHealedObRef.current === healKey) return;
+
+    const extracted = extractOrdensBancariasFromFileData(explicitObFile);
+    if (extracted.length > 0 && extracted.some((it) => isValidFonteRecursoCode(it.fonteRecurso))) {
+      autoHealedObRef.current = healKey;
+      onUpdateOrdensBancariasList(extracted, explicitObFile.fileName);
+    }
+  }, [explicitObFile, ordensBancariasList, hasValidFonteInCurrentList, onUpdateOrdensBancariasList]);
+
+  // Consolidated items: direct, fast, linear reading of ordensBancariasList (prioritizing explicit OB file if current list lacks valid fontes)
   const items = useMemo<OrdemBancariaItem[]>(() => {
     let rawList: unknown[] = [];
 
-    if (Array.isArray(ordensBancariasList) && ordensBancariasList.length > 0) {
+    if (
+      explicitObFile &&
+      (!Array.isArray(ordensBancariasList) ||
+        ordensBancariasList.length === 0 ||
+        !hasValidFonteInCurrentList)
+    ) {
+      rawList = extractOrdensBancariasFromFileData(explicitObFile);
+    } else if (Array.isArray(ordensBancariasList) && ordensBancariasList.length > 0) {
       rawList = ordensBancariasList;
     } else if (Array.isArray(files) && files.length > 0) {
       const obFile = files.find(
         (f) =>
           f &&
+          f.stage !== 'base_pps' &&
           (f.stage === 'ordem_bancaria' ||
             (typeof f.fileName === 'string' && isObFileName(f.fileName)) ||
             Boolean(f.detectedObCol && f.detectedFonteCol))
@@ -645,6 +705,7 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
                 <button
                   type="button"
                   onClick={() => {
+                    userClearedRef.current = true;
                     onUpdateOrdensBancariasList(null, '');
                     setConfirmClear(false);
                   }}
