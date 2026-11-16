@@ -189,8 +189,8 @@ export const Header: React.FC<HeaderProps> = ({
             </div>
           )}
 
-          {/* Auditoria IA Button */}
-          {onOpenAuditoriaML && (
+          {/* Auditoria IA Button - Admin Only */}
+          {userRole === 'admin' && onOpenAuditoriaML && (
             <button
               type="button"
               onClick={onOpenAuditoriaML}

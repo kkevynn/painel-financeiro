@@ -113,14 +113,14 @@ class CloudSyncService {
     if (this.pollingIntervalId) {
       clearInterval(this.pollingIntervalId);
     }
-    // Polling automático leve a cada 60 segundos para manter todos os dispositivos sincronizados
+    // Polling automático leve a cada 15 segundos para sincronização quase em tempo real entre dispositivos
     this.pollingIntervalId = setInterval(() => {
       if (!this.isProcessingSync) {
         this.pullFromCloud(true).catch((e) => {
           console.warn('Polling automático Google Drive:', e);
         });
       }
-    }, 60000);
+    }, 15000);
   }
 
   public registerDatasetReloadCallback(
@@ -478,6 +478,10 @@ class CloudSyncService {
         errorMessage: null,
       });
 
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('finance_cloud_data_updated'));
+      }
+
       console.log(`Painel sincronizado no Google Drive com sucesso a partir do ${device}`);
       return true;
     } catch (err: any) {
@@ -507,11 +511,14 @@ class CloudSyncService {
     try {
       this.isProcessingSync = true;
       if (!onlyIfNewer) {
+        // Ignora cache em memória quando usuário abre o app ou solicita sincronização manual
+        this.lastRemoteVersion = null;
         this.updateState({ isSyncing: true, syncStatus: 'syncing', errorMessage: null });
       }
 
       const response = await fetch(`${GOOGLE_DRIVE_SYNC_URL}?t=${Date.now()}`, {
         method: 'GET',
+        cache: 'no-store',
         redirect: 'follow',
       });
 
@@ -642,7 +649,7 @@ class CloudSyncService {
         }
       }
 
-      // Verificar se o computador atual já possui arquivos locais completos (com mais linhas e versão igual/mais recente)
+      // Quando onlyIfNewer === false (abertura do app ou sincronização manual), ignora o cache local e prioriza os dados da nuvem
       const localState = await loadAppState();
       const localFiles = localState?.files || [];
       const localTotalRows = localFiles.reduce((acc, f) => acc + (f.rows?.length || 0), 0);
@@ -650,6 +657,7 @@ class CloudSyncService {
       const localSavedTime = localState?.savedAt ? new Date(localState.savedAt).getTime() : 0;
 
       const preserveLocalFiles =
+        onlyIfNewer &&
         localFiles.length > 0 &&
         localTotalRows > remoteTotalRows &&
         localSavedTime >= validSyncDate.getTime();
@@ -730,42 +738,23 @@ class CloudSyncService {
   }
 
   /**
-   * Avalia estado local vs Google Drive e prioriza recuperação automática
+   * Avalia estado local vs Google Drive e prioriza verificação imediata na nuvem ao abrir o app
    */
   public async checkAndAutoSync(): Promise<void> {
     if (this.isProcessingSync) return;
 
     try {
-      const localState = await loadAppState();
-      const localFiles = localState?.files || [];
+      // Sempre força a verificação imediata no Google Drive ignorando cache local ao abrir o aplicativo
+      const pulled = await this.pullFromCloud(false);
 
-      // Se o navegador local estiver vazio (novo dispositivo / Vercel / Modo Consulta), puxa imediatamente
-      if (localFiles.length === 0) {
-        console.log('Nenhum dado local encontrado. Baixando estado do Google Drive...');
-        await this.pullFromCloud(false);
-        return;
-      }
-
-      // Mesmo com dados locais, verifica se existe atualização mais recente no Google Drive
-      const response = await fetch(`${GOOGLE_DRIVE_SYNC_URL}?t=${Date.now()}`, {
-        method: 'GET',
-        redirect: 'follow',
-      });
-      if (!response.ok) return;
-
-      const data = await response.json();
-      if (data && data.metrics) {
-        const remoteTime = data.lastSyncAt ? new Date(data.lastSyncAt).getTime() : 0;
-        const localSavedTime = localState?.savedAt ? new Date(localState.savedAt).getTime() : 0;
-
-        if (remoteTime > localSavedTime + 2000 || !this.lastPulledData) {
-          console.log('Google Drive possui atualização mais recente. Baixando...');
-          await this.pullFromCloud(false);
+      if (!pulled && isAdmin()) {
+        const localState = await loadAppState();
+        const localFiles = localState?.files || [];
+        if (localFiles.length > 0) {
+          const localOBs = getStoredOrdensBancarias().items || [];
+          console.log('Google Drive vazio; enviando estado local do Administrador...');
+          await this.pushToCloud(localFiles, localOBs);
         }
-      } else if (localFiles.length > 0 && isAdmin()) {
-        const localOBs = getStoredOrdensBancarias().items || [];
-        console.log('Google Drive vazio; enviando estado local do Administrador...');
-        await this.pushToCloud(localFiles, localOBs);
       }
     } catch (err) {
       console.warn('Verificação de sincronização automática:', err);
