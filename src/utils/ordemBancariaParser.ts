@@ -140,6 +140,7 @@ export interface OrdemBancariaItem {
   favorecidoCnpj: string;
   favorecidoName: string;
   linhaOrigem?: number;
+  isFonteProviderOnly?: boolean;
 }
 
 const MONTH_NAMES_PT = [
@@ -264,6 +265,7 @@ function isRejectedOb(sitRaw: any): boolean {
 export function extractOrdensBancariasFromFileData(file: FileData): OrdemBancariaItem[] {
   if (!file || !file.rows || file.rows.length === 0) return [];
   const items: OrdemBancariaItem[] = [];
+  const isFonteOnlyOb = file.stage === 'ordem_bancaria' || isObFileName(file.fileName || '');
 
   const headers = Object.keys(file.rows[0] || {});
   const obCol =
@@ -371,7 +373,9 @@ export function extractOrdensBancariasFromFileData(file: FileData): OrdemBancari
       valor = realVal;
     }
 
-    const rawSit = sitCol ? String(row[sitCol] || '').trim().toUpperCase() : 'CB';
+    // Em planilhas de OB (stage === 'ordem_bancaria' ou isObFileName), não inventar 'CB' sintético quando não há coluna de situação;
+    // e sua propriedade situacao serve apenas como metadado auxiliar, nunca sobrescrevendo situações oficiais de outras bases.
+    const rawSit = sitCol ? String(row[sitCol] || '').trim().toUpperCase() : (isFonteOnlyOb ? '' : 'CB');
 
     // Prioritize payment date column, then general date column, then find the most recent valid date in row
     let rawData = paymentDateCol ? row[paymentDateCol] : (generalDateCol ? row[generalDateCol] : '');
@@ -392,20 +396,37 @@ export function extractOrdensBancariasFromFileData(file: FileData): OrdemBancari
     }
 
     let rawFonte = fonteCol ? String(row[fonteCol] || '').trim() : '';
+    if (!isValidFonteRecursoCode(rawFonte)) {
+      const scannedFonte = findFonteRecursoInRow(Object.values(row));
+      if (scannedFonte) rawFonte = scannedFonte;
+    }
     let rawFav = favCol ? String(row[favCol] || '').trim() : '';
     let finalCnpj = cnpjCol ? String(row[cnpjCol] || '').trim() : '';
     let ppVal = ppCol ? String(row[ppCol] || '').trim() : '';
+    if (!ppVal) {
+      for (const cellVal of Object.values(row)) {
+        if (cellVal === null || cellVal === undefined) continue;
+        const m = String(cellVal).trim().match(/\b\d{4}PP\d+\b/i);
+        if (m) {
+          ppVal = m[0].toUpperCase();
+          break;
+        }
+      }
+    }
 
     // Only if 2-row block structure and current row lacks Favorecido or Fonte, check next row
-    const isSingleRowComplete = (rawFav && rawFav.length >= 3) && (rawFonte && rawFonte !== '-' && rawFonte !== '0');
+    const isSingleRowComplete = (rawFav && rawFav.length >= 3) && isValidFonteRecursoCode(rawFonte);
     if (!isSingleRowComplete) {
       const nextRow = idx + 1 < file.rows.length ? file.rows[idx + 1] : null;
       const nextRowHasOb = nextRow && obCol && isObNumber(nextRow[obCol]);
       if (!nextRowHasOb && nextRow) {
-        if (!rawFonte || rawFonte === '-' || rawFonte === '0' || rawFonte === 'OUTRAS') {
+        if (!isValidFonteRecursoCode(rawFonte)) {
           const nFonte = fonteCol ? String(nextRow[fonteCol] || '').trim() : '';
-          if (nFonte && nFonte !== '-' && nFonte !== '0') {
+          if (isValidFonteRecursoCode(nFonte)) {
             rawFonte = nFonte;
+          } else {
+            const scannedNext = findFonteRecursoInRow(Object.values(nextRow));
+            if (scannedNext) rawFonte = scannedNext;
           }
         }
         if (!rawFav || rawFav.length < 3) {
@@ -414,12 +435,26 @@ export function extractOrdensBancariasFromFileData(file: FileData): OrdemBancari
             rawFav = nFav;
           }
         }
-        if (!ppVal && ppCol && nextRow[ppCol]) {
-          ppVal = String(nextRow[ppCol]).trim();
+        if (!ppVal) {
+          if (ppCol && nextRow[ppCol]) {
+            ppVal = String(nextRow[ppCol]).trim();
+          } else {
+            for (const cellVal of Object.values(nextRow)) {
+              if (cellVal === null || cellVal === undefined) continue;
+              const m = String(cellVal).trim().match(/\b\d{4}PP\d+\b/i);
+              if (m) {
+                ppVal = m[0].toUpperCase();
+                break;
+              }
+            }
+          }
         }
         idx++; // Consume row 2 of the block
       }
     }
+
+    const validFonte = isValidFonteRecursoCode(rawFonte) ? rawFonte.trim().toUpperCase() : 'Fonte Não Identificada';
+    const cleanPp = ppVal ? ppVal.trim().toUpperCase() : '';
 
     const { cnpj: parsedCnpj, name: parsedName } = parseFavorecidoField(rawFav);
     finalCnpj = finalCnpj || parsedCnpj || 'N/I';
@@ -433,13 +468,14 @@ export function extractOrdensBancariasFromFileData(file: FileData): OrdemBancari
       mesAnoKey: dateInfo.mesAnoKey,
       mesAnoLabel: dateInfo.mesAnoLabel,
       valor,
-      situacao: rawSit || 'CB',
-      pp: ppVal,
-      fonteRecurso: (rawFonte || 'OUTRAS').trim(),
+      situacao: isFonteOnlyOb ? rawSit : (rawSit || 'CB'),
+      pp: cleanPp,
+      fonteRecurso: validFonte,
       favorecidoRaw: rawFav,
       favorecidoCnpj: finalCnpj,
       favorecidoName: finalName,
       linhaOrigem: idx + 1,
+      isFonteProviderOnly: isFonteOnlyOb,
     });
   }
 
@@ -492,8 +528,8 @@ export function parseListarOrdemBancariaMatrix(matrix: any[][]): OrdemBancariaIt
     }
     const dateInfo = parseDateToMonthInfo(dataReferencia);
 
-    // Situação: A string que der match em \b(CB|RJ|PPCB|PPRJ|AO|C|PAGA)\b. Se não achar, assuma 'CB'.
-    let situacao = 'CB';
+    // Situação: captura apenas se informada explicitamente na matriz (sem assumir 'CB' como verdade bancária oficial).
+    let situacao = '';
     for (let c = 0; c < row1.length; c++) {
       const cell = row1[c];
       if (cell !== null && cell !== undefined) {
@@ -669,12 +705,13 @@ export function parseListarOrdemBancariaMatrix(matrix: any[][]): OrdemBancariaIt
         mesAnoLabel: dateInfo.mesAnoLabel,
         valor,
         situacao,
-        pp,
-        fonteRecurso: (fonteRecurso || 'Fonte Não Identificada').trim(),
+        pp: pp ? pp.trim().toUpperCase() : '',
+        fonteRecurso: isValidFonteRecursoCode(fonteRecurso) ? fonteRecurso.trim().toUpperCase() : 'Fonte Não Identificada',
         favorecidoRaw: favorecidoRaw.trim(),
         favorecidoCnpj: finalCnpj,
         favorecidoName: finalName,
         linhaOrigem: i + 1,
+        isFonteProviderOnly: true,
       });
     }
   }
@@ -734,7 +771,7 @@ export async function parseListarOrdemBancariaMatrixAsync(
     }
     const dateInfo = parseDateToMonthInfo(dataReferencia);
 
-    let situacao = 'CB';
+    let situacao = '';
     for (let c = 0; c < row1.length; c++) {
       const cell = row1[c];
       if (cell !== null && cell !== undefined) {
@@ -906,12 +943,13 @@ export async function parseListarOrdemBancariaMatrixAsync(
         mesAnoLabel: dateInfo.mesAnoLabel,
         valor,
         situacao,
-        pp,
-        fonteRecurso: (fonteRecurso || 'Fonte Não Identificada').trim(),
+        pp: pp ? pp.trim().toUpperCase() : '',
+        fonteRecurso: isValidFonteRecursoCode(fonteRecurso) ? fonteRecurso.trim().toUpperCase() : 'Fonte Não Identificada',
         favorecidoRaw: favorecidoRaw.trim(),
         favorecidoCnpj: finalCnpj,
         favorecidoName: finalName,
         linhaOrigem: i + 1,
+        isFonteProviderOnly: true,
       });
     }
   }
@@ -1166,6 +1204,7 @@ export function matchesSupplierOB(
 /**
  * Attaches or recalculates payment breakdown by Fonte de Recurso and by Mês
  * on ConsolidatedSupplier objects based on the uploaded Ordens Bancárias list.
+ * Acts strictly as a Fonte de Recurso provider — never altering official payment/PP situations or financial totals.
  * Highly optimized with pre-indexed hash maps (O(N + M)) so it executes in ~2ms even for thousands of records.
  */
 export function enrichSuppliersWithOrdensBancarias(
@@ -1176,10 +1215,15 @@ export function enrichSuppliersWithOrdensBancarias(
     return;
   }
 
+  const normalizeDocKey = (val: string) => String(val || '').trim().toUpperCase().replace(/[\s\.\-\/]/g, '');
+
   // 1. Build fast lookup maps for OB items:
+  // - by PP / OB match keys (strictly prioritized)
   // - by exact CNPJ / CPF (digits only)
   // - by root CNPJ (8 digits)
   // - by normalized company name
+  const obByPp = new Map<string, OrdemBancariaItem[]>();
+  const obByOb = new Map<string, OrdemBancariaItem[]>();
   const obByCnpj = new Map<string, OrdemBancariaItem[]>();
   const obByCnpjRoot = new Map<string, OrdemBancariaItem[]>();
   const obByName = new Map<string, OrdemBancariaItem[]>();
@@ -1187,9 +1231,23 @@ export function enrichSuppliersWithOrdensBancarias(
 
   for (let i = 0; i < obItems.length; i++) {
     const item = obItems[i];
+    const ppKey = normalizeDocKey(item.pp);
+    const obKey = normalizeDocKey(item.ob);
     const cnpjDigits = extractDigits(item.favorecidoCnpj);
     const cnpjRoot = cnpjDigits.length === 14 ? cnpjDigits.substring(0, 8) : '';
     const normName = normalizeText(item.favorecidoName);
+
+    if (ppKey && isValidFonteRecursoCode(item.fonteRecurso)) {
+      const arr = obByPp.get(ppKey);
+      if (arr) arr.push(item);
+      else obByPp.set(ppKey, [item]);
+    }
+
+    if (obKey && isValidFonteRecursoCode(item.fonteRecurso)) {
+      const arr = obByOb.get(obKey);
+      if (arr) arr.push(item);
+      else obByOb.set(obKey, [item]);
+    }
 
     if (cnpjDigits.length >= 11) {
       const arr = obByCnpj.get(cnpjDigits);
@@ -1217,7 +1275,7 @@ export function enrichSuppliersWithOrdensBancarias(
     }
   }
 
-  // 2. Enrich each supplier in O(1) average lookup
+  // 2. Enrich each supplier in O(1) average lookup — strictly populating Fonte metadata
   for (let sIdx = 0; sIdx < suppliers.length; sIdx++) {
     const s = suppliers[sIdx];
     const suppDigits = extractDigits(s.cnpj);
@@ -1245,18 +1303,60 @@ export function enrichSuppliersWithOrdensBancarias(
         matchedItems = obByNamePrefix.get(prefix);
       }
     }
+    // E. Fallback match by PP or OB lists attached to the supplier
+    else {
+      const docMatches: OrdemBancariaItem[] = [];
+      const seenDocIds = new Set<string>();
+      const supplierObs: string[] = Array.isArray(s.obs) ? s.obs : [];
+      const supplierPps: string[] = Array.isArray(s.pps) ? s.pps : [];
+
+      for (const ob of supplierObs) {
+        const list = obByOb.get(normalizeDocKey(ob));
+        if (list) {
+          for (const it of list) {
+            const uid = it.id || `${it.ob}_${it.pp}_${it.valor}`;
+            if (!seenDocIds.has(uid)) {
+              seenDocIds.add(uid);
+              docMatches.push(it);
+            }
+          }
+        }
+      }
+      for (const pp of supplierPps) {
+        const list = obByPp.get(normalizeDocKey(pp));
+        if (list) {
+          for (const it of list) {
+            const uid = it.id || `${it.ob}_${it.pp}_${it.valor}`;
+            if (!seenDocIds.has(uid)) {
+              seenDocIds.add(uid);
+              docMatches.push(it);
+            }
+          }
+        }
+      }
+      if (docMatches.length > 0) {
+        matchedItems = docMatches;
+      }
+    }
 
     if (!matchedItems || matchedItems.length === 0) continue;
 
-    let totalFromOB = 0;
     const porFonte: Record<string, number> = {};
     const porMes: Record<string, { total: number; count: number; porFonte: Record<string, number> }> = {};
+    let primaryFonte = '';
+    let primaryFonteValor = -1;
 
     for (let m = 0; m < matchedItems.length; m++) {
       const it = matchedItems[m];
-      totalFromOB += it.valor;
-      const fonteKey = it.fonteRecurso || 'OUTRAS';
+      const fonteKey = isValidFonteRecursoCode(it.fonteRecurso)
+        ? it.fonteRecurso.trim().toUpperCase()
+        : 'Fonte Não Identificada';
       porFonte[fonteKey] = (porFonte[fonteKey] || 0) + it.valor;
+
+      if (isValidFonteRecursoCode(fonteKey) && porFonte[fonteKey] > primaryFonteValor) {
+        primaryFonteValor = porFonte[fonteKey];
+        primaryFonte = fonteKey;
+      }
 
       const mesKey = it.mesAnoKey || 'sem_mes';
       let mesData = porMes[mesKey];
@@ -1271,14 +1371,8 @@ export function enrichSuppliersWithOrdensBancarias(
 
     s.pagamentosDetalhePorFonte = porFonte;
     s.pagamentosPorMes = porMes;
-
-    // Set or adjust valorPagoAno
-    if (!s.valorPagoAno || s.valorPagoAno === 0) {
-      s.valorPagoAno = totalFromOB;
-      s.countPagoAno = matchedItems.length;
-    } else if (totalFromOB > s.valorPagoAno) {
-      s.valorPagoAno = totalFromOB;
-      s.countPagoAno = Math.max(s.countPagoAno || 0, matchedItems.length);
+    if (primaryFonte && !s.fonteRecurso) {
+      s.fonteRecurso = primaryFonte;
     }
   }
 }

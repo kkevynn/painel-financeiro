@@ -2645,9 +2645,12 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
     }
   >();
 
-  // Maps to capture supplier classifications from natureza_despesa files without adding financial amounts
+  // Maps to capture supplier classifications from natureza_despesa and fonte_recurso from ordem_bancaria without altering official statuses or financial totals
   const supplierNaturezasMap: Record<string, Set<string>> = {};
   const supplierEmpenhosMap: Record<string, Set<string>> = {};
+  const supplierFontesAuxMap: Record<string, Record<string, number>> = {};
+  const fonteByObMap = new Map<string, string>();
+  const fonteByPpMap = new Map<string, string>();
   const neToGroupKey = new Map<string, string>();
   const docToGroupKey = new Map<string, string>();
 
@@ -2661,6 +2664,7 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
     const neCol = file.detectedNotaEmpenhoCol;
     const favNeCol = file.detectedFavorecidoNECol;
     const stage: StageKey = file.stage || detectStageFromFileName(file.fileName);
+    const isObSourceFile = stage === 'ordem_bancaria' || detectStageFromFileName(file.fileName) === 'ordem_bancaria';
 
     // Pre-cache fallback columns from file.headers (or first row) once per file to avoid Object.keys inside row loops
     const headersList = file.headers && file.headers.length > 0
@@ -2671,6 +2675,7 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
     let sitFallbackCol = '';
     let natFallbackCol = '';
     let historicoCol = '';
+    let fonteFallbackCol = '';
 
     for (const h of headersList) {
       const norm = h.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
@@ -2686,10 +2691,14 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
       if (!historicoCol && (norm.includes('historico') || norm.includes('histórico'))) {
         historicoCol = h;
       }
+      if (!fonteFallbackCol && isFonteHeader(h)) {
+        fonteFallbackCol = h;
+      }
     }
 
     let natCol = file.detectedNaturezaCol || natFallbackCol;
     let sitCol = file.detectedSituacaoCol || sitFallbackCol;
+    let fonteCol = file.detectedFonteCol || fonteFallbackCol;
 
     let fileHasSituacaoValues = false;
     if (sitCol) {
@@ -2858,6 +2867,32 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
         return;
       }
 
+      if (isObSourceFile) {
+        // Planilha de Ordem Bancária ("OBs - sigef - Principal"): atua exclusivamente como provedora de Fonte de Recursos e chaves OB/PP.
+        // Nunca sobrescreve situações oficiais (rawSit, isAO, enviadaInfo, isPPProntaValida, isConclusivoPago) nem soma nos totais financeiros.
+        let rawFonte = fonteCol && row[fonteCol] ? String(row[fonteCol]).trim().toUpperCase() : '';
+        if (!rawFonte || rawFonte === '-' || rawFonte === '0' || !isFonteString(rawFonte)) {
+          for (const cellVal of Object.values(row)) {
+            if (typeof cellVal === 'string' && isFonteString(cellVal)) {
+              rawFonte = cellVal.trim().toUpperCase();
+              break;
+            }
+          }
+        }
+        const cleanDocKey = (s?: string) => String(s || '').trim().toUpperCase().replace(/[\s\.\-\/]/g, '');
+        const obKey = cleanDocKey(rawOB);
+        const ppKey = cleanDocKey(rawNumero);
+        if (rawFonte && rawFonte !== '-' && rawFonte !== '0' && isFonteString(rawFonte)) {
+          if (obKey) fonteByObMap.set(obKey, rawFonte);
+          if (ppKey) fonteByPpMap.set(ppKey, rawFonte);
+          if (groupKey && val > 0) {
+            if (!supplierFontesAuxMap[groupKey]) supplierFontesAuxMap[groupKey] = {};
+            supplierFontesAuxMap[groupKey][rawFonte] = (supplierFontesAuxMap[groupKey][rawFonte] || 0) + val;
+          }
+        }
+        return;
+      }
+
       if (name === 'NÃO INFORMADO' && val === 0 && String(rawFav || '').trim() === '') {
         return;
       }
@@ -2885,7 +2920,7 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
         if (isAO || !fileHasSituacaoValues) {
           shouldCountInTotals = true;
         }
-      } else if (stage !== 'ordem_bancaria' && !enviadaInfo.isEnviada) {
+      } else if (!enviadaInfo.isEnviada) {
         shouldCountInTotals = true;
       }
 
@@ -2912,7 +2947,7 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
       if (numDoc && (/\b\d{4}PP\d+\b/i.test(numDoc) || stage === 'base_pps' || stage === 'pp_prontas')) {
         // Cada proposta de pagamento é única no SIGEF. Se houver desdobramento por NE, inclui a NE
         txKey = `PP_${numDoc}` + (neDoc ? `_NE_${neDoc}` : '') + (valCents > 0 ? `_${valCents}` : '');
-      } else if (obDoc && (/\b\d{4}OB\d+\b/i.test(obDoc) || stage === 'ordem_bancaria')) {
+      } else if (obDoc && /\b\d{4}OB\d+\b/i.test(obDoc)) {
         txKey = `OB_${obDoc}` + (valCents > 0 ? `_${valCents}` : '');
       } else if (stage === 'obedece' || stage === 'nao_obedece') {
         txKey = `LIQ_${stage}_${numDoc || 'S_N'}` + (neDoc ? `_NE_${neDoc}` : '') + (valCents > 0 ? `_${valCents}` : '');
@@ -2928,10 +2963,11 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
       if (existingTx) {
         // A transação já existe em arquivo anterior!
         // Atualiza a linha no banco de dados (upsert) com as informações mais recentes, SEM DUPLICAR VALORES!
+        // Planilhas de ordem_bancaria nunca devem sobrescrever situações oficiais.
         const isNewConclusivo = isSituacaoConclusivaPagamento(rawSit) || /^(PPCB|CB|PAGO|PAGA|RJ|PPRJ|C|CANCELAD|REJEITAD)/i.test(String(rawSit || '').trim());
         const isOldConclusivo = isSituacaoConclusivaPagamento(existingTx.rawSit) || /^(PPCB|CB|PAGO|PAGA|RJ|PPRJ|C|CANCELAD|REJEITAD)/i.test(String(existingTx.rawSit || '').trim());
 
-        if (isNewConclusivo || !isOldConclusivo || (rawSit && rawSit !== '-' && rawSit !== '0')) {
+        if (!isObSourceFile && (isNewConclusivo || !isOldConclusivo || (rawSit && rawSit !== '-' && rawSit !== '0'))) {
           existingTx.rawSit = rawSit || existingTx.rawSit;
           existingTx.isAO = isSituacaoAO(existingTx.rawSit);
           existingTx.enviadaInfo = isSituacaoEnviadaBanco(existingTx.rawSit);
@@ -3134,7 +3170,7 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
       supplierMap[groupKey].favorecidoNE = tx.favNEInfo.name;
     }
 
-    if (tx.isConclusivoPago && stage !== 'natureza_despesa') {
+    if (tx.isConclusivoPago && stage !== 'natureza_despesa' && stage !== 'ordem_bancaria') {
       supplierMap[groupKey].valorPagoAno = (supplierMap[groupKey].valorPagoAno || 0) + val;
       supplierMap[groupKey].countPagoAno = (supplierMap[groupKey].countPagoAno || 0) + 1;
       totalPagoAno += val;
@@ -3191,6 +3227,29 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
           supplierMap[gKey].notasEmpenho!.push(ne);
         }
       });
+    }
+  }
+  for (const [gKey, fontesObj] of Object.entries(supplierFontesAuxMap)) {
+    if (supplierMap[gKey] && !supplierMap[gKey].pagamentosDetalhePorFonte) {
+      supplierMap[gKey].pagamentosDetalhePorFonte = { ...fontesObj };
+    }
+  }
+  if (fonteByObMap.size > 0 || fonteByPpMap.size > 0) {
+    for (const s of Object.values(supplierMap)) {
+      if (!s.pagamentosDetalhePorFonte) {
+        const matchedFontes = new Set<string>();
+        (s.obs || []).forEach((ob) => {
+          const f = fonteByObMap.get(String(ob || '').trim().toUpperCase().replace(/[\s\.\-\/]/g, ''));
+          if (f) matchedFontes.add(f);
+        });
+        (s.pps || []).forEach((pp) => {
+          const f = fonteByPpMap.get(String(pp || '').trim().toUpperCase().replace(/[\s\.\-\/]/g, ''));
+          if (f) matchedFontes.add(f);
+        });
+        if (matchedFontes.size > 0 && !(s as any).fonteRecurso) {
+          (s as any).fonteRecurso = Array.from(matchedFontes)[0];
+        }
+      }
     }
   }
 

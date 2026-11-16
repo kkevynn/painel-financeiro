@@ -23,6 +23,9 @@ import {
   parseDateToMonthInfo,
   OrdemBancariaItem,
   loadOrdensBancariasFromStorage,
+  isObFileName,
+  isValidFonteRecursoCode,
+  findFonteRecursoInRow,
 } from './ordemBancariaParser';
 import {
   extractRealNlFromRow,
@@ -133,12 +136,106 @@ export function buildCompanyAuditSummary(
   let liqNaoObedeceCount = 0;
 
   const seenFileDocKeys = new Set<string>();
+  const cleanDocKey = (v?: string) => String(v || '').trim().toUpperCase().replace(/[\s\.\-\/]/g, '');
 
-  // 1. Scan all regular uploaded files (PPs, Obedece, Não Obedece, Outros)
+  // Effective OBs from "OBs - sigef - Principal" / ordensBancariasList
+  const loadedOBs = loadOrdensBancariasFromStorage();
+  const effectiveOBList: OrdemBancariaItem[] =
+    ordensBancariasList && ordensBancariasList.length > 0
+      ? ordensBancariasList
+      : (loadedOBs && loadedOBs.items) || [];
+
+  // Mapas de cruzamento estritamente para anexar Fonte de Recursos (sem nunca substituir status oficiais)
+  const obFonteByOb = new Map<string, string>();
+  const obFonteByPp = new Map<string, string>();
+  const obFonteBySupplierVal = new Map<string, string>();
+
+  if (effectiveOBList && effectiveOBList.length > 0) {
+    effectiveOBList.forEach((obItem) => {
+      if (!isValidFonteRecursoCode(obItem.fonteRecurso)) return;
+      const validFonte = obItem.fonteRecurso.trim().toUpperCase();
+      const obK = cleanDocKey(obItem.ob);
+      const ppK = cleanDocKey(obItem.pp);
+      if (obK && !obFonteByOb.has(obK)) obFonteByOb.set(obK, validFonte);
+      if (ppK && !obFonteByPp.has(ppK)) obFonteByPp.set(ppK, validFonte);
+
+      const match = matchesSupplier(
+        targetCnpjDigits,
+        targetNormName,
+        obItem.favorecidoCnpj,
+        obItem.favorecidoRaw || obItem.favorecidoName
+      );
+      if (match && (obItem.valor || 0) > 0) {
+        const valKey = String(Math.round((obItem.valor || 0) * 100));
+        if (!obFonteBySupplierVal.has(valKey)) obFonteBySupplierVal.set(valKey, validFonte);
+      }
+    });
+  }
+
+  // Pré-indexa fontes a partir de eventuais planilhas stage === 'ordem_bancaria' presentes em files
+  files.forEach((file) => {
+    const fileStage = file.stage || 'outros';
+    if (fileStage !== 'ordem_bancaria' && !isObFileName(file.fileName || '')) return;
+    const obCol = file.detectedObCol;
+    const ppCol = file.detectedPpCol || file.detectedNumeroCol;
+    const fonteCol = file.detectedFonteCol;
+    const valCol = file.detectedValorCol;
+    const favCol = file.detectedFavorecidoCol;
+
+    file.rows.forEach((row) => {
+      const rawFav = favCol ? row[favCol] : undefined;
+      if (isTotalizadorRow(row, rawFav)) return;
+      let rawFonte = fonteCol ? String(row[fonteCol] || '').trim().toUpperCase() : '';
+      if (!isValidFonteRecursoCode(rawFonte)) {
+        rawFonte = findFonteRecursoInRow(Object.values(row));
+      }
+      if (!isValidFonteRecursoCode(rawFonte)) return;
+
+      let obStr = obCol ? String(row[obCol] || '').trim() : '';
+      let ppStr = ppCol ? String(row[ppCol] || '').trim() : '';
+      if (!obStr || !ppStr) {
+        for (const v of Object.values(row)) {
+          if (v === null || v === undefined) continue;
+          const s = String(v).trim();
+          if (!obStr) {
+            const mOb = s.match(/\b\d{4}OB\d+\b/i);
+            if (mOb) obStr = mOb[0];
+          }
+          if (!ppStr) {
+            const mPp = s.match(/\b\d{4}PP\d+\b/i);
+            if (mPp) ppStr = mPp[0];
+          }
+        }
+      }
+      const obK = cleanDocKey(obStr);
+      const ppK = cleanDocKey(ppStr);
+      if (obK && !obFonteByOb.has(obK)) obFonteByOb.set(obK, rawFonte);
+      if (ppK && !obFonteByPp.has(ppK)) obFonteByPp.set(ppK, rawFonte);
+
+      const { cnpj: rowCnpj } = parseFavorecidoField(rawFav);
+      if (matchesSupplier(targetCnpjDigits, targetNormName, rowCnpj, rawFav)) {
+        const v = valCol ? parseCurrencyValue(row[valCol]) : 0;
+        if (v > 0) {
+          const valKey = String(Math.round(v * 100));
+          if (!obFonteBySupplierVal.has(valKey)) obFonteBySupplierVal.set(valKey, rawFonte);
+        }
+      }
+    });
+  });
+
+  // Registra situações oficiais lidas de obedece, nao_obedece e base_pps para nunca serem substituídas por OBs
+  const officialSituacaoByOb = new Map<string, string>();
+  const officialSituacaoByPp = new Map<string, string>();
+
+  // 1. Scan all regular uploaded files (PPs, Obedece, Não Obedece, Outros) — ignorando ordem_bancaria como fonte de status/valores
   files.forEach((file) => {
     const favCol = file.detectedFavorecidoCol;
     const valCol = file.detectedValorCol;
     const stage = file.stage || 'outros';
+
+    if (stage === 'ordem_bancaria' || isObFileName(file.fileName || '')) {
+      return;
+    }
 
     file.rows.forEach((row, rowIndex) => {
       const rawFav = row[favCol];
@@ -157,6 +254,7 @@ export function buildCompanyAuditSummary(
       // Extract document identifiers accurately without row index fallback
       let docNumber = '';
       let obNumber = '';
+      let ppNumber = '';
       let neNumber = '';
       let dateVal = '';
       let fonteRecurso = '';
@@ -177,12 +275,17 @@ export function buildCompanyAuditSummary(
           docNumber = valCandidate;
         }
       }
-      if (!docNumber && file.detectedPpCol && row[file.detectedPpCol]) {
+      if (file.detectedPpCol && row[file.detectedPpCol]) {
         const valCandidate = String(row[file.detectedPpCol] || '').trim();
-        if (isValidNL(valCandidate)) {
-          docNumber = formatCleanNL(valCandidate);
-        } else if (!/^linha\s*\d+$/i.test(valCandidate) && !/^#?\d{1,4}$/.test(valCandidate)) {
-          docNumber = valCandidate;
+        if (!ppNumber && !/^linha\s*\d+$/i.test(valCandidate) && !/^#?\d{1,4}$/.test(valCandidate)) {
+          ppNumber = valCandidate;
+        }
+        if (!docNumber) {
+          if (isValidNL(valCandidate)) {
+            docNumber = formatCleanNL(valCandidate);
+          } else if (!/^linha\s*\d+$/i.test(valCandidate) && !/^#?\d{1,4}$/.test(valCandidate)) {
+            docNumber = valCandidate;
+          }
         }
       }
 
@@ -224,6 +327,15 @@ export function buildCompanyAuditSummary(
         if (!situacao && (lk.includes('situa') || lk.includes('status') || lk.includes('sigla'))) {
           situacao = strVal;
         }
+        if (!ppNumber && (lk === 'pp' || lk.includes('proposta') || lk.includes('preparacao'))) {
+          ppNumber = strVal;
+        }
+      }
+      if (!situacao && file.detectedSituacaoCol && row[file.detectedSituacaoCol]) {
+        situacao = String(row[file.detectedSituacaoCol] || '').trim();
+      }
+      if (!obNumber && file.detectedObCol && row[file.detectedObCol]) {
+        obNumber = String(row[file.detectedObCol] || '').trim();
       }
 
       // Regex fallback across all cell values to discover any NL identifier
@@ -286,10 +398,11 @@ export function buildCompanyAuditSummary(
       });
 
       let sourceLabel = 'Outros';
-      let rowStatus = situacao || sourceLabel;
+      const sitUpper = (situacao || '').trim().toUpperCase();
+      let rowStatus = sitUpper || sourceLabel;
       let effectiveSourceType: typeof stage | 'status_banco' | 'base_pps' = stage;
 
-      if (stage === 'base_pps' || stage === 'pp_prontas' || isPPPronta) {
+      if (stage === 'base_pps' || stage === 'pp_prontas') {
         sourceLabel = 'Base de PPs';
         ppProntasValue += val;
         ppProntasCount++;
@@ -297,28 +410,82 @@ export function buildCompanyAuditSummary(
           ppProntasAOValue += val;
           ppProntasAOCount++;
           rowStatus = 'AO - Associada Ordenadores';
+        } else if (enviadaInfo.isEnviada) {
+          enviadasBancoValue += val;
+          enviadasBancoCount++;
+          rowStatus = sitUpper && !enviadaInfo.label.toUpperCase().includes(sitUpper)
+            ? `${sitUpper} - ${enviadaInfo.label}`
+            : enviadaInfo.label;
+        } else {
+          rowStatus = sitUpper || sourceLabel;
         }
         effectiveSourceType = 'base_pps';
-      } else if (enviadaInfo.isEnviada) {
-        sourceLabel = 'Enviada a Banco';
-        enviadasBancoValue += val;
-        enviadasBancoCount++;
-        rowStatus = enviadaInfo.label;
-        effectiveSourceType = 'status_banco';
       } else if (stage === 'obedece') {
         sourceLabel = 'Liquidado - Obedece';
         liqObedeceValue += val;
         liqObedeceCount++;
         effectiveSourceType = 'obedece';
+        if (isAO) {
+          rowStatus = 'AO - Associada Ordenadores';
+        } else if (enviadaInfo.isEnviada) {
+          rowStatus = sitUpper && !enviadaInfo.label.toUpperCase().includes(sitUpper)
+            ? `${sitUpper} - ${enviadaInfo.label}`
+            : enviadaInfo.label;
+        } else {
+          rowStatus = sitUpper || sourceLabel;
+        }
       } else if (stage === 'nao_obedece') {
         sourceLabel = 'Liquidado - Não Obedece';
         liqNaoObedeceValue += val;
         liqNaoObedeceCount++;
         effectiveSourceType = 'nao_obedece';
+        if (isAO) {
+          rowStatus = 'AO - Associada Ordenadores';
+        } else if (enviadaInfo.isEnviada) {
+          rowStatus = sitUpper && !enviadaInfo.label.toUpperCase().includes(sitUpper)
+            ? `${sitUpper} - ${enviadaInfo.label}`
+            : enviadaInfo.label;
+        } else {
+          rowStatus = sitUpper || sourceLabel;
+        }
+      } else if (enviadaInfo.isEnviada) {
+        sourceLabel = 'Enviada a Banco';
+        enviadasBancoValue += val;
+        enviadasBancoCount++;
+        rowStatus = sitUpper && !enviadaInfo.label.toUpperCase().includes(sitUpper)
+          ? `${sitUpper} - ${enviadaInfo.label}`
+          : enviadaInfo.label;
+        effectiveSourceType = 'status_banco';
       } else if (stage === 'natureza_despesa') {
         sourceLabel = 'Natureza da Despesa';
         effectiveSourceType = 'natureza_despesa';
+        rowStatus = sitUpper || sourceLabel;
       }
+
+      // Guarda situação oficial por OB / PP para impedir sobrescrita por metadados de OBs
+      if (sitUpper) {
+        const cleanOb = cleanDocKey(obNumber);
+        const cleanPp = cleanDocKey(ppNumber || docNumber);
+        if (cleanOb && !officialSituacaoByOb.has(cleanOb)) officialSituacaoByOb.set(cleanOb, sitUpper);
+        if (cleanPp && !officialSituacaoByPp.has(cleanPp)) officialSituacaoByPp.set(cleanPp, sitUpper);
+      }
+
+      // Cruzamento pela OB / PP (ou fornecedor+valor) na planilha de OBs apenas para anexar Fonte de Recursos
+      const obLookupKey = cleanDocKey(obNumber);
+      const ppLookupKey = cleanDocKey(ppNumber);
+      const docLookupKey = cleanDocKey(docNumber);
+      const valLookupKey = val > 0 ? String(Math.round(val * 100)) : '';
+      const matchedObFonte =
+        (obLookupKey && obFonteByOb.get(obLookupKey)) ||
+        (ppLookupKey && obFonteByPp.get(ppLookupKey)) ||
+        (docLookupKey && obFonteByPp.get(docLookupKey)) ||
+        (valLookupKey && obFonteBySupplierVal.get(valLookupKey)) ||
+        '';
+      const resolvedFonte =
+        (isValidFonteRecursoCode(matchedObFonte) ? matchedObFonte : '') ||
+        (isValidFonteRecursoCode(fonteRecurso) ? fonteRecurso.trim().toUpperCase() : '') ||
+        fonteRecurso ||
+        '0.6.00';
 
       allRows.push({
         id: `aud_${file.id}_${rowIndex}`,
@@ -329,7 +496,7 @@ export function buildCompanyAuditSummary(
         date: dateVal || undefined,
         value: val,
         status: rowStatus,
-        fonteRecurso: fonteRecurso || '0.6.00',
+        fonteRecurso: resolvedFonte,
         rawData: row,
       });
     });
@@ -378,13 +545,6 @@ export function buildCompanyAuditSummary(
 
   const seenBankDocKeys = new Set<string>();
 
-  // Effective OBs from "OBs - sigef - Principal" / ordensBancariasList
-  const loadedOBs = loadOrdensBancariasFromStorage();
-  const effectiveOBList: OrdemBancariaItem[] =
-    ordensBancariasList && ordensBancariasList.length > 0
-      ? ordensBancariasList
-      : (loadedOBs && loadedOBs.items) || [];
-
   if (effectiveOBList && effectiveOBList.length > 0) {
     effectiveOBList.forEach((obItem, obIdx) => {
       const match = matchesSupplier(
@@ -401,10 +561,19 @@ export function buildCompanyAuditSummary(
 
       bancoRecordsCount++;
 
-      const isAO = isSituacaoAO(obItem.situacao);
+      // Prioriza sempre a situação oficial registrada em Obedece / Não Obedece / Base de PPs; nunca permite sobrescrita pela planilha de OBs.
+      const obK = cleanDocKey(obItem.ob);
+      const ppK = cleanDocKey(obItem.pp);
+      const officialSit =
+        (obK && officialSituacaoByOb.get(obK)) ||
+        (ppK && officialSituacaoByPp.get(ppK)) ||
+        '';
+      const effectiveSit = officialSit || (obItem.situacao || '').trim().toUpperCase();
+
+      const isAO = isSituacaoAO(effectiveSit);
       const isConfirmed =
-        isSituacaoConclusivaPagamento(obItem.situacao) ||
-        ['CB', 'PPCB', 'CM', 'LI', 'LD', 'II', 'PAGA', 'PAGO'].includes((obItem.situacao || '').trim().toUpperCase());
+        isSituacaoConclusivaPagamento(effectiveSit) ||
+        ['CB', 'PPCB', 'CM', 'LI', 'LD', 'II', 'PAGA', 'PAGO'].includes(effectiveSit);
 
       if (isConfirmed) {
         bancoConfirmedCount++;
@@ -414,29 +583,35 @@ export function buildCompanyAuditSummary(
         bancoPendingAOValue += obItem.valor || 0;
       }
 
-      const siglaUpper = (obItem.situacao || '').trim().toUpperCase();
-      const traduzida = SITUACAO_SIGLAS[siglaUpper] || siglaUpper || (isAO ? 'Associada Ordenadores' : 'Registrada no Banco');
+      const siglaUpper = effectiveSit;
+      const traduzida = siglaUpper
+        ? (SITUACAO_SIGLAS[siglaUpper] || siglaUpper)
+        : 'Fonte de Recursos (OB)';
 
       const docDisplay =
         [obItem.ob ? `OB: ${obItem.ob}` : '', obItem.pp ? `PP: ${obItem.pp}` : ''].filter(Boolean).join(' / ') ||
         'OB Bancária';
 
+      const validObFonte = isValidFonteRecursoCode(obItem.fonteRecurso)
+        ? obItem.fonteRecurso.trim().toUpperCase()
+        : (obItem.fonteRecurso || '0.6.00');
+
       allRows.push({
         id: `aud_ob_${obItem.id || obIdx}`,
         sourceType: 'status_banco',
-        sourceLabel: isAO ? 'Ordem Bancária (AO)' : isConfirmed ? 'Ordem Bancária (Paga)' : 'Ordem Bancária (Banco)',
-        sourceFileName: 'OBs - sigef - Principal (dados ajustados)',
+        sourceLabel: isAO ? 'Ordem Bancária (AO)' : isConfirmed ? 'Ordem Bancária (Paga)' : 'Ordem Bancária (Fonte)',
+        sourceFileName: 'OBs - sigef - Principal (Fonte de Recursos)',
         documentNumber: docDisplay,
         date: obItem.dataReferencia || obItem.dataIso || undefined,
         value: obItem.valor || 0,
-        status: `${siglaUpper || (isAO ? 'AO' : 'OB')} - ${traduzida}`,
-        fonteRecurso: obItem.fonteRecurso || '0.6.00',
+        status: siglaUpper ? `${siglaUpper} - ${traduzida}` : 'OB - Fonte de Recursos',
+        fonteRecurso: validObFonte,
         details: [
           obItem.ob ? `OB: ${obItem.ob}` : '',
           obItem.pp ? `PP: ${obItem.pp}` : '',
           obItem.mesAnoLabel ? `Mês Ref: ${obItem.mesAnoLabel}` : '',
         ].filter(Boolean).join(' • '),
-        rawData: obItem as any,
+        rawData: { ...(obItem as any), situacao: siglaUpper },
       });
     });
   }
