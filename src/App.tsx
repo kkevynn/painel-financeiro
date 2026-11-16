@@ -68,6 +68,10 @@ export function App() {
   const [activeTab, setActiveTab] = useState('painel');
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [lastProcessedAt, setLastProcessedAt] = useState<Date | null>(null);
+  const lastProcessedAtRef = useRef<Date | null>(lastProcessedAt);
+  useEffect(() => {
+    lastProcessedAtRef.current = lastProcessedAt;
+  }, [lastProcessedAt]);
 
   const [session, setSession] = useState<AuthSession | null>(() => getCurrentSession());
 
@@ -614,6 +618,15 @@ export function App() {
       setDriveState(state);
     });
 
+    // Provide currently loaded file names so auto-polling never downloads unrelated files from Drive
+    googleDriveService.registerExistingFilesProvider(() => {
+      const names = filesRef.current.map((f) => f.fileName).filter(Boolean);
+      if (ordensBancariasFileNameRef.current && !names.includes(ordensBancariasFileNameRef.current)) {
+        names.push(ordensBancariasFileNameRef.current);
+      }
+      return { names, lastSyncAt: lastProcessedAtRef.current };
+    });
+
     // When Google Drive delivers a file (either manual sync or 20-minute background auto-polling)
     googleDriveService.registerNewFileCallback(async (file: File, isAuto: boolean) => {
       if (isAuto) {
@@ -703,8 +716,8 @@ export function App() {
           titulo: 'Conta Google Conectada',
           mensagem: 'Sincronização em nuvem (Tablet/PC) e Google Drive ativadas com sucesso.',
         });
-        // Immediately fetch the latest financial report from Drive and sync cloud state
-        await handleSyncDriveNow();
+        // Immediately sync only currently loaded financial reports from Drive (incremental) and sync cloud state
+        await handleSyncDriveNow(false);
       }
     } catch (err: any) {
       toastAlertService.addToast({
@@ -729,15 +742,20 @@ export function App() {
     });
   };
 
-  const handleSyncDriveNow = async () => {
+  const handleSyncDriveNow = async (forceParam: boolean | unknown = true) => {
     if (isDriveSyncing) return;
+    const force = typeof forceParam === 'boolean' ? forceParam : true;
     setIsDriveSyncing(true);
     setIsProcessing(true);
     setProcessingProgress(20);
     setProcessingMessage('Sincronizando com Google Drive e Nuvem...');
     try {
       setProcessingProgress(40);
-      const result = await googleDriveService.syncNow(true);
+      const currentFileNames = filesRef.current.map((f) => f.fileName).filter(Boolean);
+      if (ordensBancariasFileNameRef.current && !currentFileNames.includes(ordensBancariasFileNameRef.current)) {
+        currentFileNames.push(ordensBancariasFileNameRef.current);
+      }
+      const result = await googleDriveService.syncNow(currentFileNames, lastProcessedAt, force);
       
       // Also sync Firestore cloud state across Tablet & PC
       try {
