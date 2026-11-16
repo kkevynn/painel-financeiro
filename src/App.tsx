@@ -129,11 +129,16 @@ export function App() {
     return { ...baseMetrics };
   }, []);
 
-  // Ref to always access latest ordensBancariasList inside async handlers
+  // Ref to always access latest ordensBancariasList and fileName inside async handlers
   const ordensBancariasListRef = useRef<OrdemBancariaItem[] | null>(ordensBancariasList);
   useEffect(() => {
     ordensBancariasListRef.current = ordensBancariasList;
   }, [ordensBancariasList]);
+
+  const ordensBancariasFileNameRef = useRef<string>(ordensBancariasFileName);
+  useEffect(() => {
+    ordensBancariasFileNameRef.current = ordensBancariasFileName;
+  }, [ordensBancariasFileName]);
 
   // Update ordens bancarias handler
   const handleUpdateOrdensBancariasList = (list: OrdemBancariaItem[] | null, fileName?: string) => {
@@ -150,7 +155,10 @@ export function App() {
 
     ordensBancariasListRef.current = list;
     setOrdensBancariasList(list);
-    if (fileName !== undefined) setOrdensBancariasFileName(fileName);
+    if (fileName !== undefined) {
+      ordensBancariasFileNameRef.current = fileName;
+      setOrdensBancariasFileName(fileName);
+    }
     saveOrdensBancariasToStorage(list, fileName);
 
     // Immediately re-enrich current metrics
@@ -158,7 +166,7 @@ export function App() {
       const cloned = { ...prev, consolidatedSuppliers: [...prev.consolidatedSuppliers] };
       return applyEnrichment(cloned, list);
     });
-    triggerAlertAnalysis(files, list);
+    triggerAlertAnalysis(filesRef.current, list);
   };
 
   // State for Extrato Geral de Auditoria da Empresa
@@ -202,6 +210,15 @@ export function App() {
     toast: ToastAlert,
     changes: { situacao: string; valor?: number; observacao?: string }
   ) => {
+    if (session?.role !== 'admin') {
+      toastAlertService.addToast({
+        tipo: 'aviso',
+        titulo: 'Acesso Restrito',
+        mensagem: 'Modo Consulta: apenas Administradores podem alterar registros.',
+      });
+      return;
+    }
+
     const ppTarget = (toast.pp || '').trim().toLowerCase();
     const obTarget = (toast.ob || '').trim().toLowerCase();
 
@@ -302,6 +319,7 @@ export function App() {
         if (obStored && obStored.items && obStored.items.length > 0 && storedHasValidFonte) {
           ordensBancariasListRef.current = obStored.items;
           setOrdensBancariasList(obStored.items);
+          ordensBancariasFileNameRef.current = obStored.fileName || '';
           setOrdensBancariasFileName(obStored.fileName || '');
         }
 
@@ -342,12 +360,14 @@ export function App() {
             const finalObFileName = extractedObFileName || 'Consolidado de Arquivos';
             ordensBancariasListRef.current = allExtracted;
             setOrdensBancariasList(allExtracted);
+            ordensBancariasFileNameRef.current = finalObFileName;
             setOrdensBancariasFileName(finalObFileName);
             saveOrdensBancariasToStorage(allExtracted, finalObFileName);
             obStored = { items: allExtracted, fileName: finalObFileName };
           } else if (obStored?.items && obStored.items.length > 0) {
             ordensBancariasListRef.current = obStored.items;
             setOrdensBancariasList(obStored.items);
+            ordensBancariasFileNameRef.current = obStored.fileName || '';
             setOrdensBancariasFileName(obStored.fileName || '');
           }
         }
@@ -412,6 +432,7 @@ export function App() {
                   setLastProcessedAt(new Date(cached.lastSyncAt));
                 }
                 if (cached.obFileName) {
+                  ordensBancariasFileNameRef.current = cached.obFileName;
                   setOrdensBancariasFileName(cached.obFileName);
                 }
                 restoredFromCache = true;
@@ -571,9 +592,9 @@ export function App() {
           setMetrics(finalEnriched);
           triggerAlertAnalysis(finalFiles, finalOBs);
           saveAppState(finalFiles, lastProcessedAt);
-          // Auto-save automatically to Cloud Firestore (apenas Administrador)
+          // Auto-save automatically to Cloud Drive (apenas Administrador)
           if (session?.role === 'admin') {
-            cloudSyncService.pushToCloud(finalFiles, finalOBs, ordensBancariasFileName, finalEnriched).catch((e) => {
+            cloudSyncService.pushToCloud(finalFiles, finalOBs, ordensBancariasFileNameRef.current, finalEnriched).catch((e) => {
               console.warn('Auto-save na nuvem pós-upload:', e);
             });
           }
@@ -619,27 +640,41 @@ export function App() {
 
     cloudSyncService.registerDatasetReloadCallback((reloadedFiles, reloadedOBs, syncDate, reloadedMetrics) => {
       if (reloadedFiles && reloadedFiles.length > 0) {
-        setFiles(reloadedFiles);
         filesRef.current = reloadedFiles;
-      }
-      if (reloadedOBs && reloadedOBs.length > 0) {
-        setOrdensBancariasList(reloadedOBs);
-      }
-      if (syncDate) {
-        setLastProcessedAt(syncDate);
-      }
+        setFiles(reloadedFiles);
 
-      // Se reloadedMetrics vier da nuvem, aplica DIRETAMENTE sem recalcular
-      if (reloadedMetrics && reloadedMetrics.isProcessed) {
-        setMetrics(reloadedMetrics);
-      } else if (reloadedFiles && reloadedFiles.length > 0) {
-        try {
-          const processed = processUploadedFiles(reloadedFiles);
-          const enriched = applyEnrichment(processed, reloadedOBs || ordensBancariasList);
-          setMetrics(enriched);
-        } catch (e) {
-          console.warn('Erro ao processar dados recarregados da nuvem:', e);
+        if (reloadedOBs && reloadedOBs.length > 0) {
+          ordensBancariasListRef.current = reloadedOBs;
+          setOrdensBancariasList(reloadedOBs);
+        } else if (reloadedOBs === null) {
+          ordensBancariasListRef.current = null;
+          setOrdensBancariasList(null);
         }
+        if (syncDate) {
+          setLastProcessedAt(syncDate);
+        }
+
+        // Se reloadedMetrics vier da nuvem, aplica DIRETAMENTE sem recalcular
+        if (reloadedMetrics && reloadedMetrics.isProcessed) {
+          setMetrics(reloadedMetrics);
+        } else {
+          try {
+            const processed = processUploadedFiles(reloadedFiles);
+            const enriched = applyEnrichment(processed, reloadedOBs || ordensBancariasListRef.current);
+            setMetrics(enriched);
+          } catch (e) {
+            console.warn('Erro ao processar dados recarregados da nuvem:', e);
+          }
+        }
+      } else if (Array.isArray(reloadedFiles) && reloadedFiles.length === 0 && !reloadedMetrics?.isProcessed) {
+        filesRef.current = [];
+        setFiles([]);
+        ordensBancariasListRef.current = null;
+        setOrdensBancariasList(null);
+        ordensBancariasFileNameRef.current = '';
+        setOrdensBancariasFileName('');
+        setMetrics(initialMetrics);
+        setLastProcessedAt(null);
       }
     });
 
@@ -744,6 +779,8 @@ export function App() {
 
   // Change file stage tag
   const handleChangeFileStage = (fileId: string, stage: StageKey) => {
+    if (session?.role !== 'admin') return;
+
     hasUserChangesRef.current = true;
     let targetUpdatedFile: FileData | null = null;
     const updated = filesRef.current.map((f) => {
@@ -757,7 +794,7 @@ export function App() {
     filesRef.current = updated;
     setFiles(updated);
 
-    let targetOBs = ordensBancariasList;
+    let targetOBs = ordensBancariasListRef.current;
     if (stage === 'ordem_bancaria' && targetUpdatedFile) {
       const extracted = extractOrdensBancariasFromFileData(targetUpdatedFile);
       if (extracted.length > 0) {
@@ -770,11 +807,9 @@ export function App() {
     const enriched = applyEnrichment(newMetrics, targetOBs);
     setMetrics(enriched);
     triggerAlertAnalysis(updated, targetOBs);
-    if (session?.role === 'admin') {
-      cloudSyncService.pushToCloud(updated, targetOBs, ordensBancariasFileName, enriched).catch((e) => {
-        console.warn('Auto-save na nuvem alteração de etapa:', e);
-      });
-    }
+    cloudSyncService.pushToCloud(updated, targetOBs, ordensBancariasFileNameRef.current, enriched).catch((e) => {
+      console.warn('Auto-save na nuvem alteração de etapa:', e);
+    });
   };
 
   // Remove file action
@@ -822,7 +857,7 @@ export function App() {
       setMetrics(enriched);
       saveAppState(updated, lastProcessedAt);
       if (session?.role === 'admin') {
-        cloudSyncService.pushToCloud(updated, targetOBs, ordensBancariasFileName, enriched).catch((e) => {
+        cloudSyncService.pushToCloud(updated, targetOBs, ordensBancariasFileNameRef.current, enriched).catch((e) => {
           console.warn('Auto-save na nuvem remoção de arquivo:', e);
         });
       }
@@ -842,7 +877,7 @@ export function App() {
         setLastProcessedAt(now);
         saveAppState(files, now);
         if (session?.role === 'admin') {
-          cloudSyncService.pushToCloud(files, ordensBancariasList, ordensBancariasFileName, enriched).catch((e) => {
+          cloudSyncService.pushToCloud(files, ordensBancariasList, ordensBancariasFileNameRef.current, enriched).catch((e) => {
             console.warn('Auto-save na nuvem processamento de dados:', e);
           });
         }
@@ -930,7 +965,13 @@ export function App() {
     setIsProcessing(true);
     setProcessingMessage('Limpando dados e redefinindo painel...');
     try {
+      filesRef.current = [];
       setFiles([]);
+      ordensBancariasListRef.current = null;
+      setOrdensBancariasList(null);
+      ordensBancariasFileNameRef.current = '';
+      setOrdensBancariasFileName('');
+      saveOrdensBancariasToStorage(null, '');
       setMetrics(initialMetrics);
       setLastProcessedAt(null);
       await clearAppState();
@@ -1006,7 +1047,7 @@ export function App() {
     saveAppState(updated, lastProcessedAt || new Date());
     triggerAlertAnalysis(updated, targetOBs);
     if (session?.role === 'admin') {
-      cloudSyncService.pushToCloud(updated, targetOBs, ordensBancariasFileName, enriched).catch((e) => {
+      cloudSyncService.pushToCloud(updated, targetOBs, ordensBancariasFileNameRef.current, enriched).catch((e) => {
         console.warn('Auto-save na nuvem mapeamento de colunas:', e);
       });
     }
@@ -1107,13 +1148,19 @@ export function App() {
                         </h2>
                       </div>
                       <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
-                        <button
-                          onClick={() => handleTabChange('importacoes')}
-                          className="w-full sm:w-auto px-6 py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm rounded-xl transition flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/20 cursor-pointer active:scale-98"
-                        >
-                          <span>Ir para Importação de Planilhas</span>
-                          <ArrowRight className="w-4 h-4" />
-                        </button>
+                        {session?.role === 'admin' ? (
+                          <button
+                            onClick={() => handleTabChange('importacoes')}
+                            className="w-full sm:w-auto px-6 py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm rounded-xl transition flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/20 cursor-pointer active:scale-98"
+                          >
+                            <span>Ir para Importação de Planilhas</span>
+                            <ArrowRight className="w-4 h-4" />
+                          </button>
+                        ) : (
+                          <span className="text-xs text-emerald-300/80 font-medium">
+                            Aguardando publicação de dados pelo Administrador.
+                          </span>
+                        )}
                       </div>
                     </div>
                   ) : (

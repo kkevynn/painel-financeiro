@@ -795,12 +795,29 @@ class ToastAlertManager {
     }
   > {
     const records: Record<string, any> = {};
+    const obFonteByOb = new Map<string, string>();
+    const obFonteByPp = new Map<string, string>();
 
-    // 1. Extract from Ordens Bancárias
+    // 1. Extract from Ordens Bancárias (itens marcados como isFonteProviderOnly apenas fornecem Fonte, sem gerar/sobrescrever status)
     if (ordensBancariasList && ordensBancariasList.length > 0) {
       ordensBancariasList.forEach((obItem) => {
         const obNum = isValidOBString(obItem.ob) ? obItem.ob.trim().toUpperCase() : '';
         const ppNum = cleanDocStr(obItem.pp);
+        const fonteClean = (obItem.fonteRecurso || '').trim();
+        if (fonteClean && fonteClean !== 'OUTRAS' && !fonteClean.toLowerCase().includes('não identificada')) {
+          if (obNum) obFonteByOb.set(cleanDocStr(obNum), fonteClean);
+          if (ppNum) obFonteByPp.set(ppNum, fonteClean);
+        }
+
+        if (obItem.isFonteProviderOnly) {
+          return;
+        }
+
+        const sitStr = (obItem.situacao || '').trim().toUpperCase();
+        if (!sitStr) {
+          return;
+        }
+
         const cnpjNum = (obItem.favorecidoCnpj || '').replace(/\D/g, '');
         let valNum = typeof obItem.valor === 'number' ? obItem.valor : 0;
         if (
@@ -814,11 +831,10 @@ class ToastAlertManager {
         ) {
           valNum = 0;
         }
-        const sitStr = (obItem.situacao || 'CB').trim().toUpperCase();
         const isRejected = isSituacaoRejeitada(sitStr);
-        const isConclusivo = isSituacaoConclusivaPagamento(sitStr) || sitStr === 'CB' || !isRejected;
+        const isConclusivo = isSituacaoConclusivaPagamento(sitStr) || isSituacaoConfirmadaBanco(sitStr).isMatch;
 
-        const fonteRecurso = (obItem.fonteRecurso || '').trim() || 'OUTRAS';
+        const fonteRecurso = fonteClean || 'OUTRAS';
         const isFonte600 = isFonte600OuDerivada(fonteRecurso);
 
         const key = ppNum
@@ -851,8 +867,28 @@ class ToastAlertManager {
       });
     }
 
-    // 2. Extract from Files
+    // Pré-indexa Fontes das planilhas stage === 'ordem_bancaria' sem alterar situações oficiais
     files.forEach((file) => {
+      if (file.stage !== 'ordem_bancaria') return;
+      const numCol = file.detectedNumeroCol || file.detectedPpCol;
+      const obCol = file.detectedObCol;
+      const fonteCol = file.detectedFonteCol || file.headers?.find((k) => isFonteHeader(k));
+      (file.rows || []).forEach((row) => {
+        let rawFonte = fonteCol ? String(row[fonteCol] || '').trim() : '';
+        if (!rawFonte || rawFonte === '-' || rawFonte === '0') {
+          rawFonte = findFonteRecursoInRow(Object.values(row));
+        }
+        if (!rawFonte || rawFonte === 'OUTRAS') return;
+        const obKey = obCol ? cleanDocStr(row[obCol]) : '';
+        const ppKey = numCol ? cleanDocStr(row[numCol]) : '';
+        if (obKey) obFonteByOb.set(obKey, rawFonte);
+        if (ppKey) obFonteByPp.set(ppKey, rawFonte);
+      });
+    });
+
+    // 2. Extract from Files (ignora ordem_bancaria para nunca sobrescrever situação oficial de Liquidação/Base de PPs)
+    files.forEach((file) => {
+      if (file.stage === 'ordem_bancaria') return;
       const sitCol = file.detectedSituacaoCol;
       const sitObCol = file.detectedSituacaoObCol;
       const numCol = file.detectedNumeroCol || file.detectedPpCol;
@@ -1014,6 +1050,17 @@ class ToastAlertManager {
         const ppNum = cleanDocStr(rawNum);
         const neNum = cleanDocStr(rawNE);
 
+        // Enriquecimento opcional de Fonte via OBs quando o arquivo oficial não traz coluna Fonte
+        const enrichedFonte =
+          (rawFonte && rawFonte !== 'OUTRAS' ? rawFonte : '') ||
+          (ppNum ? obFonteByPp.get(ppNum) : '') ||
+          (obNum ? obFonteByOb.get(cleanDocStr(obNum)) : '') ||
+          '';
+        if (enrichedFonte) {
+          rawFonte = enrichedFonte;
+        }
+        const resolvedIsFonte600 = isFonte600OuDerivada(rawFonte);
+
         const isRejected = isSituacaoRejeitada(rawSit) || isSituacaoRejeitadaBanco(rawSit).isMatch;
         const isConclusivo = isSituacaoConclusivaPagamento(rawSit) || isSituacaoConfirmadaBanco(rawSit).isMatch || (!!obNum && !isRejected);
 
@@ -1041,7 +1088,7 @@ class ToastAlertManager {
           isConclusivo,
           isRejected,
           fonteRecurso: rawFonte || 'OUTRAS',
-          isFonte600,
+          isFonte600: resolvedIsFonte600,
           stage: file.stage,
           dataReferencia: rowDateInfo?.dateStr,
           fileName: file.fileName,
@@ -1057,7 +1104,7 @@ class ToastAlertManager {
           const trueFav = favName || existing.fornecedor || '';
           const trueCnpj = favCnpj || existing.cnpj || '';
           const trueFonte = (rawFonte && rawFonte !== 'OUTRAS') ? rawFonte : (existing.fonteRecurso || 'OUTRAS');
-          const trueIsF600 = isFonte600 || existing.isFonte600;
+          const trueIsF600 = resolvedIsFonte600 || existing.isFonte600;
 
           const isBetterSit =
             (isSituacaoAOOuVazia(existing.situacao) && !isSituacaoAOOuVazia(rawSit)) ||

@@ -12,10 +12,12 @@ import {
 } from 'firebase/auth';
 import { auth, googleAuthProvider } from '../firebase';
 import { FileData, DashboardMetrics, ConsolidatedSupplier } from '../types';
-import { saveAppState, loadAppState } from './storageService';
+import { saveAppState, loadAppState, clearAppState } from './storageService';
 import {
   saveStoredOrdensBancarias,
   getStoredOrdensBancarias,
+  loadOrdensBancariasAsync,
+  clearStoredOrdensBancarias,
   OrdemBancariaItem,
   enrichSuppliersWithOrdensBancarias,
 } from './ordemBancariaParser';
@@ -31,6 +33,7 @@ export const DRIVE_DATABASE_FOLDER_NAME = 'Painel_Financeiro_SESAP_Dados';
 const GOOGLE_DRIVE_SYNC_URL =
   'https://script.google.com/macros/s/AKfycbyIKBVLRR2hSLt2Ci--84mvBkf8tpvL3QI6GtTkgsWijEOFQiZXInvoE9w303GDCvVA/exec';
 const METRICS_CACHE_STORAGE_KEY = 'painel_fes_metrics_cache_v1';
+const LAST_PUSHED_VERSION_KEY = 'painel_fes_last_pushed_version_v1';
 
 export interface CloudSyncState {
   isAuthenticated: boolean;
@@ -77,14 +80,41 @@ class CloudSyncService {
       ) => void)
     | null = null;
 
+  private broadcastChannel: BroadcastChannel | null = null;
+
   constructor() {
     this.initAuthListener();
+    this.initBroadcastChannel();
     this.startAutoPolling();
     setTimeout(() => {
       this.checkAndAutoSync().catch((e) => {
         console.warn('Auto-sync inicial Google Drive:', e);
       });
     }, 300);
+  }
+
+  private initBroadcastChannel() {
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        this.broadcastChannel = new BroadcastChannel('sesap_cloud_sync_channel');
+        this.broadcastChannel.onmessage = (ev) => {
+          if (ev?.data?.type === 'cloud_updated' || ev?.data?.type === 'cloud_cleared') {
+            this.lastRemoteVersion = null;
+            this.pullFromCloud(false).catch((e) => {
+              console.warn('Sync via BroadcastChannel:', e);
+            });
+          }
+        };
+      }
+    } catch (_) {
+      // BroadcastChannel opcional
+    }
+  }
+
+  private notifyOtherTabs(type: 'cloud_updated' | 'cloud_cleared') {
+    try {
+      this.broadcastChannel?.postMessage({ type, at: Date.now() });
+    } catch (_) {}
   }
 
   private initAuthListener() {
@@ -278,9 +308,13 @@ class CloudSyncService {
       const nowDate = new Date();
       const nowIso = nowDate.toISOString();
       const version = Date.now();
-      const effectiveOBs = obsList || getStoredOrdensBancarias().items || [];
+      const asyncObState = !obsList || !obFileName ? await loadOrdensBancariasAsync() : null;
+      const effectiveOBs = obsList || asyncObState?.items || getStoredOrdensBancarias().items || [];
       const effectiveOBFileName =
-        obFileName || getStoredOrdensBancarias().fileName || 'OBs - sigef - Principal';
+        obFileName ||
+        asyncObState?.fileName ||
+        getStoredOrdensBancarias().fileName ||
+        'OBs - sigef - Principal';
 
       // 1. Obter ou calcular as métricas consolidadas
       let activeMetrics: DashboardMetrics;
@@ -467,6 +501,9 @@ class CloudSyncService {
       }
 
       this.lastRemoteVersion = version;
+      try {
+        localStorage.setItem(LAST_PUSHED_VERSION_KEY, String(version));
+      } catch (_) {}
       this.saveMetricsCache(metricsPayload, nowDate, effectiveOBFileName);
 
       this.updateState({
@@ -478,6 +515,7 @@ class CloudSyncService {
         errorMessage: null,
       });
 
+      this.notifyOtherTabs('cloud_updated');
       if (typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('finance_cloud_data_updated'));
       }
@@ -527,7 +565,7 @@ class CloudSyncService {
       }
 
       const data = await response.json();
-      if (!data || !data.metrics) {
+      if (!data) {
         if (!onlyIfNewer) {
           this.updateState({ isSyncing: false, syncStatus: 'idle' });
         }
@@ -538,7 +576,7 @@ class CloudSyncService {
       const syncDate = data.lastSyncAt ? new Date(data.lastSyncAt) : new Date();
       const validSyncDate = isNaN(syncDate.getTime()) ? new Date() : syncDate;
 
-      // No polling automático a cada 60s, evita re-renderizações desnecessárias se a versão for idêntica
+      // No polling automático a cada 15s, evita re-renderizações desnecessárias se a versão for idêntica
       if (
         onlyIfNewer &&
         remoteVersion &&
@@ -547,6 +585,47 @@ class CloudSyncService {
       ) {
         this.updateState({ syncStatus: 'synced', isSyncing: false });
         return true;
+      }
+
+      // Trata limpeza remota do workspace feita pelo Administrador
+      if (!data.metrics) {
+        const isExplicitClear =
+          data.totalFiles === 0 &&
+          Array.isArray(data.filesSummary) &&
+          data.filesSummary.length === 0;
+        if (isExplicitClear) {
+          await clearAppState();
+          clearStoredOrdensBancarias();
+          try {
+            localStorage.removeItem(METRICS_CACHE_STORAGE_KEY);
+            localStorage.removeItem(LAST_PUSHED_VERSION_KEY);
+          } catch (_) {}
+
+          this.lastRemoteVersion = remoteVersion || validSyncDate.getTime();
+          this.lastPulledData = {
+            files: [],
+            obs: null,
+            metrics: null,
+            syncDate: validSyncDate,
+          };
+          this.updateState({
+            isSyncing: false,
+            syncStatus: 'synced',
+            lastSyncAt: validSyncDate,
+            lastSyncDevice: data.deviceType || 'Google Drive',
+            remoteFilesCount: 0,
+            errorMessage: null,
+          });
+          if (this.onDatasetReloadCallback) {
+            this.onDatasetReloadCallback([], null, validSyncDate, null);
+          }
+          return true;
+        }
+
+        if (!onlyIfNewer) {
+          this.updateState({ isSyncing: false, syncStatus: 'idle' });
+        }
+        return false;
       }
 
       // 1. Restaurar metrics
@@ -649,20 +728,39 @@ class CloudSyncService {
         }
       }
 
-      // Quando onlyIfNewer === false (abertura do app ou sincronização manual), ignora o cache local e prioriza os dados da nuvem
+      // Preserva arquivos e OBs locais completos do Administrador quando o snapshot remoto corresponde à mesma versão enviada localmente (evita downgrade de 36k linhas para resumo de 200 linhas no F5)
       const localState = await loadAppState();
       const localFiles = localState?.files || [];
       const localTotalRows = localFiles.reduce((acc, f) => acc + (f.rows?.length || 0), 0);
       const remoteTotalRows = parsedFilesSummary.reduce((acc, f) => acc + (f.rows?.length || 0), 0);
       const localSavedTime = localState?.savedAt ? new Date(localState.savedAt).getTime() : 0;
 
+      let lastPushedVersion: string | null = null;
+      try {
+        lastPushedVersion = localStorage.getItem(LAST_PUSHED_VERSION_KEY);
+      } catch (_) {}
+      const isSameLocalPushedVersion =
+        Boolean(remoteVersion && lastPushedVersion && String(remoteVersion) === lastPushedVersion);
+
       const preserveLocalFiles =
-        onlyIfNewer &&
         localFiles.length > 0 &&
         localTotalRows > remoteTotalRows &&
-        localSavedTime >= validSyncDate.getTime();
+        (isSameLocalPushedVersion || (onlyIfNewer && localSavedTime >= validSyncDate.getTime()));
 
       const effectiveFiles = preserveLocalFiles ? localFiles : parsedFilesSummary;
+
+      const localOBState = await loadOrdensBancariasAsync();
+      const localOBs = localOBState?.items || [];
+      const preserveLocalOBs =
+        localOBs.length > 0 &&
+        localOBs.length > parsedCompactOBs.length &&
+        (isSameLocalPushedVersion || (onlyIfNewer && localSavedTime >= validSyncDate.getTime()));
+
+      const effectiveOBs = preserveLocalOBs
+        ? localOBs
+        : parsedCompactOBs.length > 0
+        ? parsedCompactOBs
+        : null;
 
       // Salvar localmente no IndexedDB apenas se NÃO estiver sobrescrevendo arquivos locais mais completos
       if (!preserveLocalFiles && parsedFilesSummary.length > 0) {
@@ -672,7 +770,7 @@ class CloudSyncService {
           console.warn('Erro ao salvar localmente dados baixados do Drive:', e);
         }
       }
-      if (parsedCompactOBs.length > 0) {
+      if (!preserveLocalOBs && parsedCompactOBs.length > 0) {
         try {
           saveStoredOrdensBancarias(parsedCompactOBs, obFileName);
         } catch (e) {
@@ -682,10 +780,7 @@ class CloudSyncService {
 
       // Atualiza silenciosamente a base comparativa (BASELINE_SNAPSHOT_KEY) sem disparar alertas falsos no login
       try {
-        toastAlertService.forceUpdateBaseline(
-          effectiveFiles,
-          parsedCompactOBs.length > 0 ? parsedCompactOBs : null
-        );
+        toastAlertService.forceUpdateBaseline(effectiveFiles, effectiveOBs);
       } catch (e) {
         console.warn('Erro ao atualizar baseline após pullFromCloud:', e);
       }
@@ -698,7 +793,7 @@ class CloudSyncService {
       // Salva no cache em memória
       this.lastPulledData = {
         files: effectiveFiles,
-        obs: parsedCompactOBs.length > 0 ? parsedCompactOBs : null,
+        obs: effectiveOBs,
         metrics: parsedMetrics,
         syncDate: validSyncDate,
       };
@@ -716,7 +811,7 @@ class CloudSyncService {
       if (this.onDatasetReloadCallback) {
         this.onDatasetReloadCallback(
           effectiveFiles,
-          parsedCompactOBs.length > 0 ? parsedCompactOBs : null,
+          effectiveOBs,
           validSyncDate,
           parsedMetrics
         );
@@ -751,9 +846,10 @@ class CloudSyncService {
         const localState = await loadAppState();
         const localFiles = localState?.files || [];
         if (localFiles.length > 0) {
-          const localOBs = getStoredOrdensBancarias().items || [];
+          const asyncOB = await loadOrdensBancariasAsync();
+          const localOBs = asyncOB.items || getStoredOrdensBancarias().items || [];
           console.log('Google Drive vazio; enviando estado local do Administrador...');
-          await this.pushToCloud(localFiles, localOBs);
+          await this.pushToCloud(localFiles, localOBs, asyncOB.fileName);
         }
       }
     } catch (err) {
@@ -769,11 +865,12 @@ class CloudSyncService {
     try {
       this.isProcessingSync = true;
       const nowIso = new Date().toISOString();
+      const clearVersion = Date.now();
       const clearPayload = {
         lastSyncAt: nowIso,
         deviceType: this.getDeviceName(),
         totalFiles: 0,
-        version: Date.now(),
+        version: clearVersion,
         obFileName: '',
         metrics: null,
         filesSummary: [],
@@ -792,15 +889,20 @@ class CloudSyncService {
 
       try {
         localStorage.removeItem(METRICS_CACHE_STORAGE_KEY);
+        localStorage.removeItem(LAST_PUSHED_VERSION_KEY);
       } catch (_) {}
 
-      this.lastRemoteVersion = null;
+      this.lastRemoteVersion = clearVersion;
       this.lastPulledData = null;
       this.updateState({
         remoteFilesCount: 0,
         lastSyncAt: new Date(),
         syncStatus: 'synced',
       });
+      this.notifyOtherTabs('cloud_cleared');
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('finance_cloud_data_updated'));
+      }
       console.log('Workspace no Google Drive limpo com sucesso.');
     } catch (err) {
       console.warn('Erro ao limpar workspace no Google Drive:', err);
@@ -878,7 +980,11 @@ class CloudSyncService {
       return true;
     } catch (err: any) {
       console.error('Erro ao restaurar backup:', err);
-      alert('Falha ao restaurar backup: ' + (err.message || 'Arquivo corrompido'));
+      toastAlertService.addToast({
+        tipo: 'critico',
+        titulo: 'Falha ao Restaurar Backup',
+        mensagem: err?.message || 'Arquivo de backup corrompido ou formato inválido.',
+      });
       return false;
     }
   }

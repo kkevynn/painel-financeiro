@@ -27,6 +27,7 @@ export const ParaPublicarView: React.FC = () => {
   const [filterSource, setFilterSource] = useState<string>('all');
   const [sortBy, setSortBy] = useState<'date' | 'value' | 'supplier' | 'doc'>('date');
   const [sortAsc, setSortAsc] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
 
   useEffect(() => {
     const unsub = paraPublicarService.subscribe((newItems) => {
@@ -173,9 +174,8 @@ export const ParaPublicarView: React.FC = () => {
   };
 
   const handleClearAll = () => {
-    if (window.confirm('Deseja realmente limpar toda a lista de liquidações para publicar?')) {
-      paraPublicarService.clearAll();
-    }
+    paraPublicarService.clearAll();
+    setConfirmClear(false);
   };
 
   return (
@@ -335,15 +335,35 @@ export const ParaPublicarView: React.FC = () => {
               <span>Exportar Excel</span>
             </button>
             {items.length > 0 && (
-              <button
-                type="button"
-                onClick={handleClearAll}
-                className="px-3.5 py-2 bg-slate-100 hover:bg-red-50 text-slate-600 hover:text-red-600 text-xs font-bold rounded-xl transition flex items-center gap-1.5 border border-slate-200 hover:border-red-200 cursor-pointer active:scale-95"
-                title="Limpar todas as liquidações da fila"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-                <span>Limpar Fila</span>
-              </button>
+              confirmClear ? (
+                <div className="flex items-center gap-1.5 bg-red-50 border border-red-200 rounded-xl px-2.5 py-1.5">
+                  <span className="text-[11px] font-bold text-red-800">Limpar fila?</span>
+                  <button
+                    type="button"
+                    onClick={handleClearAll}
+                    className="px-2 py-0.5 bg-red-600 hover:bg-red-700 text-white rounded text-[10px] font-bold cursor-pointer"
+                  >
+                    Sim
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmClear(false)}
+                    className="px-2 py-0.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded text-[10px] font-bold cursor-pointer"
+                  >
+                    Não
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setConfirmClear(true)}
+                  className="px-3.5 py-2 bg-slate-100 hover:bg-red-50 text-slate-600 hover:text-red-600 text-xs font-bold rounded-xl transition flex items-center gap-1.5 border border-slate-200 hover:border-red-200 cursor-pointer active:scale-95"
+                  title="Limpar todas as liquidações da fila"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Limpar Fila</span>
+                </button>
+              )
             )}
           </div>
         </div>

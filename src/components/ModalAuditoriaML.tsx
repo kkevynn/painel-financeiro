@@ -16,6 +16,7 @@ import {
   Plus,
   Edit3,
   Check,
+  AlertCircle,
 } from 'lucide-react';
 import { InferredPaymentMatch, LearnedCreditorPattern, FileData } from '../types';
 import { mlInferenceService } from '../utils/machineLearningInferenceService';
@@ -54,6 +55,7 @@ export const ModalAuditoriaML: React.FC<ModalAuditoriaMLProps> = ({
   const [matches, setMatches] = useState<InferredPaymentMatch[]>(() => mlInferenceService.getInferredMatches());
   const [patterns, setPatterns] = useState<LearnedCreditorPattern[]>(() => mlInferenceService.getLearnedPatterns());
   const [feedbackMsg, setFeedbackMsg] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isScanning, setIsScanning] = useState(false);
 
   // Available suggestions from app files and OB list
@@ -241,9 +243,11 @@ export const ModalAuditoriaML: React.FC<ModalAuditoriaMLProps> = ({
 
   const handleSaveManualMatch = () => {
     if (!manualNL.trim() || !manualCredor.trim() || !manualValorNL || !manualPP.trim()) {
-      alert('Por favor, preencha pelo menos a NL, o Credor, o Valor da NL e o número da PP.');
+      setErrorMsg('Por favor, preencha pelo menos a NL, o Credor, o Valor da NL e o número da PP.');
+      setTimeout(() => setErrorMsg(null), 4500);
       return;
     }
+    setErrorMsg(null);
 
     const valNL = parseFloat(manualValorNL) || 0;
     const valPP = manualValorPP ? parseFloat(manualValorPP) : valNL;
@@ -309,9 +313,11 @@ export const ModalAuditoriaML: React.FC<ModalAuditoriaMLProps> = ({
 
   const handleSaveEdit = (matchId: string) => {
     if (!editPP.trim()) {
-      alert('O número da PP não pode ficar vazio.');
+      setErrorMsg('O número da PP não pode ficar vazio.');
+      setTimeout(() => setErrorMsg(null), 4000);
       return;
     }
+    setErrorMsg(null);
 
     const valPP = parseFloat(editValorPP);
 
@@ -495,6 +501,23 @@ export const ModalAuditoriaML: React.FC<ModalAuditoriaMLProps> = ({
               }`}
             >
               Todos ({matches.length})
+            </button>
+          </div>
+        )}
+
+        {/* Error Alert */}
+        {errorMsg && (
+          <div className="bg-rose-50 border-b border-rose-200 px-6 py-2.5 text-xs text-rose-900 font-semibold flex items-center justify-between gap-2 animate-in fade-in">
+            <div className="flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+              <span>{errorMsg}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setErrorMsg(null)}
+              className="text-rose-500 hover:text-rose-800 p-0.5 cursor-pointer"
+            >
+              <X className="w-3.5 h-3.5" />
             </button>
           </div>
         )}

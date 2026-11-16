@@ -27,28 +27,28 @@ export const ColumnMappingModal: React.FC<ColumnMappingModalProps> = ({
   onClose,
   onSaveMapping,
 }) => {
-  if (!fileData) return null;
+  const headers = fileData?.headers || [];
 
   const [selectedStage, setSelectedStage] = useState<StageKey>(
-    fileData.stage || 'outros'
+    fileData?.stage || 'outros'
   );
 
   // 6 Primary Mapping Columns requested by user
   const [selectedNumero, setSelectedNumero] = useState<string>(() => {
-    return fileData.detectedNumeroCol || fileData.detectedPpCol || '';
+    return fileData?.detectedNumeroCol || fileData?.detectedPpCol || '';
   });
 
   const [selectedOb, setSelectedOb] = useState<string>(() => {
-    return fileData.detectedObCol || '';
+    return fileData?.detectedObCol || '';
   });
 
   const [selectedFavorecido, setSelectedFavorecido] = useState<string>(() => {
-    return fileData.detectedFavorecidoCol || fileData.headers[0] || '';
+    return fileData?.detectedFavorecidoCol || headers[0] || '';
   });
 
   const [selectedNotaEmpenho, setSelectedNotaEmpenho] = useState<string>(() => {
-    if (fileData.detectedNotaEmpenhoCol) return fileData.detectedNotaEmpenhoCol;
-    const found = fileData.headers.find((h) => {
+    if (fileData?.detectedNotaEmpenhoCol) return fileData.detectedNotaEmpenhoCol;
+    const found = headers.find((h) => {
       const norm = h.toLowerCase().trim();
       if (norm.includes('favorecido')) return false;
       return (
@@ -62,8 +62,8 @@ export const ColumnMappingModal: React.FC<ColumnMappingModalProps> = ({
   });
 
   const [selectedFavorecidoNE, setSelectedFavorecidoNE] = useState<string>(() => {
-    if (fileData.detectedFavorecidoNECol) return fileData.detectedFavorecidoNECol;
-    const found = fileData.headers.find((h) => {
+    if (fileData?.detectedFavorecidoNECol) return fileData.detectedFavorecidoNECol;
+    const found = headers.find((h) => {
       const norm = h.toLowerCase().trim();
       return (
         norm.includes('favorecido nota empenho') ||
@@ -76,34 +76,33 @@ export const ColumnMappingModal: React.FC<ColumnMappingModalProps> = ({
   });
 
   const [selectedValor, setSelectedValor] = useState<string>(() => {
-    return fileData.detectedValorCol || fileData.headers[1] || '';
+    return fileData?.detectedValorCol || headers[1] || '';
   });
 
   // Additional secondary columns
   const [selectedCnpj, setSelectedCnpj] = useState<string>(
-    fileData.detectedCnpjCol || ''
+    fileData?.detectedCnpjCol || ''
   );
   const [selectedSituacao, setSelectedSituacao] = useState<string>(
-    fileData.detectedSituacaoCol || ''
+    fileData?.detectedSituacaoCol || ''
   );
   const [selectedNatureza, setSelectedNatureza] = useState<string>(
-    fileData.detectedNaturezaCol || ''
+    fileData?.detectedNaturezaCol || ''
   );
   const [selectedFonte, setSelectedFonte] = useState<string>(
-    fileData.detectedFonteCol || ''
+    fileData?.detectedFonteCol || ''
   );
   const [selectedData, setSelectedData] = useState<string>(() => {
-    if (fileData.detectedDataCol) return fileData.detectedDataCol;
-    const found = fileData.headers.find((h) => {
+    if (fileData?.detectedDataCol) return fileData.detectedDataCol;
+    const found = headers.find((h) => {
       const norm = h.toLowerCase().trim();
       return norm.includes('data') || norm.includes('dt');
     });
     return found || '';
   });
 
-
   const previewRow = useMemo(() => {
-    if (!fileData.rows || fileData.rows.length === 0) return null;
+    if (!fileData?.rows || fileData.rows.length === 0) return null;
     const row = fileData.rows[0] || {};
     const rawVal = selectedValor ? row[selectedValor] : null;
     const parsedVal = parseCurrencyValue(rawVal);
@@ -121,7 +120,7 @@ export const ColumnMappingModal: React.FC<ColumnMappingModalProps> = ({
       data: selectedData ? String(row[selectedData] || '-') : '-',
     };
   }, [
-    fileData.rows,
+    fileData?.rows,
     selectedNumero,
     selectedOb,
     selectedFavorecido,
@@ -178,12 +177,15 @@ export const ColumnMappingModal: React.FC<ColumnMappingModalProps> = ({
 
   // Lock background scroll when open
   useEffect(() => {
+    if (!fileData) return;
     const orig = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
     return () => {
       document.body.style.overflow = orig;
     };
-  }, []);
+  }, [fileData]);
+
+  if (!fileData) return null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-900/60 backdrop-blur-xs overscroll-contain animate-in fade-in duration-200">

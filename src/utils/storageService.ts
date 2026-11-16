@@ -162,8 +162,15 @@ export async function loadAppState(): Promise<StoredAppState | null> {
 export async function clearAppState(): Promise<boolean> {
   try {
     const db1 = await openDB(DB_NAME_PRIMARY);
-    const tx1 = db1.transaction(STORE_NAME, 'readwrite');
-    tx1.objectStore(STORE_NAME).delete('current_dataset');
+    if (db1.objectStoreNames.contains(STORE_NAME)) {
+      const tx1 = db1.transaction(STORE_NAME, 'readwrite');
+      const req = tx1.objectStore(STORE_NAME).delete('current_dataset');
+      await new Promise<void>((resolve) => {
+        tx1.oncomplete = () => resolve();
+        tx1.onerror = () => resolve();
+        req.onerror = () => resolve();
+      });
+    }
   } catch (err) {
     // Ignore
   }

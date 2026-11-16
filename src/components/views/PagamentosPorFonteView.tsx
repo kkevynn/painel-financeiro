@@ -304,7 +304,7 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
         mesAnoKey,
         mesAnoLabel,
         valor,
-        situacao: String(raw.situacao ?? 'CB'),
+        situacao: String(raw.situacao ?? ''),
         pp: String(raw.pp ?? '').trim(),
         fonteRecurso,
         favorecidoRaw: String(raw.favorecidoRaw ?? ''),
@@ -315,7 +315,7 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
     }
 
     return validated;
-  }, [ordensBancariasList, files]);
+  }, [ordensBancariasList, files, explicitObFile, hasValidFonteInCurrentList]);
 
   // Handle direct file upload in this view
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -619,30 +619,36 @@ export const PagamentosPorFonteView: React.FC<PagamentosPorFonteViewProps> = ({
             </h2>
           </div>
 
-          <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
-            <label className="w-full sm:w-auto px-6 py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm rounded-xl transition flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/20 cursor-pointer active:scale-98">
-              <Upload className="w-4 h-4" />
-              <span>{isUploading ? 'Processando Planilha...' : 'Carregar Planilha do SIGEF'}</span>
-              <input
-                type="file"
-                accept=".xlsx, .xls, .csv"
-                onChange={handleFileUpload}
-                disabled={isUploading}
-                className="hidden"
-              />
-            </label>
+          {isAdmin() ? (
+            <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
+              <label className="w-full sm:w-auto px-6 py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm rounded-xl transition flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/20 cursor-pointer active:scale-98">
+                <Upload className="w-4 h-4" />
+                <span>{isUploading ? 'Processando Planilha...' : 'Carregar Planilha do SIGEF'}</span>
+                <input
+                  type="file"
+                  accept=".xlsx, .xls, .csv"
+                  onChange={handleFileUpload}
+                  disabled={isUploading}
+                  className="hidden"
+                />
+              </label>
 
-            {onNavigateToImportacoes && (
-              <button
-                type="button"
-                onClick={onNavigateToImportacoes}
-                className="w-full sm:w-auto px-6 py-3 bg-white/10 hover:bg-white/20 text-white font-bold text-sm rounded-xl transition flex items-center justify-center gap-2 cursor-pointer active:scale-98"
-              >
-                <span>Ir para Central de Importações</span>
-                <ArrowRight className="w-4 h-4" />
-              </button>
-            )}
-          </div>
+              {onNavigateToImportacoes && (
+                <button
+                  type="button"
+                  onClick={onNavigateToImportacoes}
+                  className="w-full sm:w-auto px-6 py-3 bg-white/10 hover:bg-white/20 text-white font-bold text-sm rounded-xl transition flex items-center justify-center gap-2 cursor-pointer active:scale-98"
+                >
+                  <span>Ir para Central de Importações</span>
+                  <ArrowRight className="w-4 h-4" />
+                </button>
+              )}
+            </div>
+          ) : (
+            <p className="text-xs text-emerald-300/80 font-medium pt-2">
+              Aguardando importação da planilha de Ordens Bancárias pelo Administrador.
+            </p>
+          )}
         </div>
       </div>
     );

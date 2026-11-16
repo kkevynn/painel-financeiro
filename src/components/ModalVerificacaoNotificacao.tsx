@@ -9,6 +9,7 @@ import {
 import { ToastAlert, FileData } from '../types';
 import { formatBRL } from '../utils/excelParser';
 import { toastAlertService } from '../utils/toastAlertService';
+import { isAdmin } from '../utils/authService';
 
 interface ModalVerificacaoNotificacaoProps {
   toast: ToastAlert | null;
@@ -57,15 +58,11 @@ export const ModalVerificacaoNotificacao: React.FC<ModalVerificacaoNotificacaoPr
   onSaveAlteration,
   onOpenCompanyAudit,
 }) => {
-  if (!isOpen || !toast) return null;
-
-  const isCritico = toast.tipo === 'critico';
-
-  const [situacao, setSituacao] = useState<string>(toast.situacaoNova || 'AO');
+  const [situacao, setSituacao] = useState<string>(toast?.situacaoNova || 'AO');
   const [valorStr, setValorStr] = useState<string>(
-    toast.valor !== undefined ? toast.valor.toString() : ''
+    toast?.valor !== undefined ? toast.valor.toString() : ''
   );
-  const [observacao, setObservacao] = useState<string>(toast.observacao || '');
+  const [observacao, setObservacao] = useState<string>(toast?.observacao || '');
   const [isSaved, setIsSaved] = useState(false);
 
   useEffect(() => {
@@ -77,7 +74,23 @@ export const ModalVerificacaoNotificacao: React.FC<ModalVerificacaoNotificacaoPr
     }
   }, [toast]);
 
+  // Lock background scroll when open
+  useEffect(() => {
+    if (!isOpen) return;
+    const orig = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = orig;
+    };
+  }, [isOpen]);
+
+  if (!isOpen || !toast) return null;
+
+  const isCritico = toast.tipo === 'critico';
+  const adminUser = isAdmin();
+
   const handleSave = () => {
+    if (!adminUser) return;
     const parsedVal = valorStr ? parseFloat(valorStr.replace(',', '.')) : toast.valor;
     onSaveAlteration(toast, {
       situacao: situacao.trim(),
@@ -100,16 +113,6 @@ export const ModalVerificacaoNotificacao: React.FC<ModalVerificacaoNotificacaoPr
       onClose();
     }
   };
-
-  // Lock background scroll when open
-  useEffect(() => {
-    if (!isOpen) return;
-    const orig = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-    return () => {
-      document.body.style.overflow = orig;
-    };
-  }, [isOpen]);
 
   return (
     <div
@@ -190,38 +193,40 @@ export const ModalVerificacaoNotificacao: React.FC<ModalVerificacaoNotificacaoPr
                 </div>
               </div>
 
-              <div className="pt-1 flex flex-col sm:flex-row items-center justify-between gap-2">
-                <span className="text-[11px] font-bold text-indigo-950">
-                  Esta conversão está correta?
-                </span>
-                <div className="flex items-center gap-2 w-full sm:w-auto">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      toastAlertService.confirmTransition(toast.id);
-                      setIsSaved(true);
-                      setTimeout(() => {
-                        setIsSaved(false);
+              {adminUser && (
+                <div className="pt-1 flex flex-col sm:flex-row items-center justify-between gap-2">
+                  <span className="text-[11px] font-bold text-indigo-950">
+                    Esta conversão está correta?
+                  </span>
+                  <div className="flex items-center gap-2 w-full sm:w-auto">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        toastAlertService.confirmTransition(toast.id);
+                        setIsSaved(true);
+                        setTimeout(() => {
+                          setIsSaved(false);
+                          onClose();
+                        }, 500);
+                      }}
+                      className="flex-1 sm:flex-none px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-bold transition cursor-pointer shadow-xs active:scale-95 flex items-center justify-center gap-1"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                      <span>Sim, está correto</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        toastAlertService.rejectTransition(toast.id);
                         onClose();
-                      }, 500);
-                    }}
-                    className="flex-1 sm:flex-none px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-bold transition cursor-pointer shadow-xs active:scale-95 flex items-center justify-center gap-1"
-                  >
-                    <Check className="w-3.5 h-3.5" />
-                    <span>Sim, está correto</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      toastAlertService.rejectTransition(toast.id);
-                      onClose();
-                    }}
-                    className="flex-1 sm:flex-none px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-300 rounded-lg text-xs font-bold transition cursor-pointer active:scale-95"
-                  >
-                    <span>Não, rejeitar</span>
-                  </button>
+                      }}
+                      className="flex-1 sm:flex-none px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-300 rounded-lg text-xs font-bold transition cursor-pointer active:scale-95"
+                    >
+                      <span>Não, rejeitar</span>
+                    </button>
+                  </div>
                 </div>
-              </div>
+              )}
             </div>
           )}
 
@@ -277,56 +282,58 @@ export const ModalVerificacaoNotificacao: React.FC<ModalVerificacaoNotificacaoPr
             </div>
           </div>
 
-          {/* Campos de Alteração */}
-          <div className="space-y-3 pt-1">
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div>
-                <label className="block text-[11px] font-bold text-slate-600 mb-1">
-                  Situação:
-                </label>
-                <select
-                  value={situacao}
-                  onChange={(e) => setSituacao(e.target.value)}
-                  className="w-full bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-slate-800 focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition cursor-pointer"
-                >
-                  {SITUACOES_SUGERIDAS.map((s) => (
-                    <option key={s.value} value={s.value}>
-                      {s.label}
-                    </option>
-                  ))}
-                  {!SITUACOES_SUGERIDAS.some((s) => s.value === situacao) && (
-                    <option value={situacao}>{situacao}</option>
-                  )}
-                </select>
+          {/* Campos de Alteração (apenas Administrador) */}
+          {adminUser && (
+            <div className="space-y-3 pt-1">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-600 mb-1">
+                    Situação:
+                  </label>
+                  <select
+                    value={situacao}
+                    onChange={(e) => setSituacao(e.target.value)}
+                    className="w-full bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-slate-800 focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition cursor-pointer"
+                  >
+                    {SITUACOES_SUGERIDAS.map((s) => (
+                      <option key={s.value} value={s.value}>
+                        {s.label}
+                      </option>
+                    ))}
+                    {!SITUACOES_SUGERIDAS.some((s) => s.value === situacao) && (
+                      <option value={situacao}>{situacao}</option>
+                    )}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-600 mb-1">
+                    Valor (R$):
+                  </label>
+                  <input
+                    type="text"
+                    value={valorStr}
+                    onChange={(e) => setValorStr(e.target.value)}
+                    placeholder="0.00"
+                    className="w-full bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 text-xs font-mono font-bold text-slate-800 focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition"
+                  />
+                </div>
               </div>
 
               <div>
                 <label className="block text-[11px] font-bold text-slate-600 mb-1">
-                  Valor (R$):
+                  Observação (opcional):
                 </label>
-                <input
-                  type="text"
-                  value={valorStr}
-                  onChange={(e) => setValorStr(e.target.value)}
-                  placeholder="0.00"
-                  className="w-full bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 text-xs font-mono font-bold text-slate-800 focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition"
+                <textarea
+                  value={observacao}
+                  onChange={(e) => setObservacao(e.target.value)}
+                  placeholder="Motivo ou nota da alteração..."
+                  rows={2}
+                  className="w-full bg-white border border-slate-300 rounded-lg p-2 text-xs text-slate-800 focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition resize-none"
                 />
               </div>
             </div>
-
-            <div>
-              <label className="block text-[11px] font-bold text-slate-600 mb-1">
-                Observação (opcional):
-              </label>
-              <textarea
-                value={observacao}
-                onChange={(e) => setObservacao(e.target.value)}
-                placeholder="Motivo ou nota da alteração..."
-                rows={2}
-                className="w-full bg-white border border-slate-300 rounded-lg p-2 text-xs text-slate-800 focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition resize-none"
-              />
-            </div>
-          </div>
+          )}
 
         </div>
 
@@ -337,30 +344,32 @@ export const ModalVerificacaoNotificacao: React.FC<ModalVerificacaoNotificacaoPr
             onClick={onClose}
             className="px-3 py-1.5 text-xs font-semibold text-slate-600 hover:text-slate-800 hover:bg-slate-200 rounded-lg transition cursor-pointer"
           >
-            Cancelar
+            {adminUser ? 'Cancelar' : 'Fechar'}
           </button>
 
-          <button
-            type="button"
-            onClick={handleSave}
-            className={`px-4 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 shadow-xs cursor-pointer ${
-              isSaved
-                ? 'bg-emerald-600 text-white'
-                : 'bg-emerald-700 hover:bg-emerald-800 text-white'
-            }`}
-          >
-            {isSaved ? (
-              <>
-                <Check className="w-3.5 h-3.5" />
-                <span>Salvo!</span>
-              </>
-            ) : (
-              <>
-                <Save className="w-3.5 h-3.5" />
-                <span>Salvar</span>
-              </>
-            )}
-          </button>
+          {adminUser && (
+            <button
+              type="button"
+              onClick={handleSave}
+              className={`px-4 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 shadow-xs cursor-pointer ${
+                isSaved
+                  ? 'bg-emerald-600 text-white'
+                  : 'bg-emerald-700 hover:bg-emerald-800 text-white'
+              }`}
+            >
+              {isSaved ? (
+                <>
+                  <Check className="w-3.5 h-3.5" />
+                  <span>Salvo!</span>
+                </>
+              ) : (
+                <>
+                  <Save className="w-3.5 h-3.5" />
+                  <span>Salvar</span>
+                </>
+              )}
+            </button>
+          )}
         </div>
       </div>
     </div>
