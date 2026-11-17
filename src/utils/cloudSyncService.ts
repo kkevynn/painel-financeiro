@@ -63,6 +63,10 @@ class CloudSyncService {
   private listeners = new Set<SyncListener>();
   private pollingIntervalId: ReturnType<typeof setInterval> | null = null;
   private isProcessingSync = false;
+  private pullInFlight: Promise<boolean> | null = null;
+  private lastPullHadNetworkError = false;
+  private consecutivePollFailures = 0;
+  private pollTickCounter = 0;
   private lastRemoteVersion: number | null = null;
   private lastPulledData: {
     files: FileData[];
@@ -144,12 +148,23 @@ class CloudSyncService {
       clearInterval(this.pollingIntervalId);
     }
     // Polling automático leve a cada 15 segundos para sincronização quase em tempo real entre dispositivos
+    // Aplica backoff progressivo em caso de falhas de rede para não sobrecarregar a conexão
     this.pollingIntervalId = setInterval(() => {
-      if (!this.isProcessingSync) {
-        this.pullFromCloud(true).catch((e) => {
-          console.warn('Polling automático Google Drive:', e);
-        });
+      if (this.isProcessingSync || this.pullInFlight) return;
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+
+      if (this.consecutivePollFailures > 0) {
+        this.pollTickCounter++;
+        const skipTicks = Math.min(this.consecutivePollFailures, 4);
+        if (this.pollTickCounter <= skipTicks) {
+          return;
+        }
+        this.pollTickCounter = 0;
       }
+
+      this.pullFromCloud(true).catch((e) => {
+        console.warn('Polling automático Google Drive:', e);
+      });
     }, 15000);
   }
 
@@ -523,11 +538,11 @@ class CloudSyncService {
       console.log(`Painel sincronizado no Google Drive com sucesso a partir do ${device}`);
       return true;
     } catch (err: any) {
-      console.error('ERRO GOOGLE DRIVE PUSH:', err);
+      console.warn('Sincronização Google Drive (envio):', err?.message || err);
       this.updateState({
         isSyncing: false,
         syncStatus: 'error',
-        errorMessage: err.message || 'Erro ao sincronizar com o Google Drive.',
+        errorMessage: err?.message || 'Erro ao sincronizar com o Google Drive.',
       });
       return false;
     } finally {
@@ -542,29 +557,95 @@ class CloudSyncService {
     console.log(`Arquivo ${fileId} marcado para remoção local e nuvem.`);
   }
 
+  private async fetchDriveStateJson(): Promise<any> {
+    const attemptFetch = async (): Promise<any> => {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 60000);
+      try {
+        const response = await fetch(`${GOOGLE_DRIVE_SYNC_URL}?t=${Date.now()}`, {
+          method: 'GET',
+          redirect: 'follow',
+          signal: controller.signal,
+        });
+
+        if (!response.ok) {
+          throw new Error(`Falha HTTP ${response.status} ao consultar Google Drive.`);
+        }
+
+        return await response.json();
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    };
+
+    try {
+      return await attemptFetch();
+    } catch (firstErr: any) {
+      // Pequena pausa e nova tentativa para oscilações transitórias de redirecionamento do Apps Script
+      const isAbortOrNetwork =
+        firstErr?.name === 'AbortError' ||
+        firstErr instanceof TypeError ||
+        String(firstErr?.message || '').toLowerCase().includes('fetch');
+
+      if (isAbortOrNetwork && (typeof navigator === 'undefined' || navigator.onLine !== false)) {
+        await new Promise((r) => setTimeout(r, 1200));
+        try {
+          return await attemptFetch();
+        } catch (retryErr) {
+          // Fallback direto para a pasta dedicada do Google Drive caso o OAuth esteja conectado
+          if (googleDriveService.isConnected()) {
+            const driveFolderData = await googleDriveService.loadStateFromDriveFolder(
+              'SESAP_PAINEL_STATE_V1.json'
+            );
+            if (driveFolderData) {
+              return driveFolderData;
+            }
+          }
+          throw retryErr;
+        }
+      }
+
+      throw firstErr;
+    }
+  }
+
   /**
    * Leitura direta do estado completo no Google Drive (SESAP_PAINEL_STATE_V1.json)
    */
   public async pullFromCloud(onlyIfNewer: boolean = false): Promise<boolean> {
+    if (this.pullInFlight) {
+      return this.pullInFlight;
+    }
+
+    this.pullInFlight = this.executePullFromCloud(onlyIfNewer).finally(() => {
+      this.pullInFlight = null;
+    });
+
+    return this.pullInFlight;
+  }
+
+  private async executePullFromCloud(onlyIfNewer: boolean = false): Promise<boolean> {
     try {
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        this.lastPullHadNetworkError = true;
+        if (!onlyIfNewer) {
+          this.updateState({ isSyncing: false, syncStatus: 'idle' });
+        }
+        return false;
+      }
+
       this.isProcessingSync = true;
+      this.lastPullHadNetworkError = false;
       if (!onlyIfNewer) {
         // Ignora cache em memória quando usuário abre o app ou solicita sincronização manual
         this.lastRemoteVersion = null;
         this.updateState({ isSyncing: true, syncStatus: 'syncing', errorMessage: null });
       }
 
-      const response = await fetch(`${GOOGLE_DRIVE_SYNC_URL}?t=${Date.now()}`, {
-        method: 'GET',
-        cache: 'no-store',
-        redirect: 'follow',
-      });
+      const data = await this.fetchDriveStateJson();
+      this.consecutivePollFailures = 0;
+      this.pollTickCounter = 0;
 
-      if (!response.ok) {
-        throw new Error(`Falha HTTP ${response.status} ao consultar Google Drive.`);
-      }
-
-      const data = await response.json();
       if (!data) {
         if (!onlyIfNewer) {
           this.updateState({ isSyncing: false, syncStatus: 'idle' });
@@ -820,12 +901,18 @@ class CloudSyncService {
       console.log('Dados restaurados diretamente do Google Drive com sucesso.');
       return true;
     } catch (err: any) {
-      console.error('ERRO GOOGLE DRIVE PULL:', err);
-      this.updateState({
-        isSyncing: false,
-        syncStatus: 'error',
-        errorMessage: err.message || 'Erro ao baixar dados do Google Drive.',
-      });
+      this.lastPullHadNetworkError = true;
+      this.consecutivePollFailures++;
+      console.warn('Sincronização Google Drive (pull) indisponível no momento:', err?.message || err);
+      if (!onlyIfNewer) {
+        this.updateState({
+          isSyncing: false,
+          syncStatus: this.state.lastSyncAt ? 'synced' : 'idle',
+          errorMessage: err?.message || 'Erro ao baixar dados do Google Drive.',
+        });
+      } else {
+        this.updateState({ isSyncing: false });
+      }
       return false;
     } finally {
       this.isProcessingSync = false;
@@ -836,13 +923,13 @@ class CloudSyncService {
    * Avalia estado local vs Google Drive e prioriza verificação imediata na nuvem ao abrir o app
    */
   public async checkAndAutoSync(): Promise<void> {
-    if (this.isProcessingSync) return;
+    if (this.isProcessingSync && !this.pullInFlight) return;
 
     try {
       // Sempre força a verificação imediata no Google Drive ignorando cache local ao abrir o aplicativo
       const pulled = await this.pullFromCloud(false);
 
-      if (!pulled && isAdmin()) {
+      if (!pulled && !this.lastPullHadNetworkError && isAdmin()) {
         const localState = await loadAppState();
         const localFiles = localState?.files || [];
         if (localFiles.length > 0) {

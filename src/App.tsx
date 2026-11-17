@@ -40,11 +40,9 @@ import {
   loadOrdensBancariasFromStorage,
   loadOrdensBancariasAsync,
   isObFileName,
-  parseListarOrdemBancariaMatrixAsync,
   extractOrdensBancariasFromFileData,
   isValidFonteRecursoCode,
 } from './utils/ordemBancariaParser';
-import { readSpreadsheetAsMatrix } from './utils/excelParser';
 import { googleDriveService, GoogleDriveState } from './utils/googleDriveService';
 import { cloudSyncService, CloudSyncState } from './utils/cloudSyncService';
 import { indexAppKnowledge } from './utils/appKnowledgeDirectory';
@@ -68,10 +66,6 @@ export function App() {
   const [activeTab, setActiveTab] = useState('painel');
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [lastProcessedAt, setLastProcessedAt] = useState<Date | null>(null);
-  const lastProcessedAtRef = useRef<Date | null>(lastProcessedAt);
-  useEffect(() => {
-    lastProcessedAtRef.current = lastProcessedAt;
-  }, [lastProcessedAt]);
 
   const [session, setSession] = useState<AuthSession | null>(() => getCurrentSession());
 
@@ -541,26 +535,10 @@ export function App() {
           parsedFileData.stage !== 'base_pps' &&
           (parsedFileData.stage === 'ordem_bancaria' || isObFileName(parsedFileData.fileName))
         ) {
-          try {
-            const matrix = await readSpreadsheetAsMatrix(file);
-            const parsedOBs = await parseListarOrdemBancariaMatrixAsync(matrix);
-            if (parsedOBs.length > 0) {
-              targetOBs = parsedOBs;
-              handleUpdateOrdensBancariasList(parsedOBs, parsedFileData.fileName);
-            } else {
-              const extracted = extractOrdensBancariasFromFileData(parsedFileData);
-              if (extracted.length > 0) {
-                targetOBs = extracted;
-                handleUpdateOrdensBancariasList(extracted, parsedFileData.fileName);
-              }
-            }
-          } catch (obErr) {
-            console.warn('Erro ao auto-processar planilha de OBs:', obErr);
-            const extracted = extractOrdensBancariasFromFileData(parsedFileData);
-            if (extracted.length > 0) {
-              targetOBs = extracted;
-              handleUpdateOrdensBancariasList(extracted, parsedFileData.fileName);
-            }
+          const extracted = extractOrdensBancariasFromFileData(parsedFileData);
+          if (extracted.length > 0) {
+            targetOBs = extracted;
+            handleUpdateOrdensBancariasList(extracted, parsedFileData.fileName);
           }
         }
       }
@@ -616,15 +594,6 @@ export function App() {
   useEffect(() => {
     const unsubscribe = googleDriveService.subscribe((state) => {
       setDriveState(state);
-    });
-
-    // Provide currently loaded file names so auto-polling never downloads unrelated files from Drive
-    googleDriveService.registerExistingFilesProvider(() => {
-      const names = filesRef.current.map((f) => f.fileName).filter(Boolean);
-      if (ordensBancariasFileNameRef.current && !names.includes(ordensBancariasFileNameRef.current)) {
-        names.push(ordensBancariasFileNameRef.current);
-      }
-      return { names, lastSyncAt: lastProcessedAtRef.current };
     });
 
     // When Google Drive delivers a file (either manual sync or 20-minute background auto-polling)
@@ -716,8 +685,8 @@ export function App() {
           titulo: 'Conta Google Conectada',
           mensagem: 'Sincronização em nuvem (Tablet/PC) e Google Drive ativadas com sucesso.',
         });
-        // Immediately sync only currently loaded financial reports from Drive (incremental) and sync cloud state
-        await handleSyncDriveNow(false);
+        // Immediately fetch the latest financial report from Drive and sync cloud state
+        await handleSyncDriveNow();
       }
     } catch (err: any) {
       toastAlertService.addToast({
@@ -742,20 +711,15 @@ export function App() {
     });
   };
 
-  const handleSyncDriveNow = async (forceParam: boolean | unknown = true) => {
+  const handleSyncDriveNow = async () => {
     if (isDriveSyncing) return;
-    const force = typeof forceParam === 'boolean' ? forceParam : true;
     setIsDriveSyncing(true);
     setIsProcessing(true);
     setProcessingProgress(20);
     setProcessingMessage('Sincronizando com Google Drive e Nuvem...');
     try {
       setProcessingProgress(40);
-      const currentFileNames = filesRef.current.map((f) => f.fileName).filter(Boolean);
-      if (ordensBancariasFileNameRef.current && !currentFileNames.includes(ordensBancariasFileNameRef.current)) {
-        currentFileNames.push(ordensBancariasFileNameRef.current);
-      }
-      const result = await googleDriveService.syncNow(currentFileNames, lastProcessedAt, force);
+      const result = await googleDriveService.syncNow(true);
       
       // Also sync Firestore cloud state across Tablet & PC
       try {

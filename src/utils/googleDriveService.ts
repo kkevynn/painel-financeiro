@@ -79,7 +79,6 @@ class GoogleDriveService {
   private pollingTimer: any = null;
   private cachedDatabaseFolderId: string | null = null;
   private onNewFileCallback: ((file: File, isAuto: boolean) => Promise<void> | void) | null = null;
-  private existingFilesProvider: (() => { names: string[]; lastSyncAt: Date | null }) | null = null;
 
   // 20 minutes polling interval
   public readonly POLLING_INTERVAL_MS = 20 * 60 * 1000;
@@ -529,8 +528,10 @@ class GoogleDriveService {
    * 2. Any recent spreadsheet file (.xlsx, .xls, .csv, Google Sheet).
    */
   /**
-   * Lists spreadsheets and CSVs in the user's Google Drive using a broad MIME query.
-   * Returns metadata only (no file downloads), delegating filtering to syncNow.
+   * Identifies all active, relevant financial spreadsheets in the user's Google Drive:
+   * 1. Latest "Processamento de dados" (contains Obedece and Não Obedece pages)
+   * 2. Latest "Publicação - (dia)/(mes)" (contains publication NLs)
+   * 3. Latest SIGEF / PP / OB report
    */
   public async fetchRelevantFinancialMetadataList(): Promise<DriveFileMetadata[]> {
     if (!this.accessToken) {
@@ -545,19 +546,31 @@ class GoogleDriveService {
       }
     }
 
-    // Busca ampla: apenas tipos MIME de planilha/csv e trashed = false
+    // Search query: Spreadsheets, Excel files, and CSVs grouped cleanly with financial keywords
     const query =
       "trashed = false and (" +
       "mimeType = 'application/vnd.google-apps.spreadsheet' or " +
       "mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' or " +
       "mimeType = 'application/vnd.ms-excel' or " +
-      "mimeType = 'text/csv'" +
+      "mimeType = 'text/csv' or " +
+      "name contains '.xls' or " +
+      "name contains '.xlsx'" +
+      ") and (" +
+      "name contains 'Processamento' or " +
+      "name contains 'Publicac' or " +
+      "name contains 'Publicação' or " +
+      "name contains 'Obedece' or " +
+      "name contains 'SIGEF' or " +
+      "name contains 'sigef' or " +
+      "name contains 'PP' or " +
+      "name contains 'OB' or " +
+      "name contains 'Liq'" +
       ")";
 
     const url = new URL('https://www.googleapis.com/drive/v3/files');
     url.searchParams.set('q', query);
     url.searchParams.set('orderBy', 'modifiedTime desc');
-    url.searchParams.set('pageSize', '100');
+    url.searchParams.set('pageSize', '25');
     url.searchParams.set('fields', 'files(id, name, mimeType, modifiedTime, size)');
 
     const res = await fetch(url.toString(), {
@@ -573,7 +586,93 @@ class GoogleDriveService {
 
     const data = await res.json();
     const files: DriveFileMetadata[] = data.files || [];
-    return files;
+
+    if (files.length === 0) {
+      // Secondary fallback query: any spreadsheet in drive
+      const fallbackUrl = new URL('https://www.googleapis.com/drive/v3/files');
+      fallbackUrl.searchParams.set('q', "trashed = false and (mimeType = 'application/vnd.google-apps.spreadsheet' or mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' or mimeType = 'application/vnd.ms-excel')");
+      fallbackUrl.searchParams.set('orderBy', 'modifiedTime desc');
+      fallbackUrl.searchParams.set('pageSize', '10');
+      fallbackUrl.searchParams.set('fields', 'files(id, name, mimeType, modifiedTime, size)');
+
+      const fallbackRes = await fetch(fallbackUrl.toString(), {
+        headers: { Authorization: `Bearer ${this.accessToken}` },
+      });
+      if (fallbackRes.ok) {
+        const fallbackData = await fallbackRes.json();
+        if (fallbackData.files && fallbackData.files.length > 0) {
+          return [fallbackData.files[0]];
+        }
+      }
+      return [];
+    }
+
+    const normalize = (n: string) =>
+      (n || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+
+    // Select top candidate for each financial category
+    const selected: DriveFileMetadata[] = [];
+    const addedIds = new Set<string>();
+
+    // A. "Processamento de dados" (holds Obedece & Não Obedece)
+    const procFile = files.find((f) => {
+      const norm = normalize(f.name);
+      return norm.includes('processamento') && norm.includes('dados');
+    });
+    if (procFile && !addedIds.has(procFile.id)) {
+      selected.push(procFile);
+      addedIds.add(procFile.id);
+    }
+
+    // B. "Publicação - DD/MM" (NLs para publicação - include all recent publication files across days)
+    const pubFiles = files.filter((f) => {
+      const norm = normalize(f.name);
+      return norm.includes('publicac') || norm.includes('publicar');
+    });
+    pubFiles.slice(0, 10).forEach((pubFile) => {
+      if (!addedIds.has(pubFile.id)) {
+        selected.push(pubFile);
+        addedIds.add(pubFile.id);
+      }
+    });
+
+    // C. SIGEF / OB / PP report
+    const sigefFile = files.find((f) => {
+      const norm = normalize(f.name);
+      return (
+        norm.includes('sigef') ||
+        norm.includes('relatorio') ||
+        norm.includes('ordem bancaria') ||
+        norm.includes('listar') ||
+        /\bobs?\b/.test(norm) ||
+        /\bpps?\b/.test(norm)
+      ) && !addedIds.has(f.id);
+    });
+    if (sigefFile && !addedIds.has(sigefFile.id)) {
+      selected.push(sigefFile);
+      addedIds.add(sigefFile.id);
+    }
+
+    // D. "OBs - sigef - Principal" (holds "dados ajustados" for OB consolidation)
+    const obsPrincipalFile = files.find((f) => {
+      const norm = normalize(f.name);
+      return (
+        (norm.includes('obs') || norm.includes('ob')) &&
+        norm.includes('sigef') &&
+        norm.includes('principal')
+      ) && !addedIds.has(f.id);
+    });
+    if (obsPrincipalFile && !addedIds.has(obsPrincipalFile.id)) {
+      selected.push(obsPrincipalFile);
+      addedIds.add(obsPrincipalFile.id);
+    }
+
+    // If none of the specific named patterns matched, pick the most recent file
+    if (selected.length === 0 && files.length > 0) {
+      selected.push(files[0]);
+    }
+
+    return selected;
   }
 
   /**
@@ -652,22 +751,10 @@ class GoogleDriveService {
   }
 
   /**
-   * Registers provider of currently loaded file names and last sync date for safe background polling
+   * Manually trigger a synchronization check right now.
+   * Downloads and delivers the latest sheets to the parser.
    */
-  public registerExistingFilesProvider(provider: () => { names: string[]; lastSyncAt: Date | null }) {
-    this.existingFilesProvider = provider;
-  }
-
-  /**
-   * Incremental smart synchronization:
-   * Only downloads files already loaded in the dashboard (`existingFileNames`)
-   * when forced or modified after `lastSyncAt`.
-   */
-  public async syncNow(
-    existingFileNames: string[] = [],
-    lastSyncAt: Date | null = null,
-    force: boolean = false
-  ): Promise<{
+  public async syncNow(force: boolean = true): Promise<{
     success: boolean;
     hasUpdate: boolean;
     fileName?: string;
@@ -691,35 +778,26 @@ class GoogleDriveService {
       if (relevantFiles.length === 0) {
         this.setState({
           status: 'connected',
-          errorMessage: null,
+          errorMessage: 'Nenhuma planilha financeira encontrada no Google Drive.',
         });
         return {
-          success: true,
+          success: false,
           hasUpdate: false,
-          message: 'Nenhuma planilha encontrada no Google Drive.',
+          message: 'Nenhum relatório ("Processamento de dados", "Publicação" ou SIGEF) foi localizado no Google Drive.',
         };
       }
 
       let downloadedCount = 0;
       const fileNames: string[] = [];
-      let latestDownloadedModifiedAt: string | null = null;
 
       for (const meta of relevantFiles) {
-        if (!existingFileNames.includes(meta.name)) {
-          // Ignora silenciosamente arquivos do Drive que não estão carregados no painel
-          continue;
-        }
+        const lastMod = this.state.lastFileModifiedAt
+          ? new Date(this.state.lastFileModifiedAt).getTime()
+          : 0;
+        const shouldDownload = force || new Date(meta.modifiedTime).getTime() > lastMod;
+        if (!shouldDownload) continue;
 
-        const shouldDownload =
-          force ||
-          !lastSyncAt ||
-          new Date(meta.modifiedTime).getTime() > lastSyncAt.getTime();
-
-        if (!shouldDownload) {
-          continue;
-        }
-
-        // Download file into memory one at a time
+        // Download file into memory
         const file = await this.downloadFileAsBrowserFile(meta);
 
         // Deliver to parser callback
@@ -727,17 +805,15 @@ class GoogleDriveService {
           await this.onNewFileCallback(file, false);
           downloadedCount++;
           fileNames.push(meta.name);
-          if (!latestDownloadedModifiedAt) {
-            latestDownloadedModifiedAt = meta.modifiedTime;
-          }
         }
       }
 
+      const topFile = relevantFiles[0];
       this.setState({
         status: 'connected',
         lastSyncAt: new Date(),
-        lastFileName: fileNames.length > 0 ? fileNames.join(', ') : this.state.lastFileName,
-        lastFileModifiedAt: latestDownloadedModifiedAt || this.state.lastFileModifiedAt,
+        lastFileName: fileNames.join(', '),
+        lastFileModifiedAt: topFile.modifiedTime,
         errorMessage: null,
       });
 
@@ -746,9 +822,7 @@ class GoogleDriveService {
         hasUpdate: downloadedCount > 0,
         fileName: fileNames.join(', '),
         message:
-          downloadedCount === 0
-            ? 'Nenhuma planilha carregada no painel precisou ser atualizada no Google Drive.'
-            : downloadedCount === 1
+          downloadedCount === 1
             ? `Planilha "${fileNames[0]}" sincronizada com sucesso!`
             : `Sincronizadas ${downloadedCount} planilhas: ${fileNames.join(', ')}`,
       };
@@ -768,7 +842,7 @@ class GoogleDriveService {
 
   /**
    * Starts the 20-minute background polling loop.
-   * Checks silently if newer versions of currently loaded files exist in Drive.
+   * Checks silently if newer versions exist in Drive. If so, fetches and processes them.
    */
   public startAutoPolling(): void {
     this.stopAutoPolling();
@@ -778,28 +852,17 @@ class GoogleDriveService {
       if (!this.isConnected()) return;
 
       try {
-        const provided = this.existingFilesProvider ? this.existingFilesProvider() : null;
-        const existingFileNames = provided?.names || [];
-        if (existingFileNames.length === 0) return;
-
         const relevantFiles = await this.fetchRelevantFinancialMetadataList();
         if (relevantFiles.length === 0) return;
 
-        const stateMod = this.state.lastFileModifiedAt
+        const lastMod = this.state.lastFileModifiedAt
           ? new Date(this.state.lastFileModifiedAt).getTime()
           : 0;
-        const providedMod = provided?.lastSyncAt ? provided.lastSyncAt.getTime() : 0;
-        const lastMod = Math.max(stateMod, providedMod);
 
         let anyUpdated = false;
         const updatedNames: string[] = [];
-        let newestModTime: string | null = null;
 
         for (const meta of relevantFiles) {
-          if (!existingFileNames.includes(meta.name)) {
-            continue;
-          }
-
           const currentMod = new Date(meta.modifiedTime).getTime();
           if (currentMod > lastMod) {
             console.log('[GoogleDriveService] Nova versão detectada no Drive:', meta.name, meta.modifiedTime);
@@ -809,9 +872,6 @@ class GoogleDriveService {
               await this.onNewFileCallback(file, true);
               anyUpdated = true;
               updatedNames.push(meta.name);
-              if (!newestModTime) {
-                newestModTime = meta.modifiedTime;
-              }
             }
           }
         }
@@ -820,7 +880,7 @@ class GoogleDriveService {
           this.setState({
             lastSyncAt: new Date(),
             lastFileName: updatedNames.join(', '),
-            lastFileModifiedAt: newestModTime || this.state.lastFileModifiedAt,
+            lastFileModifiedAt: relevantFiles[0].modifiedTime,
           });
         }
       } catch (pollErr) {
