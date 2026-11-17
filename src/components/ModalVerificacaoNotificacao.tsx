@@ -5,6 +5,7 @@ import {
   Save,
   Check,
   ExternalLink,
+  ShieldCheck,
 } from 'lucide-react';
 import { ToastAlert, FileData } from '../types';
 import { formatBRL } from '../utils/excelParser';
@@ -159,13 +160,13 @@ export const ModalVerificacaoNotificacao: React.FC<ModalVerificacaoNotificacaoPr
         {/* Body */}
         <div className="p-5 space-y-4 text-slate-800 text-xs">
           
-          {/* Caixa Especial: Auditoria IA - Confirmação da Transição NL -> PP/OB */}
+          {/* Caixa Especial: Conciliação NL/PP - Confirmação da Transição NL -> PP/OB */}
           {(toast.requerValidacao || toast.nl || toast.isFonte600) && (
             <div className="bg-gradient-to-br from-indigo-50 to-amber-50/60 rounded-xl p-4 border border-indigo-200/90 space-y-3">
               <div className="flex items-center justify-between gap-2">
                 <span className="font-extrabold text-indigo-950 flex items-center gap-1.5 text-xs">
-                  <span>🤖</span>
-                  <span>Auditoria com Inteligência Artificial</span>
+                  <ShieldCheck className="w-4 h-4 text-indigo-700 shrink-0" />
+                  <span>Auditoria de Transição (NL → PP/OB)</span>
                 </span>
                 {toast.isFonte600 && (
                   <span className="text-[10px] font-black uppercase px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-950 border border-emerald-300">
@@ -175,7 +176,7 @@ export const ModalVerificacaoNotificacao: React.FC<ModalVerificacaoNotificacaoPr
               </div>
 
               <div className="text-[11px] text-slate-700 leading-relaxed">
-                A IA identificou a transição da <strong className="text-slate-900 font-mono">NL {toast.nl || 'S/N'}</strong> (Fase: {toast.etapaOrigem === 'obedece' ? 'Obedece' : toast.etapaOrigem === 'nao_obedece' ? 'Não Obedece' : 'Liquidação'}) para <strong className="text-slate-900 font-mono">PP {toast.pp || 'S/N'}{toast.ob ? ` / OB ${toast.ob}` : ''}</strong>.
+                O sistema identificou a transição da <strong className="text-slate-900 font-mono">NL {toast.nl || 'S/N'}</strong> (Fase: {toast.etapaOrigem === 'obedece' ? 'Obedece' : toast.etapaOrigem === 'nao_obedece' ? 'Não Obedece' : 'Liquidação'}) para <strong className="text-slate-900 font-mono">PP {toast.pp || 'S/N'}{toast.ob ? ` / OB ${toast.ob}` : ''}</strong>.
               </div>
 
               <div className="bg-white/80 rounded-lg p-2.5 border border-indigo-100 text-xs space-y-1">

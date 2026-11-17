@@ -4,16 +4,48 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Painel Financeiro - FES/SESAP</title>
-    <meta name="description" content="Painel para consolidação e análise das três etapas de relatórios (PPs Prontas, Liq. Obedece e Liq. Não Obedece) da FES/SESAP." />
+    <meta name="description" content="Painel para controle e consolidação das etapas financeiras (PPs Prontas, Liq. Obedece, Liq. Não Obedece e Ordens Bancárias por Fonte) da FES/SESAP." />
+    <meta property="og:type" content="website" />
+    <meta property="og:locale" content="pt_BR" />
+    <meta property="og:site_name" content="Painel Financeiro - FES/SESAP" />
     <meta property="og:title" content="Painel Financeiro - FES/SESAP" />
-    <meta property="og:description" content="Painel para consolidação e análise das três etapas de relatórios (PPs Prontas, Liq. Obedece e Liq. Não Obedece) da FES/SESAP." />
+    <meta property="og:description" content="Painel para controle e consolidação das etapas financeiras (PPs Prontas, Liq. Obedece, Liq. Não Obedece e Ordens Bancárias por Fonte) da FES/SESAP." />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="Painel Financeiro - FES/SESAP" />
+    <meta name="twitter:description" content="Painel para controle e consolidação das etapas financeiras da FES/SESAP." />
+    <meta name="theme-color" content="#064e3b" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "WebApplication",
+        "name": "Painel Financeiro - FES/SESAP",
+        "description": "Painel para controle e consolidação das etapas financeiras (PPs Prontas, Liq. Obedece, Liq. Não Obedece e Ordens Bancárias por Fonte) da FES/SESAP.",
+        "applicationCategory": "FinanceApplication",
+        "operatingSystem": "All",
+        "inLanguage": "pt-BR",
+        "browserRequirements": "Requires JavaScript. Requires HTML5.",
+        "offers": {
+          "@type": "Offer",
+          "price": "0",
+          "priceCurrency": "BRL"
+        },
+        "publisher": {
+          "@type": "GovernmentOrganization",
+          "name": "Secretaria de Estado da Saúde Pública - SESAP/RN",
+          "department": {
+            "@type": "GovernmentOrganization",
+            "name": "Fundo Estadual de Saúde - FES/SESAP"
+          }
+        }
+      }
+    </script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://accounts.google.com/gsi/client" async defer></script>
   </head>
-  <body class="bg-[#f3f4f6] text-slate-800 antialiased font-['Inter',system-ui,-apple-system,BlinkMacSystemFont,'Segoe_UI',Roboto,sans-serif]">
-    <div id="root"></div>
+  <body class="min-h-screen bg-[#f3f4f6] text-slate-800 antialiased font-['Inter','InterFallback',system-ui,-apple-system,BlinkMacSystemFont,'Segoe_UI',Roboto,sans-serif]">
+    <div id="root" class="min-h-screen flex flex-col"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

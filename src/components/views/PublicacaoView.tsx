@@ -17,7 +17,6 @@ import {
   Zap,
   Link2,
   X,
-  Sparkles,
 } from 'lucide-react';
 import { FileData, PublicacaoItem } from '../../types';
 import { OrdemBancariaItem } from '../../utils/ordemBancariaParser';
@@ -1314,11 +1313,11 @@ export const PublicacaoView: React.FC<PublicacaoViewProps> = ({
                   return (
                     <div className="p-3 bg-amber-50 rounded-xl border border-amber-200 text-amber-900 space-y-1">
                       <div className="flex items-center gap-1.5 font-bold">
-                        <Sparkles className="w-3.5 h-3.5 text-amber-700" />
+                        <CheckCircle2 className="w-3.5 h-3.5 text-amber-700" />
                         <span>Retenção tributária calculada: {formatBRL(dif)} ({retPct.toFixed(2).replace('.', ',')}%)</span>
                       </div>
                       <p className="text-[11px] text-amber-800 leading-relaxed">
-                        O sistema registrará esse percentual para o credor <strong>{manualModalItem.fornecedor}</strong> na Fonte <strong>{manualFonte}</strong>, aprendendo o padrão para associar automaticamente futuras liquidações semelhantes.
+                        O sistema registrará esse percentual para o credor <strong>{manualModalItem.fornecedor}</strong> na Fonte <strong>{manualFonte}</strong>, salvando o parâmetro para associar automaticamente futuras liquidações semelhantes.
                       </p>
                     </div>
                   );

@@ -101,7 +101,7 @@ export const ChartsSection: React.FC<ChartsSectionProps> = ({ metrics }) => {
   };
 
   return (
-    <section className="bg-white rounded-2xl p-6 shadow-xs border border-slate-200/90 space-y-4">
+    <section className="bg-white rounded-2xl p-6 shadow-xs border border-slate-200/90 space-y-4 cls-stable">
       <div className="flex items-center justify-between">
         <div>
           <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
@@ -118,7 +118,7 @@ export const ChartsSection: React.FC<ChartsSectionProps> = ({ metrics }) => {
         </span>
       </div>
 
-      <div className="h-80 relative flex items-center justify-center py-2">
+      <div className="h-80 min-h-[320px] relative flex items-center justify-center py-2 cls-stable">
         {isProcessed && topSuppliers.length > 0 ? (
           <Bar data={chartData} options={chartOptions} />
         ) : (

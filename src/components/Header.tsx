@@ -6,7 +6,7 @@ import {
   Trash2,
   Calendar,
   Check,
-  BrainCircuit,
+  GitCompareArrows,
   Bell,
   Loader2,
   RefreshCw,
@@ -149,7 +149,7 @@ export const Header: React.FC<HeaderProps> = ({
   };
 
   return (
-    <header className="bg-white/95 backdrop-blur-md border-b border-slate-200/90 shadow-xs sticky top-0 z-30 px-4 sm:px-6 py-3.5 transition-all">
+    <header className="bg-white/95 backdrop-blur-md border-b border-slate-200/90 shadow-xs sticky top-0 z-30 px-4 sm:px-6 py-3.5 min-h-[68px] transition-colors cls-stable">
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         
         {/* Toggle Button & Title */}
@@ -158,7 +158,7 @@ export const Header: React.FC<HeaderProps> = ({
             <button
               type="button"
               onClick={onToggleSidebar}
-              className="p-2 rounded-xl text-slate-700 bg-slate-100 hover:bg-emerald-50 hover:text-emerald-800 border border-slate-200 shadow-2xs transition-all flex items-center justify-center cursor-pointer active:scale-95 shrink-0"
+              className="p-2 rounded-xl text-slate-700 bg-slate-100 hover:bg-emerald-50 hover:text-emerald-800 border border-slate-200 shadow-2xs transition-colors flex items-center justify-center cursor-pointer active:scale-95 shrink-0"
               title="Abrir Menu de Navegação"
               aria-label="Abrir Menu de Navegação"
             >
@@ -178,18 +178,18 @@ export const Header: React.FC<HeaderProps> = ({
           
           {/* Updated Date & Time Display OR Discreet Updating Indicator */}
           {isProcessing ? (
-            <div className="bg-emerald-50 text-emerald-900 px-3.5 py-1.5 rounded-xl border border-emerald-300 text-xs font-bold flex items-center gap-2 shadow-2xs">
-              <RefreshCw className="w-3.5 h-3.5 animate-spin text-emerald-600" />
+            <div className="bg-emerald-50 text-emerald-900 px-3.5 py-1.5 min-w-[235px] min-h-[34px] rounded-xl border border-emerald-300 text-xs font-bold flex items-center gap-2 shadow-2xs tabular-nums">
+              <RefreshCw className="w-3.5 h-3.5 animate-spin text-emerald-600 shrink-0" />
               <span>{processingMessage || 'Atualizando informações...'} ({processingProgress || 100}%)</span>
             </div>
           ) : (
-            <div className="bg-emerald-50/80 text-emerald-900 px-3.5 py-1.5 rounded-xl border border-emerald-200 text-xs font-semibold flex items-center gap-2">
-              <Calendar className="w-3.5 h-3.5 text-emerald-700" />
+            <div className="bg-emerald-50/80 text-emerald-900 px-3.5 py-1.5 min-w-[235px] min-h-[34px] rounded-xl border border-emerald-200 text-xs font-semibold flex items-center gap-2 tabular-nums">
+              <Calendar className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
               <span className="font-mono">{formattedUpdateDate}</span>
             </div>
           )}
 
-          {/* Auditoria IA Button - Admin Only */}
+          {/* Conciliação NL/PP Button - Admin Only */}
           {userRole === 'admin' && onOpenAuditoriaML && (
             <button
               type="button"
@@ -199,18 +199,18 @@ export const Header: React.FC<HeaderProps> = ({
                   ? 'bg-amber-50 hover:bg-amber-100 text-amber-950 border-amber-300 ring-2 ring-amber-400/30'
                   : 'bg-indigo-50 hover:bg-indigo-100 text-indigo-900 border-indigo-200'
               }`}
-              title="Auditoria de Inferências e Validação de Conversões (NL em PP / OB)"
+              title="Auditoria de Vínculos e Validação de Conversões (NL em PP / OB)"
             >
-              <BrainCircuit
+              <GitCompareArrows
                 className={`w-4 h-4 ${
                   typeof pendingInferencesCount === 'number' && pendingInferencesCount > 0
                     ? 'text-amber-600 animate-pulse'
                     : 'text-indigo-600'
                 }`}
               />
-              <span>Auditoria IA</span>
+              <span>Conciliação NL/PP</span>
               {typeof pendingInferencesCount === 'number' && pendingInferencesCount > 0 && (
-                <span className="bg-amber-600 text-white text-[10px] font-black px-1.5 py-0.5 rounded-full leading-none">
+                <span className="bg-amber-600 text-white text-[10px] font-black px-1.5 py-0.5 rounded-full leading-none tabular-nums">
                   {pendingInferencesCount}
                 </span>
               )}

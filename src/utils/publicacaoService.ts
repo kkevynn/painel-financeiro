@@ -144,7 +144,7 @@ function persistResolvedCacheToStorage() {
 
 /**
  * Manually links PP and OB to a publication NL, marking it as resolved,
- * saving the resolution persistently, and registering the tax retention pattern in AI/ML model.
+ * saving the resolution persistently, and registering the tax retention pattern in the retention registry.
  * Supports parcel split editing between Federal (0.600) and State (0.500) resources.
  */
 export function saveManualPublicacaoResolution(params: {
@@ -192,7 +192,7 @@ export function saveManualPublicacaoResolution(params: {
 
   persistResolvedCacheToStorage();
 
-  // Register in AI pattern learning model
+  // Register in retention pattern registry
   if (params.fornecedor || params.cnpj) {
     mlInferenceService.recordManualPattern({
       credor: params.fornecedor || 'Fornecedor',

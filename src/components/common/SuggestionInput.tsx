@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Search, ChevronDown, Check, Sparkles } from 'lucide-react';
+import { Search, ChevronDown, Check } from 'lucide-react';
 
 export interface SuggestionItem<T = any> {
   id: string;
@@ -105,7 +105,7 @@ export function SuggestionInput<T = any>({
           </label>
           {suggestions.length > 0 && (
             <span className="text-[10px] text-emerald-600 font-semibold flex items-center gap-0.5">
-              <Sparkles className="w-2.5 h-2.5" />
+              <Search className="w-2.5 h-2.5" />
               <span>{suggestions.length} sugestões</span>
             </span>
           )}

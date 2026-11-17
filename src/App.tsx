@@ -170,7 +170,7 @@ export function App() {
   // State for Extrato Geral de Auditoria da Empresa
   const [auditedSupplier, setAuditedSupplier] = useState<{ name: string; cnpj: string } | null>(null);
 
-  // State for Machine Learning & AI Inferences Audit Modal
+  // State for NL/PP Reconciliation & Retention Audit Modal
   const [isModalMLOpen, setIsModalMLOpen] = useState(false);
   const [pendingMLCount, setPendingMLCount] = useState(0);
 
@@ -1120,9 +1120,9 @@ export function App() {
         />
 
         {/* Dynamic Workspace (Expanded Layout to 98% Screen Width) */}
-        <main className="p-4 sm:p-6 md:p-8 space-y-8 w-full max-w-[98%] mx-auto flex-1">
+        <main className="p-4 sm:p-6 md:p-8 space-y-8 w-full max-w-[98%] mx-auto flex-1 cls-stable">
           <ErrorBoundary fallbackTitle="Falha ao carregar o módulo selecionado">
-            <div className="space-y-8">
+            <div className="space-y-8 cls-stable">
               {activeTab === 'painel' && (
                 <div className="space-y-8 animate-in fade-in-50 duration-150">
                   {!metrics.isProcessed ? (
@@ -1305,7 +1305,7 @@ export function App() {
         />
       )}
 
-      {/* Machine Learning / IA Audit Modal */}
+      {/* Conciliação NL/PP e Retenções Modal */}
       {isModalMLOpen && (
         <ModalAuditoriaML
           isOpen={isModalMLOpen}

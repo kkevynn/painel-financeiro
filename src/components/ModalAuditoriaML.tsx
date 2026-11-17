@@ -1,9 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import {
-  BrainCircuit,
+  GitCompareArrows,
   CheckCircle2,
   XCircle,
-  Sparkles,
   ArrowRight,
   ShieldCheck,
   Building,
@@ -288,7 +287,7 @@ export const ModalAuditoriaML: React.FC<ModalAuditoriaMLProps> = ({
     setMatches(mlInferenceService.getInferredMatches());
     setPatterns(mlInferenceService.getLearnedPatterns());
 
-    setFeedbackMsg(`Ligação manual registrada e padrão aprendido para "${manualCredor.trim()}"!`);
+    setFeedbackMsg(`Ligação manual registrada e regra de retenção salva para "${manualCredor.trim()}"!`);
     setIsAddingManual(false);
 
     setManualNL('');
@@ -355,7 +354,7 @@ export const ModalAuditoriaML: React.FC<ModalAuditoriaMLProps> = ({
     setMatches(mlInferenceService.getInferredMatches());
     setPatterns(mlInferenceService.getLearnedPatterns());
     setEditingMatchId(null);
-    setFeedbackMsg('Ligação atualizada com sucesso e novo padrão memorizado!');
+    setFeedbackMsg('Ligação atualizada com sucesso e parâmetro de retenção salvo!');
     setTimeout(() => setFeedbackMsg(null), 3500);
   };
 
@@ -367,11 +366,11 @@ export const ModalAuditoriaML: React.FC<ModalAuditoriaMLProps> = ({
         <div className="p-6 bg-slate-900 text-white flex items-center justify-between border-b border-slate-800">
           <div className="flex items-center space-x-3">
             <div className="w-10 h-10 rounded-xl bg-emerald-500/20 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
-              <BrainCircuit className="w-6 h-6" />
+              <GitCompareArrows className="w-6 h-6" />
             </div>
             <div>
               <h3 className="text-lg font-black tracking-tight text-white">
-                Auditoria IA
+                Conciliação NL/PP e Retenções
               </h3>
             </div>
           </div>
@@ -413,7 +412,7 @@ export const ModalAuditoriaML: React.FC<ModalAuditoriaMLProps> = ({
               }`}
             >
               <Database className="w-3.5 h-3.5" />
-              <span>Padrões Memorizados</span>
+              <span>Padrões Registrados</span>
               <span className="bg-slate-200 text-slate-700 px-1.5 py-0.2 rounded-full text-[10px] font-black">
                 {patterns.length}
               </span>
@@ -425,7 +424,7 @@ export const ModalAuditoriaML: React.FC<ModalAuditoriaMLProps> = ({
               type="button"
               onClick={() => setIsAddingManual((v) => !v)}
               className="px-3.5 py-1.5 bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-bold rounded-xl transition flex items-center gap-1.5 shadow-xs cursor-pointer active:scale-98"
-              title="Adicionar manualmente se uma NL virou PP e OB para o modelo aprender o padrão"
+              title="Adicionar manualmente se uma NL virou PP e OB para registrar o percentual de retenção"
             >
               <Plus className="w-3.5 h-3.5" />
               <span>+ Adicionar Ligação Manual</span>
@@ -539,7 +538,7 @@ export const ModalAuditoriaML: React.FC<ModalAuditoriaMLProps> = ({
                 <div className="bg-emerald-50/70 border border-emerald-300 rounded-2xl p-5 space-y-4 shadow-sm animate-in fade-in duration-200">
                   <div className="flex items-center justify-between border-b border-emerald-200 pb-2">
                     <div className="flex items-center gap-2">
-                      <Sparkles className="w-4 h-4 text-emerald-700" />
+                      <GitCompareArrows className="w-4 h-4 text-emerald-700" />
                       <h4 className="text-sm font-bold text-emerald-950">
                         Adicionar Ligação Manual (NL → PP / OB)
                       </h4>
@@ -702,7 +701,7 @@ export const ModalAuditoriaML: React.FC<ModalAuditoriaMLProps> = ({
               {displayedMatches.length === 0 ? (
                 <div className="py-14 text-center text-slate-500 space-y-3 max-w-lg mx-auto">
                   <div className="w-12 h-12 bg-indigo-50 border border-indigo-200 text-indigo-700 rounded-2xl flex items-center justify-center mx-auto">
-                    <BrainCircuit className="w-6 h-6" />
+                    <GitCompareArrows className="w-6 h-6" />
                   </div>
                   <h4 className="text-sm font-bold text-slate-800">
                     {matches.length === 0
@@ -762,8 +761,8 @@ export const ModalAuditoriaML: React.FC<ModalAuditoriaMLProps> = ({
                               )}
                               {item.automaticamenteConfirmado && (
                                 <span className="inline-flex items-center gap-1 text-[10px] font-black bg-blue-100 text-blue-800 border border-blue-300 px-2 py-0.5 rounded-full">
-                                  <Sparkles className="w-3 h-3 text-blue-600" />
-                                  Auto-Confirmado via Padrão Memorizado
+                                  <CheckCircle2 className="w-3 h-3 text-blue-600" />
+                                  Auto-Confirmado via Histórico Registrado
                                 </span>
                               )}
                               {isConfirmed && !item.automaticamenteConfirmado && (
@@ -990,9 +989,9 @@ export const ModalAuditoriaML: React.FC<ModalAuditoriaMLProps> = ({
               {patterns.length === 0 ? (
                 <div className="py-16 text-center text-slate-400 space-y-2">
                   <Database className="w-10 h-10 mx-auto text-slate-300" />
-                  <p className="text-sm font-semibold text-slate-600">Nenhum padrão memorizado ainda</p>
+                  <p className="text-sm font-semibold text-slate-600">Nenhum padrão registrado ainda</p>
                   <p className="text-xs text-slate-400 max-w-md mx-auto">
-                    Ao confirmar que uma NL virou uma PP na aba de validação, a taxa de retenção tributária daquele credor será aprendida e guardada no navegador para auto-validação futura.
+                    Ao confirmar que uma NL virou uma PP na aba de validação, a taxa de retenção tributária daquele credor será registrada no sistema para associação automática futura.
                   </p>
                 </div>
               ) : (
@@ -1002,7 +1001,7 @@ export const ModalAuditoriaML: React.FC<ModalAuditoriaMLProps> = ({
                       <tr className="bg-slate-50 border-b border-slate-200 text-slate-600 font-extrabold text-[11px] uppercase">
                         <th className="py-3 px-4">CREDOR / FORNECEDOR</th>
                         <th className="py-3 px-3">CNPJ</th>
-                        <th className="py-3 px-3 text-right">ALÍQUOTA DE RETENÇÃO APRENDIDA</th>
+                        <th className="py-3 px-3 text-right">ALÍQUOTA DE RETENÇÃO REGISTRADA</th>
                         <th className="py-3 px-3 text-center">CONFIRMAÇÕES</th>
                         <th className="py-3 px-3">ÚLTIMA AMOSTRA</th>
                         <th className="py-3 px-3 text-center w-16">AÇÃO</th>

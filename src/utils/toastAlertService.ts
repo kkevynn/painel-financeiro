@@ -1151,7 +1151,7 @@ class ToastAlertManager {
    * Monitora estritamente a resolução bancária de Ordens Bancárias / PPs preexistentes:
    * 1. Alerta verde (Sucesso): transição de situação pendente (AO ou vazia) para Confirmada (PPCB, CB, PAGO).
    * 2. Alerta vermelho (Crítico): transição de situação pendente (AO ou vazia) para Rejeitada (PPRJ, RJ, C).
-   * Transições heurísticas de NL -> PP/OB (dedução de impostos) pertencem exclusivamente à Auditoria IA e NÃO disparam Toasts.
+   * Transições heurísticas de NL -> PP/OB (dedução de impostos) pertencem exclusivamente à Conciliação NL/PP e NÃO disparam Toasts.
    */
   public analyzeFileTransitions(
     files: FileData[],

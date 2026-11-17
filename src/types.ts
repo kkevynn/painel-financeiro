@@ -383,7 +383,7 @@ export interface ToastAlert {
 }
 
 // ----------------------------------------------------
-// Inferência de Pagamento e Machine Learning Local
+// Conciliação de Pagamento e Registro de Retenções
 // ----------------------------------------------------
 export interface InferredPaymentMatch {
   id: string;

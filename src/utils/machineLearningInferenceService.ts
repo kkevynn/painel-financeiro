@@ -159,7 +159,7 @@ class MachineLearningInferenceService {
   }
 
   /**
-   * Confirms an inferred match, memorizing the creditor tax retention pattern into local machine learning model
+   * Confirms an inferred match, saving the creditor tax retention pattern into local retention registry
    */
   public confirmMatch(id: string) {
     const match = this.inferredMatches.find((m) => m.id === id);
@@ -223,7 +223,7 @@ class MachineLearningInferenceService {
   }
 
   /**
-   * Confirms all pending matches that have high machine learning confidence (>85%)
+   * Confirms all pending matches that have high matching confidence (>85%)
    */
   public confirmAllHighConfidence() {
     let changed = false;
@@ -366,7 +366,7 @@ class MachineLearningInferenceService {
 
   /**
    * Records a manual PP/OB association pattern for a creditor (from Publicação view)
-   * so the AI pattern model learns the tax retention rate and creditor mapping
+   * so the retention registry saves the tax retention rate and creditor mapping
    */
   public recordManualPattern(params: {
     credor: string;
@@ -727,7 +727,7 @@ class MachineLearningInferenceService {
               percentualRetencao: pct,
               statusSituacaoPP: 'AO (Confirmado Manualmente)',
               confianca: 100,
-              motivo: `Vínculo manual aprendido: Esta NL foi vinculada à PP ${learnedExact.pp || '-'} ${learnedExact.ob ? `/ OB ${learnedExact.ob}` : ''}.`,
+              motivo: `Vínculo manual registrado: Esta NL foi vinculada à PP ${learnedExact.pp || '-'} ${learnedExact.ob ? `/ OB ${learnedExact.ob}` : ''}.`,
               baseOrigem: nl.stage,
               automaticamenteConfirmado: true,
               statusValidacao: 'confirmado',
@@ -774,7 +774,7 @@ class MachineLearningInferenceService {
                 const difFromLearned = Math.abs(pctRetention - learnedPattern.aliquotaImpostoRetidoMedia);
                 if (difFromLearned <= learnedPattern.toleranciaPercentual) {
                   confianca = 98;
-                  motivo = `Ligação baseada em eventos passados deste fornecedor (${learnedPattern.credor}): retenção aprendida de ${(learnedPattern.aliquotaImpostoRetidoMedia * 100).toFixed(1).replace('.', ',')}% (amostra anterior NL ${learnedPattern.sampleNL || 'anterior'} → PP ${learnedPattern.samplePP || 'anterior'}). Confirma esta ligação?`;
+                  motivo = `Ligação baseada em eventos passados deste fornecedor (${learnedPattern.credor}): retenção registrada de ${(learnedPattern.aliquotaImpostoRetidoMedia * 100).toFixed(1).replace('.', ',')}% (amostra anterior NL ${learnedPattern.sampleNL || 'anterior'} → PP ${learnedPattern.samplePP || 'anterior'}). Confirma esta ligação?`;
                 } else {
                   confianca = 92;
                   motivo = `Ligação com retenção de ${(pctRetention * 100).toFixed(1).replace('.', ',')}% próxima do histórico de eventos passados deste fornecedor (${(learnedPattern.aliquotaImpostoRetidoMedia * 100).toFixed(1).replace('.', ',')}%). Requer validação.`;

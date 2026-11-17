@@ -13,7 +13,6 @@ import {
   Clock,
   AlertCircle,
   Repeat,
-  Sparkles,
   ChevronLeft,
   ChevronRight,
   ShieldCheck,

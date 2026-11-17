@@ -1,16 +1,53 @@
 @import "tailwindcss";
 
+@font-face {
+  font-family: 'InterFallback';
+  src: local('Arial'), local('Helvetica Neue'), local('Roboto'), local('Segoe UI');
+  size-adjust: 107%;
+  ascent-override: 90%;
+  descent-override: 22%;
+  line-gap-override: 0%;
+}
+
 @layer base {
+  html {
+    scrollbar-gutter: stable;
+    text-rendering: optimizeLegibility;
+    font-synthesis-weight: none;
+  }
+
   html, body {
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    font-family: 'Inter', 'InterFallback', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
     letter-spacing: -0.011em;
+    min-height: 100dvh;
+  }
+
+  @media print {
+    html {
+      scrollbar-gutter: auto;
+    }
   }
 
   /* Consistent tabular alignment for numbers, values, and codes in tables */
   table, .tabular-nums, [data-tabular="true"] {
     font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer utilities {
+  .cls-stable {
+    contain: layout style;
+  }
+
+  .cls-card {
+    contain: layout style;
+    min-height: 92px;
+  }
+
+  .cls-table-wrap {
+    contain: layout style;
   }
 }
