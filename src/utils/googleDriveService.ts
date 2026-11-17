@@ -560,6 +560,8 @@ class GoogleDriveService {
       "name contains 'Publicac' or " +
       "name contains 'Publicação' or " +
       "name contains 'Obedece' or " +
+      "name contains 'Cronolog' or " +
+      "name contains 'Natureza' or " +
       "name contains 'SIGEF' or " +
       "name contains 'sigef' or " +
       "name contains 'PP' or " +
@@ -570,7 +572,9 @@ class GoogleDriveService {
     const url = new URL('https://www.googleapis.com/drive/v3/files');
     url.searchParams.set('q', query);
     url.searchParams.set('orderBy', 'modifiedTime desc');
-    url.searchParams.set('pageSize', '25');
+    url.searchParams.set('pageSize', '100');
+    url.searchParams.set('supportsAllDrives', 'true');
+    url.searchParams.set('includeItemsFromAllDrives', 'true');
     url.searchParams.set('fields', 'files(id, name, mimeType, modifiedTime, size)');
 
     const res = await fetch(url.toString(), {
@@ -624,6 +628,25 @@ class GoogleDriveService {
       addedIds.add(procFile.id);
     }
 
+    // A2. Planilhas individuais de Obedece / Não Obedece (caso não estejam consolidadas em Processamento de dados)
+    const obedeceStandalone = files.find((f) => {
+      const norm = normalize(f.name);
+      return (norm.includes('obedece') || norm.includes('cronolog')) && !norm.includes('nao') && !addedIds.has(f.id);
+    });
+    if (obedeceStandalone && !addedIds.has(obedeceStandalone.id)) {
+      selected.push(obedeceStandalone);
+      addedIds.add(obedeceStandalone.id);
+    }
+
+    const naoObedeceStandalone = files.find((f) => {
+      const norm = normalize(f.name);
+      return (norm.includes('nao obedece') || norm.includes('nao cron')) && !addedIds.has(f.id);
+    });
+    if (naoObedeceStandalone && !addedIds.has(naoObedeceStandalone.id)) {
+      selected.push(naoObedeceStandalone);
+      addedIds.add(naoObedeceStandalone.id);
+    }
+
     // B. "Publicação - DD/MM" (NLs para publicação - include all recent publication files across days)
     const pubFiles = files.filter((f) => {
       const norm = normalize(f.name);
@@ -636,7 +659,21 @@ class GoogleDriveService {
       }
     });
 
-    // C. SIGEF / OB / PP report
+    // C. "OBs - sigef - Principal" (holds "Dados Ajustados" from row 7 for OB consolidation)
+    const obsPrincipalFile = files.find((f) => {
+      const norm = normalize(f.name);
+      return (
+        (norm.includes('obs') || norm.includes('ob')) &&
+        norm.includes('sigef') &&
+        norm.includes('principal')
+      ) && !addedIds.has(f.id);
+    });
+    if (obsPrincipalFile && !addedIds.has(obsPrincipalFile.id)) {
+      selected.push(obsPrincipalFile);
+      addedIds.add(obsPrincipalFile.id);
+    }
+
+    // D. SIGEF / OB / PP report (distinct from OBs - sigef - Principal)
     const sigefFile = files.find((f) => {
       const norm = normalize(f.name);
       return (
@@ -653,18 +690,14 @@ class GoogleDriveService {
       addedIds.add(sigefFile.id);
     }
 
-    // D. "OBs - sigef - Principal" (holds "dados ajustados" for OB consolidation)
-    const obsPrincipalFile = files.find((f) => {
+    // E. Natureza de Despesa
+    const naturezaFile = files.find((f) => {
       const norm = normalize(f.name);
-      return (
-        (norm.includes('obs') || norm.includes('ob')) &&
-        norm.includes('sigef') &&
-        norm.includes('principal')
-      ) && !addedIds.has(f.id);
+      return norm.includes('natureza') && !addedIds.has(f.id);
     });
-    if (obsPrincipalFile && !addedIds.has(obsPrincipalFile.id)) {
-      selected.push(obsPrincipalFile);
-      addedIds.add(obsPrincipalFile.id);
+    if (naturezaFile && !addedIds.has(naturezaFile.id)) {
+      selected.push(naturezaFile);
+      addedIds.add(naturezaFile.id);
     }
 
     // If none of the specific named patterns matched, pick the most recent file

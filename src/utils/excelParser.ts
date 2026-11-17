@@ -14,7 +14,7 @@ export function detectStageFromFileName(fileName: string): StageKey {
     .replace(/\s+/g, ' ')
     .trim();
 
-  // 0. DETALHAMENTO DE PAGAMENTOS / ORDEM BANCÁRIA (Listar Ordem Bancária)
+  // 0. DETALHAMENTO EXPLÍCITO DE ORDEM BANCÁRIA (Listar Ordem Bancária / OBs - sigef - Principal)
   if (
     normalized.includes('ordem bancaria') ||
     normalized.includes('ordens bancarias') ||
@@ -25,34 +25,30 @@ export function detectStageFromFileName(fileName: string): StageKey {
     normalized.includes('relatorio de ob') ||
     normalized.includes('planilha ob') ||
     normalized.includes('planilha de ob') ||
-    ((normalized.includes('obs') || normalized.includes('ob')) && normalized.includes('principal')) ||
-    /\bobs?\b/.test(normalized)
+    ((normalized.includes('obs') || normalized.includes('ob')) && normalized.includes('principal'))
   ) {
     return 'ordem_bancaria';
   }
 
-  // 1. NATUREZA DA DESPESA (Priority check for empenho/natureza)
-  if (
-    normalized.includes('natureza') ||
-    normalized.includes('empenho')
-  ) {
+  // 1. NATUREZA DA DESPESA (explícita pelo nome "natureza")
+  if (normalized.includes('natureza')) {
     return 'natureza_despesa';
   }
 
-  // 1.1 PUBLICAÇÃO / DOE / PARA PUBLICAR
+  // 1.1 PUBLICAÇÃO / DOE / PARA PUBLICAR (prioridade sobre termos genéricos como "empenho" ou "obs")
   if (
     normalized.includes('publicacao') ||
     normalized.includes('publicac') ||
     normalized.includes('publicar') ||
     normalized.includes('publicado') ||
-    normalized.includes('doe') ||
     normalized.includes('diario oficial') ||
-    normalized.includes('para publicacao')
+    normalized.includes('para publicacao') ||
+    /\bdoe\b/.test(normalized)
   ) {
     return 'publicacao';
   }
 
-  // 2. NÃO OBEDECE (Priority check before "obedece")
+  // 2. NÃO OBEDECE (Priority check before "obedece" and before generic "empenho"/"obs")
   if (
     normalized.includes('nao obedece') ||
     normalized.includes('naoobedece') ||
@@ -88,6 +84,16 @@ export function detectStageFromFileName(fileName: string): StageKey {
     normalized.includes('ordem cronologica')
   ) {
     return 'obedece';
+  }
+
+  // 3.1 NATUREZA / EMPENHO (quando não é liquidação/publicação)
+  if (normalized.includes('empenho')) {
+    return 'natureza_despesa';
+  }
+
+  // 3.2 ORDEM BANCÁRIA por palavra isolada "ob" ou "obs" (fallback após checar etapas funcionais)
+  if (/\bobs?\b/.test(normalized)) {
+    return 'ordem_bancaria';
   }
 
   // 4. BASE DE PPS (including SIGEF reports such as Relatorio_*.xls and payment proposals)
@@ -849,6 +855,17 @@ export function autoDetectColumns(
     for (const h of headers) {
       if (h === obCol || h === notaEmpenhoCol) continue;
       const norm = normalize(h);
+      if (
+        norm.includes('valor') ||
+        norm.includes('vlr') ||
+        norm.includes('saldo') ||
+        norm.includes('data') ||
+        norm.includes('situacao') ||
+        norm.includes('historico') ||
+        norm.includes('status')
+      ) {
+        continue;
+      }
       for (const kw of specificDocKeywords) {
         if (norm === kw || norm.startsWith(`${kw} `) || norm.endsWith(` ${kw}`) || norm.includes(` ${kw} `)) {
           numeroCol = h;
@@ -862,12 +879,34 @@ export function autoDetectColumns(
     }
   }
 
-  // Step 5c. Generic keywords ('documento', 'processo') but avoid row sequence lines (nº, item, ordem)
+  // Step 5d. Fallback para cabeçalho 'numero'/'num'/'nr' com códigos numéricos não sequenciais (ex: NL numérica sem prefixo)
+  if (!numeroCol) {
+    for (const h of headers) {
+      if (h === obCol || h === notaEmpenhoCol || h === favorecidoCol || h === favorecidoNECol) continue;
+      const norm = normalize(h);
+      if (norm === 'numero' || norm === 'num' || norm === 'nr' || norm === 'numero doc' || norm === 'nr doc') {
+        const isRowNumberCol =
+          sampleRows &&
+          sampleRows.length > 1 &&
+          sampleRows.every((r, idx) => {
+            const val = String(r[h] || '').trim();
+            return /^\d{1,3}$/.test(val) && parseInt(val, 10) === idx + 1;
+          });
+        if (!isRowNumberCol) {
+          numeroCol = h;
+          break;
+        }
+      }
+    }
+  }
+
+  // Step 5e. Generic keywords ('documento', 'processo') but avoid row sequence lines (nº, item, ordem)
   if (!numeroCol) {
     const genericKeywords = ['documento', 'doc', 'processo'];
     for (const h of headers) {
       if (h === obCol || h === notaEmpenhoCol || h === favorecidoCol) continue;
       const norm = normalize(h);
+      if (norm.includes('valor') || norm.includes('vlr') || norm.includes('data') || norm.includes('situacao')) continue;
       for (const kw of genericKeywords) {
         if (norm === kw || norm.startsWith(`${kw} `) || norm.endsWith(` ${kw}`) || norm.includes(` ${kw} `)) {
           const isRowNumberCol =
@@ -1357,10 +1396,19 @@ export function analyzeColumnsForStage(
 
   // STAGE SPECIFIC ANALYSIS:
   if (stage === 'ordem_bancaria') {
-    // 1. OB Column: se stage === 'ordem_bancaria' e o cabeçalho for 'numero', ou se as células tiverem o padrão \d{4}OB\d+, mapeie como obCol
+    // 1. OB Column: se stage === 'ordem_bancaria' e o cabeçalho for 'numero'/'ob', ou se as células tiverem o padrão \d{4}OB\d+, mapeie como obCol
     for (const h of headers) {
       const norm = normalize(h);
-      if (norm === 'numero' || norm === 'num' || norm === 'n' || norm === 'ob' || norm.includes('ordem bancaria')) {
+      if (
+        norm === 'numero' ||
+        norm === 'num' ||
+        norm === 'n' ||
+        norm === 'ob' ||
+        norm.startsWith('ob ') ||
+        norm.endsWith(' ob') ||
+        norm.includes(' ob ') ||
+        norm.includes('ordem bancaria')
+      ) {
         obCol = h;
         break;
       }
@@ -1374,7 +1422,7 @@ export function analyzeColumnsForStage(
         }
       }
     }
-    // 2. Fonte Column: Check content for 0.6.xx or .6. or \d\.\d\.\d{2}\.\d{6}
+    // 2. Fonte Column: Check content for 0.6.xx, .6., .5. or any isFonteString pattern
     for (const h of headers) {
       const matchCount = sample.filter((r) => {
         const v = String(r[h] || '');
@@ -1383,6 +1431,16 @@ export function analyzeColumnsForStage(
       if (matchCount >= 1) {
         fonteCol = h;
         break;
+      }
+    }
+    if (!fonteCol) {
+      for (const h of headers) {
+        if (h === obCol || h === dataCol) continue;
+        const matchCount = sample.filter((r) => isFonteString(r[h])).length;
+        if (matchCount >= 2) {
+          fonteCol = h;
+          break;
+        }
       }
     }
     // 3. PP Column: Check content for \d{4}PP\d+
@@ -1394,18 +1452,42 @@ export function analyzeColumnsForStage(
         break;
       }
     }
-    // 4. Favorecido: Check content for CNPJ or Company names (>10 chars, not bank account)
+    // 4. Favorecido / CNPJ: Check content for CNPJ or Company names (>10 chars, not OB/PP/date/fonte/bank)
     for (const h of headers) {
       if (h === obCol || h === fonteCol || h === ppCol || h === dataCol) continue;
       const cnpjMatches = sample.filter((r) => /\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}/.test(String(r[h] || ''))).length;
       if (cnpjMatches >= 1) {
-        favorecidoCol = h;
+        const hasCompanyNameInSameCol = sample.some((r) => {
+          const s = String(r[h] || '').replace(/\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}/g, '').replace(/[^A-Za-zÀ-ÿ]/g, '').trim();
+          return s.length >= 4;
+        });
+        if (hasCompanyNameInSameCol) {
+          favorecidoCol = h;
+        } else if (!cnpjCol) {
+          cnpjCol = h;
+        }
         break;
+      }
+    }
+    if (!favorecidoCol || favorecidoCol === obCol || favorecidoCol === fonteCol || favorecidoCol === ppCol || favorecidoCol === dataCol || favorecidoCol === cnpjCol) {
+      for (const h of headers) {
+        if (h === obCol || h === fonteCol || h === ppCol || h === dataCol || h === cnpjCol || h === situacaoCol) continue;
+        const nameMatches = sample.filter((r) => {
+          const s = String(r[h] || '').trim();
+          if (s.length <= 6 || !/[A-Za-zÀ-ÿ]{3,}/.test(s)) return false;
+          if (/\b\d{4}(?:OB|PP|NL|NE)\d+\b/i.test(s) || isFonteString(s)) return false;
+          if (/^\d{2}\/\d{2}\/\d{4}$/.test(s)) return false;
+          return true;
+        }).length;
+        if (nameMatches >= 2) {
+          favorecidoCol = h;
+          break;
+        }
       }
     }
     // 5. Situação: Check for CB, PPCB, RJ, etc.
     for (const h of headers) {
-      if (h === obCol || h === fonteCol || h === ppCol) continue;
+      if (h === obCol || h === fonteCol || h === ppCol || h === favorecidoCol || h === cnpjCol) continue;
       const sitMatches = sample.filter((r) => /\b(CB|RJ|PPCB|PPRJ|AO|C|AP|PAGA)\b/i.test(String(r[h] || '').trim())).length;
       if (sitMatches >= 1) {
         situacaoCol = h;
@@ -1490,17 +1572,104 @@ export function analyzeColumnsForStage(
     // Liquidação: Prioritize "valor da liquidacao" or "saldo a liquidar"
     for (const h of headers) {
       const norm = normalize(h);
-      if (norm.includes('liquidacao') && norm.includes('valor')) {
+      if (
+        (norm.includes('liquidacao') || norm.includes('liquidac') || norm.includes('liquidar')) &&
+        (norm.includes('valor') || norm.includes('vlr') || norm.includes('saldo'))
+      ) {
         valorCol = h;
         break;
       }
     }
-    // Número da liquidação / processo
-    for (const h of headers) {
-      const norm = normalize(h);
-      if (norm.includes('liquidacao') || norm.includes('nl') || norm.includes('documento')) {
-        numeroCol = h;
-        break;
+    // Número da liquidação (NL): priorizar padrão \d{4}NL\d+ nas linhas ou cabeçalhos explícitos de documento/NL (nunca Valor/Data/Situação)
+    let matchedNlDataCol = '';
+    if (sample.length > 0) {
+      for (const h of headers) {
+        if (h === obCol || h === notaEmpenhoCol || h === favorecidoCol || h === valorCol) continue;
+        if (sample.some((r) => /\b(?:\d{2,4})?NL[\s\-_]*\d+\b/i.test(String(r[h] || '')))) {
+          matchedNlDataCol = h;
+          break;
+        }
+      }
+    }
+    if (matchedNlDataCol) {
+      numeroCol = matchedNlDataCol;
+    } else {
+      for (const h of headers) {
+        if (h === obCol || h === notaEmpenhoCol || h === favorecidoCol || h === valorCol) continue;
+        const norm = normalize(h);
+        if (
+          norm.includes('valor') ||
+          norm.includes('vlr') ||
+          norm.includes('saldo') ||
+          norm.includes('data') ||
+          norm.includes('dt ') ||
+          norm.includes('situacao') ||
+          norm.includes('historico') ||
+          norm.includes('status')
+        ) {
+          continue;
+        }
+        if (
+          norm === 'nl' ||
+          norm.includes(' nl') ||
+          norm.startsWith('nl ') ||
+          norm.includes('nota de liquidacao') ||
+          norm.includes('nota liquidacao') ||
+          norm.includes('nota de lancamento') ||
+          norm.includes('nota lancamento') ||
+          norm.includes('liquidacao') ||
+          norm.includes('documento') ||
+          norm === 'doc'
+        ) {
+          numeroCol = h;
+          break;
+        }
+      }
+    }
+  } else if (stage === 'publicacao') {
+    // Publicação: priorizar NL nos dados ou cabeçalho de documento/NL (nunca Valor/Data/Empenho)
+    let matchedNlDataCol = '';
+    if (sample.length > 0) {
+      for (const h of headers) {
+        if (h === obCol || h === notaEmpenhoCol || h === favorecidoCol || h === valorCol) continue;
+        if (sample.some((r) => /\b(?:\d{2,4})?NL[\s\-_]*\d+\b/i.test(String(r[h] || '')))) {
+          matchedNlDataCol = h;
+          break;
+        }
+      }
+    }
+    if (matchedNlDataCol) {
+      numeroCol = matchedNlDataCol;
+    } else {
+      for (const h of headers) {
+        if (h === obCol || h === notaEmpenhoCol || h === favorecidoCol || h === valorCol) continue;
+        const norm = normalize(h);
+        if (
+          norm.includes('valor') ||
+          norm.includes('vlr') ||
+          norm.includes('saldo') ||
+          norm.includes('data') ||
+          norm.includes('dt ') ||
+          norm.includes('situacao') ||
+          norm.includes('processo')
+        ) {
+          continue;
+        }
+        if (
+          norm === 'nl' ||
+          norm.includes(' nl') ||
+          norm.startsWith('nl ') ||
+          norm.includes('nota de lancamento') ||
+          norm.includes('nota lancamento') ||
+          norm.includes('liquidacao') ||
+          norm.includes('documento') ||
+          norm === 'doc' ||
+          norm === 'numero' ||
+          norm === 'num'
+        ) {
+          numeroCol = h;
+          break;
+        }
       }
     }
   } else if (stage === 'natureza_despesa') {
@@ -1721,6 +1890,14 @@ export function isSigefPageOrAdministrativeRow(row: any[]): boolean {
 
   // Single cell or small group of cells containing page/system text
   if (nonEmptyCells.length <= 3) {
+    const hasDocOrMoney = nonEmptyCells.some(
+      (c) =>
+        /\b\d{2,4}(?:NL|PP|OB|NE)\d+\b/i.test(c) ||
+        /\d{2}\.\d{3}\.\d{3}/.test(c) ||
+        /R\$\s*\d|\d{1,3}(?:\.\d{3})*,\d{2}/.test(c)
+    );
+    if (hasDocOrMoney) return false;
+
     const combined = nonEmptyCells.join(' ').toLowerCase();
     if (
       combined.startsWith('total da pagina') ||
@@ -1902,6 +2079,118 @@ export async function readSpreadsheetSheets(file: File): Promise<RawSheetResult[
         }
 
         if (workbook && workbook.SheetNames && workbook.SheetNames.length > 0) {
+          const normalizedLowerName = lowerName
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/[^a-z0-9]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+          // STRICT FILTER FOR "OBs - sigef - Principal":
+          // Lê exclusivamente a página "Dados Ajustados" a partir da linha 7 física do Excel (índice 6, 0-indexed),
+          // ignorando completamente títulos/resumos das linhas 1 a 6 e quaisquer outras abas da planilha.
+          const isObsSigefPrincipal =
+            (normalizedLowerName.includes('obs') || normalizedLowerName.includes('ob')) &&
+            normalizedLowerName.includes('sigef') &&
+            normalizedLowerName.includes('principal');
+
+          if (isObsSigefPrincipal) {
+            const targetSheetName = workbook.SheetNames.find((sName) => {
+              const sn = sName.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+              return sn.includes('dados') && sn.includes('ajustad');
+            });
+
+            if (targetSheetName) {
+              const ws = workbook.Sheets[targetSheetName];
+              if (!ws || !ws['!ref']) {
+                throw new Error(`A aba "${targetSheetName}" da planilha "${file.name}" está vazia.`);
+              }
+
+              const ref = XLSX.utils.decode_range(ws['!ref']);
+              const EXCEL_ROW_7_INDEX = 6; // Linha 7 do Excel (1-indexed) = índice 6 (0-indexed)
+
+              if (ref.e.r < EXCEL_ROW_7_INDEX) {
+                throw new Error(
+                  `A aba "${targetSheetName}" da planilha "${file.name}" não possui dados a partir da linha 7.`
+                );
+              }
+
+              const startRowIndex = Math.max(ref.s.r, EXCEL_ROW_7_INDEX);
+              const rowsFromRow7: any[][] = XLSX.utils.sheet_to_json(ws, {
+                header: 1,
+                defval: '',
+                blankrows: false,
+                range: {
+                  s: { r: startRowIndex, c: ref.s.c },
+                  e: ref.e,
+                },
+              });
+
+              const cleanRowsFromRow7 = rowsFromRow7.filter(
+                (row) => Array.isArray(row) && row.some((c) => c !== null && c !== undefined && String(c).trim() !== '')
+              );
+
+              if (cleanRowsFromRow7.length === 0) {
+                throw new Error(
+                  `A aba "${targetSheetName}" da planilha "${file.name}" não contém informações de OBs a partir da linha 7.`
+                );
+              }
+
+              // Se a própria linha 7 já for um registro de OB (ex: 2026OB..., PP ou CNPJ), preserva a linha 7 como dado:
+              // utiliza apenas os nomes das colunas da linha 6 se ela for um cabeçalho válido, ou gera Coluna_1..N.
+              const firstRow = cleanRowsFromRow7[0];
+              const firstRowIsObData = firstRow.some((cell) => {
+                const s = String(cell ?? '').trim();
+                return (
+                  /\b\d{4}OB\d+\b/i.test(s) ||
+                  /\b\d{4}PP\d+\b/i.test(s) ||
+                  /\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}/.test(s)
+                );
+              });
+
+              let finalRawRows = cleanRowsFromRow7;
+              if (firstRowIsObData) {
+                let row6Header: any[] | null = null;
+                if (ref.s.r <= EXCEL_ROW_7_INDEX - 1) {
+                  const row6Arr: any[][] = XLSX.utils.sheet_to_json(ws, {
+                    header: 1,
+                    defval: '',
+                    blankrows: true,
+                    range: {
+                      s: { r: EXCEL_ROW_7_INDEX - 1, c: ref.s.c },
+                      e: { r: EXCEL_ROW_7_INDEX - 1, c: ref.e.c },
+                    },
+                  });
+                  const candidate = row6Arr[0];
+                  if (Array.isArray(candidate) && isSheetHeaderRow(candidate)) {
+                    row6Header = candidate;
+                  }
+                }
+
+                if (row6Header) {
+                  finalRawRows = [row6Header, ...cleanRowsFromRow7];
+                } else {
+                  const maxCols = cleanRowsFromRow7.reduce(
+                    (max, r) => Math.max(max, Array.isArray(r) ? r.length : 0),
+                    0
+                  );
+                  const syntheticHeaders = Array.from({ length: maxCols }, (_, idx) => `Coluna_${idx + 1}`);
+                  finalRawRows = [syntheticHeaders, ...cleanRowsFromRow7];
+                }
+              }
+
+              const cleanMatrix = cleanAndFilterMatrix(finalRawRows);
+              if (cleanMatrix.length > 0) {
+                resolve([{
+                  sheetName: `${file.name} - ${targetSheetName}`,
+                  matrix: cleanMatrix,
+                  stage: 'ordem_bancaria',
+                }]);
+                return;
+              }
+            }
+          }
+
           const sheetItems: { name: string; rows: any[][]; stage: StageKey }[] = [];
 
           for (const sName of workbook.SheetNames) {
@@ -1943,48 +2232,58 @@ export async function readSpreadsheetSheets(file: File): Promise<RawSheetResult[
 
           const hasMultipleKnownStages =
             sheetItems.length > 1 &&
-            new Set(sheetItems.map((s) => s.stage).filter((st) => st !== 'outros')).size > 1;
+            sheetItems.some((s) => s.stage !== 'outros');
 
           if (isProcessamentoDeDados) {
             // STRICT FILTER FOR "Processamento de dados":
-            // The user explicitly stated that this workbook only contains two relevant liquidation pages:
-            // "Obedece - DD/MM" and "Não Obedece - DD/MM".
-            // All other auxiliary or unrequested sheets in this file must be completely ignored.
+            // Keeps only the latest valid liquidation sheets for "Obedece" and "Não Obedece"
             const obedeceCandidates = sheetItems.filter((s) => {
+              if (s.stage === 'obedece') return true;
               const sn = s.name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
               return sn.includes('obedece') && !sn.includes('nao');
             });
 
             const naoObedeceCandidates = sheetItems.filter((s) => {
+              if (s.stage === 'nao_obedece') return true;
               const sn = s.name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
               return sn.includes('nao obedece') || (sn.includes('nao') && sn.includes('obedec'));
             });
 
-            // If there are multiple date versions, pick the most recent one (last in list)
-            const selectedObedece = obedeceCandidates[obedeceCandidates.length - 1];
-            const selectedNaoObedece = naoObedeceCandidates[naoObedeceCandidates.length - 1];
+            const pickLastValidMatrix = (candidates: typeof sheetItems) => {
+              for (let i = candidates.length - 1; i >= 0; i--) {
+                const cleanMatrix = cleanAndFilterMatrix(candidates[i].rows);
+                if (cleanMatrix.length >= 2) {
+                  return { item: candidates[i], matrix: cleanMatrix };
+                }
+              }
+              if (candidates.length > 0) {
+                const last = candidates[candidates.length - 1];
+                const cleanMatrix = cleanAndFilterMatrix(last.rows);
+                if (cleanMatrix.length > 0) {
+                  return { item: last, matrix: cleanMatrix };
+                }
+              }
+              return null;
+            };
+
+            const pickedObedece = pickLastValidMatrix(obedeceCandidates);
+            const pickedNaoObedece = pickLastValidMatrix(naoObedeceCandidates);
 
             const results: RawSheetResult[] = [];
-            if (selectedObedece) {
-              const cleanMatrix = cleanAndFilterMatrix(selectedObedece.rows);
-              if (cleanMatrix.length > 0) {
-                results.push({
-                  sheetName: selectedObedece.name,
-                  matrix: cleanMatrix,
-                  stage: 'obedece',
-                });
-              }
+            if (pickedObedece) {
+              results.push({
+                sheetName: pickedObedece.item.name,
+                matrix: pickedObedece.matrix,
+                stage: 'obedece',
+              });
             }
 
-            if (selectedNaoObedece) {
-              const cleanMatrix = cleanAndFilterMatrix(selectedNaoObedece.rows);
-              if (cleanMatrix.length > 0) {
-                results.push({
-                  sheetName: selectedNaoObedece.name,
-                  matrix: cleanMatrix,
-                  stage: 'nao_obedece',
-                });
-              }
+            if (pickedNaoObedece) {
+              results.push({
+                sheetName: pickedNaoObedece.item.name,
+                matrix: pickedNaoObedece.matrix,
+                stage: 'nao_obedece',
+              });
             }
 
             if (results.length > 0) {
@@ -1993,49 +2292,25 @@ export async function readSpreadsheetSheets(file: File): Promise<RawSheetResult[
             }
           }
 
-          // STRICT FILTER FOR "OBs - sigef - Principal":
-          // The user explicitly stated: "leia a planilha nomeada: 'OBs - sigef - Principal' na pagina 'dados ajustados' outras paginas fora essa nao deve ser analisada"
-          // "leia tambem apenas as informações que sao necessárias para o app para que nao haja soma de valores que nao são necessários"
-          const isObsSigefPrincipal =
-            (lowerName.includes('obs') || lowerName.includes('ob')) &&
-            lowerName.includes('sigef') &&
-            lowerName.includes('principal');
-
-          if (isObsSigefPrincipal) {
-            const dadosAjustadosSheet = sheetItems.find((s) => {
-              const sn = s.name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-              return sn.includes('dados') && sn.includes('ajustad');
-            });
-
-            if (dadosAjustadosSheet) {
-              const cleanMatrix = cleanAndFilterMatrix(dadosAjustadosSheet.rows);
-              if (cleanMatrix.length > 0) {
-                resolve([{
-                  sheetName: `${file.name} - ${dadosAjustadosSheet.name}`,
-                  matrix: cleanMatrix,
-                  stage: 'ordem_bancaria',
-                }]);
-                return;
-              }
-            }
-          }
-
           if (hasDistinctStages || hasMultipleKnownStages) {
             const stageGroups: Record<string, { sheetName: string; rows: any[][]; stage: StageKey }> = {};
 
             sheetItems.forEach((item) => {
               let finalStage = item.stage;
-              const sn = item.name.toLowerCase();
+              const sn = item.name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 
               if (finalStage === 'outros') {
-                if (sn.includes('nao') || sn.includes('não')) {
+                if ((sn.includes('nao') && sn.includes('obedec')) || sn.includes('nao cron')) {
                   finalStage = 'nao_obedece';
-                } else if (sn.includes('obedece')) {
+                } else if (sn.includes('obedece') || sn.includes('cronolog')) {
                   finalStage = 'obedece';
+                } else if (sn.includes('publicac') || sn.includes('publicar') || /\bdoe\b/.test(sn)) {
+                  finalStage = 'publicacao';
                 }
               }
 
-              const groupKey = finalStage !== 'outros' ? `${finalStage}_${item.name}` : item.name;
+              // Se uma planilha nomeada explicitamente (ex: Publicação) tiver abas de capa/resumo sem etapa conhecida e menos de 2 linhas úteis, ignorar ruído
+              const groupKey = `${finalStage}_${item.name}`;
 
               if (!stageGroups[groupKey]) {
                 stageGroups[groupKey] = {
@@ -2060,7 +2335,7 @@ export async function readSpreadsheetSheets(file: File): Promise<RawSheetResult[
             const results: RawSheetResult[] = [];
             for (const g of Object.values(stageGroups)) {
               const cleanMatrix = cleanAndFilterMatrix(g.rows);
-              if (cleanMatrix.length > 0) {
+              if (cleanMatrix.length >= 2) {
                 results.push({
                   sheetName: g.sheetName,
                   matrix: cleanMatrix,
@@ -2286,7 +2561,7 @@ export function parseMatrixToFileData(
     throw new Error(`A planilha "${fileName}" não possui linhas de dados.`);
   }
 
-  // Search for the header row in the first 35 rows
+  // Search for the header row in the first 50 rows
   let bestHeaderRowIndex = -1;
   let bestHeaderScore = -1;
 
@@ -2309,6 +2584,12 @@ export function parseMatrixToFileData(
     'pago',
     'total',
     'bruto',
+    'saldo',
+    'pagamento',
+    'liquidacao',
+    'documento',
+    'doc',
+    'numero',
     'empenho',
     'ne',
     'data',
@@ -2322,70 +2603,85 @@ export function parseMatrixToFileData(
     'status',
     'descricao',
     'fonte',
+    'natureza',
   ];
 
-  for (let r = 0; r < Math.min(matrix.length, 35); r++) {
-    const row = matrix[r];
-    if (!Array.isArray(row)) continue;
-    const cleanCells = row.map((c) => String(c ?? '').trim());
-    const nonEmptyCells = cleanCells.filter((c) => c.length > 0);
+  const hasSyntheticHeaders =
+    Array.isArray(matrix[0]) && String(matrix[0][0] ?? '').trim() === 'Coluna_1';
 
-    if (nonEmptyCells.length < 2) continue;
+  if (hasSyntheticHeaders) {
+    bestHeaderRowIndex = 0;
+  } else {
+    for (let r = 0; r < Math.min(matrix.length, 50); r++) {
+      const row = matrix[r];
+      if (!Array.isArray(row)) continue;
+      const cleanCells = row.map((c) => String(c ?? '').trim());
+      const nonEmptyCells = cleanCells.filter((c) => c.length > 0);
 
-    let score = 0;
-    let hasFavKw = false;
-    let hasValKw = false;
+      if (nonEmptyCells.length < 2) continue;
 
-    cleanCells.forEach((cell) => {
-      const norm = cell
-        .normalize('NFD')
-        .replace(/[\u0300-\u036f]/g, '')
-        .toLowerCase();
-      for (const kw of headerKeywords) {
-        if (norm.includes(kw)) {
-          score += 4;
-          if (
-            kw.includes('favorecido') ||
-            kw.includes('credor') ||
-            kw.includes('fornecedor') ||
-            kw.includes('nome') ||
-            kw.includes('cnpj')
-          ) {
-            hasFavKw = true;
+      const hasDataCodeInRow = cleanCells.some(
+        (c) =>
+          /\b\d{4}(?:OB|PP|NL|NE|OP)\d+\b/i.test(c) ||
+          /\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}/.test(c)
+      );
+      if (hasDataCodeInRow) continue;
+
+      let score = 0;
+      let hasFavKw = false;
+      let hasValKw = false;
+
+      cleanCells.forEach((cell) => {
+        const norm = cell
+          .normalize('NFD')
+          .replace(/[\u0300-\u036f]/g, '')
+          .toLowerCase();
+        for (const kw of headerKeywords) {
+          if (norm.includes(kw)) {
+            score += 4;
+            if (
+              kw.includes('favorecido') ||
+              kw.includes('credor') ||
+              kw.includes('fornecedor') ||
+              kw.includes('nome') ||
+              kw.includes('cnpj')
+            ) {
+              hasFavKw = true;
+            }
+            if (
+              kw.includes('valor') ||
+              kw.includes('vlr') ||
+              kw.includes('liquido') ||
+              kw.includes('pago') ||
+              kw.includes('total')
+            ) {
+              hasValKw = true;
+            }
+            break;
           }
-          if (
-            kw.includes('valor') ||
-            kw.includes('vlr') ||
-            kw.includes('liquido') ||
-            kw.includes('pago') ||
-            kw.includes('total')
-          ) {
-            hasValKw = true;
-          }
+        }
+      });
+
+      score += nonEmptyCells.length;
+      if (hasFavKw && hasValKw) score += 15;
+
+      if (score > bestHeaderScore) {
+        bestHeaderScore = score;
+        bestHeaderRowIndex = r;
+      }
+    }
+
+    // Fallback: if no keyword score was found, pick the first row with >= 2 non-empty cells
+    if (bestHeaderRowIndex === -1 || bestHeaderScore < 4) {
+      for (let r = 0; r < Math.min(matrix.length, 10); r++) {
+        const row = matrix[r];
+        if (Array.isArray(row) && row.filter((c) => String(c ?? '').trim() !== '').length >= 2) {
+          bestHeaderRowIndex = r;
           break;
         }
       }
-    });
-
-    score += nonEmptyCells.length;
-    if (hasFavKw && hasValKw) score += 15;
-
-    if (score > bestHeaderScore) {
-      bestHeaderScore = score;
-      bestHeaderRowIndex = r;
+      if (bestHeaderRowIndex === -1) bestHeaderRowIndex = 0;
     }
-  }
-
-  // Fallback: if no keyword score was found, pick the first row with >= 2 non-empty cells
-  if (bestHeaderRowIndex === -1 || bestHeaderScore < 4) {
-    for (let r = 0; r < Math.min(matrix.length, 10); r++) {
-      const row = matrix[r];
-      if (Array.isArray(row) && row.filter((c) => String(c ?? '').trim() !== '').length >= 2) {
-        bestHeaderRowIndex = r;
-        break;
-      }
-    }
-    if (bestHeaderRowIndex === -1) bestHeaderRowIndex = 0;
   }
 
   const rawHeaderRow = matrix[bestHeaderRowIndex] || [];
@@ -2476,6 +2772,23 @@ export function parseMatrixToFileData(
     throw new Error(`A planilha "${fileName}" não possui registros de dados válidos após o cabeçalho.`);
   }
 
+  let autoStage: StageKey = forcedStage || detectStageFromFileName(fileName);
+  const baselineCols = autoDetectColumns(headers, jsonRows);
+  if (autoStage === 'outros') {
+    const sampleSlice = jsonRows.slice(0, 30);
+    const hasObRows = sampleSlice.some((r) =>
+      Object.values(r).some((v) => /\b\d{4}OB\d+\b/i.test(String(v || '')))
+    );
+    const hasPpRows = sampleSlice.some((r) =>
+      Object.values(r).some((v) => /\b\d{4}PP\d+\b/i.test(String(v || '')))
+    );
+    if (hasObRows && (baselineCols.fonteCol || !hasPpRows)) {
+      autoStage = 'ordem_bancaria';
+    } else if (hasPpRows) {
+      autoStage = 'base_pps';
+    }
+  }
+
   const {
     favorecidoCol,
     valorCol,
@@ -2490,22 +2803,14 @@ export function parseMatrixToFileData(
     processoCol,
     fonteCol,
     naturezaCol,
-  } = autoDetectColumns(headers, jsonRows);
+    dataCol,
+  } = analyzeColumnsForStage(headers, jsonRows, autoStage);
 
-  let autoStage: StageKey = forcedStage || detectStageFromFileName(fileName);
-  if (autoStage === 'outros') {
-    const hasObRows = jsonRows.slice(0, 30).some((r) =>
-      Object.values(r).some((v) => /\b\d{4}OB\d+\b/i.test(String(v || '')))
-    );
-    if (hasObRows || (obCol && fonteCol)) {
-      autoStage = 'ordem_bancaria';
-    }
-  }
-
-  // Filtro estrito de subtotais ocultos do SIGEF (base_pps ou relatórios com colunas de PP/OB/Nota Empenho)
-  const isBasePpsOrHasCols = autoStage === 'base_pps' || !!(ppCol || obCol || notaEmpenhoCol);
+  // Filtro estrito de subtotais ocultos do SIGEF EXCLUSIVAMENTE para Base de PPs / PPs Prontas.
+  // Planilhas funcionais (obedece, nao_obedece, publicacao, natureza_despesa, ordem_bancaria) NÃO exigem PP ou OB preenchidos por linha.
+  const isBasePpsStage = autoStage === 'base_pps' || autoStage === 'pp_prontas';
   let finalRows = jsonRows;
-  if (isBasePpsOrHasCols) {
+  if (isBasePpsStage) {
     finalRows = jsonRows.filter((r) => {
       const rawPp = ppCol ? String(r[ppCol] ?? '').trim() : '';
       const rawNum = numeroCol ? String(r[numeroCol] ?? '').trim() : '';
@@ -2542,6 +2847,7 @@ export function parseMatrixToFileData(
     detectedProcessoCol: processoCol,
     detectedFonteCol: fonteCol,
     detectedNaturezaCol: naturezaCol,
+    detectedDataCol: dataCol,
     stage: autoStage,
     totalCount: finalRows.length,
   };
@@ -2711,11 +3017,9 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
       }
     }
 
-    const isBasePpsOrHasCols =
-      stage === 'base_pps' ||
-      !!(numCol || obCol || neCol);
+    const isBasePpsStage = stage === 'base_pps' || stage === 'pp_prontas';
 
-    file.rows.forEach((row) => {
+    file.rows.forEach((row, rowIdx) => {
       let rawFav = row[favCol];
       let rawFavNE = favNeCol ? row[favNeCol] : undefined;
       const rawNumero = numCol ? String(row[numCol] || '').trim() : '';
@@ -2736,8 +3040,8 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
       });
       if (isLegendOrFooter) return;
 
-      // Regra estrita SIGEF: descarte imediatamente se tanto Número/PP quanto OB estiverem vazios
-      if (isBasePpsOrHasCols) {
+      // Regra estrita SIGEF apenas para Base de PPs / PPs Prontas: descarta subtotais ocultos sem Número/PP e OB
+      if (isBasePpsStage) {
         if (!rawNumero && !rawOB) {
           return;
         }
@@ -2944,19 +3248,29 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
       const valCents = Math.round(val * 100);
 
       let txKey = '';
-      if (numDoc && (/\b\d{4}PP\d+\b/i.test(numDoc) || stage === 'base_pps' || stage === 'pp_prontas')) {
+      if (stage === 'obedece' || stage === 'nao_obedece') {
+        const uniquenessSuffix =
+          !numDoc && !neDoc
+            ? `_${groupKey}_${file.id}_${rowIdx}`
+            : !numDoc
+            ? `_${groupKey}`
+            : '';
+        txKey =
+          `LIQ_${stage}_${numDoc || 'S_N'}` +
+          (neDoc ? `_NE_${neDoc}` : '') +
+          (valCents > 0 ? `_${valCents}` : '') +
+          uniquenessSuffix;
+      } else if (numDoc && (/\b\d{4}PP\d+\b/i.test(numDoc) || stage === 'base_pps' || stage === 'pp_prontas')) {
         // Cada proposta de pagamento é única no SIGEF. Se houver desdobramento por NE, inclui a NE
         txKey = `PP_${numDoc}` + (neDoc ? `_NE_${neDoc}` : '') + (valCents > 0 ? `_${valCents}` : '');
       } else if (obDoc && /\b\d{4}OB\d+\b/i.test(obDoc)) {
         txKey = `OB_${obDoc}` + (valCents > 0 ? `_${valCents}` : '');
-      } else if (stage === 'obedece' || stage === 'nao_obedece') {
-        txKey = `LIQ_${stage}_${numDoc || 'S_N'}` + (neDoc ? `_NE_${neDoc}` : '') + (valCents > 0 ? `_${valCents}` : '');
       } else if (numDoc) {
         txKey = `DOC_${stage}_${numDoc}` + (neDoc ? `_NE_${neDoc}` : '') + (valCents > 0 ? `_${valCents}` : '');
       } else if (neDoc) {
         txKey = `NE_${neDoc}_${digits || cleanDoc(name)}_${valCents}`;
       } else {
-        txKey = `TX_${stage}_${digits || cleanDoc(name)}_${valCents}`;
+        txKey = `TX_${stage}_${digits || cleanDoc(name)}_${valCents}_${file.id}_${rowIdx}`;
       }
 
       const existingTx = transactionMap.get(txKey);

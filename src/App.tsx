@@ -555,6 +555,9 @@ export function App() {
         setMetrics(enriched);
         setLastProcessedAt(new Date());
         setProcessingProgress(92);
+        try {
+          indexAppKnowledge(updated, targetOBs);
+        } catch (_) {}
         triggerAlertAnalysis(updated, targetOBs);
       }
     } catch (error: any) {
@@ -635,6 +638,9 @@ export function App() {
         if (syncDate) {
           setLastProcessedAt(syncDate);
         }
+        try {
+          indexAppKnowledge(reloadedFiles, reloadedOBs || ordensBancariasListRef.current);
+        } catch (_) {}
 
         // Se reloadedMetrics vier da nuvem, aplica DIRETAMENTE sem recalcular
         if (reloadedMetrics && reloadedMetrics.isProcessed) {

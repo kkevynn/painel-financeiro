@@ -1,5 +1,5 @@
 import { FileData, PublicacaoItem, PublicacaoStatus } from '../types';
-import { parseCurrencyValue, parseFavorecidoField, formatBRL } from './excelParser';
+import { parseCurrencyValue, parseFavorecidoField, formatBRL, isTotalizadorRow } from './excelParser';
 import { OrdemBancariaItem } from './ordemBancariaParser';
 import { mlInferenceService } from './machineLearningInferenceService';
 import {
@@ -227,8 +227,22 @@ export function analyzePublicacaoRecords(
   // 0. Build central knowledge directory across all datasets
   indexAppKnowledge(files, ordensBancariasList);
 
-  // 1. Identify files for Publicacao
-  const publicacaoFiles = files.filter((f) => f.stage === 'publicacao');
+  // 1. Identify files for Publicacao (includes explicit stage or 'outros' named Publicação/DOE)
+  const publicacaoFiles = files.filter((f) => {
+    if (f.stage === 'publicacao') return true;
+    const norm = (f.fileName || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase();
+    return (
+      f.stage === 'outros' &&
+      (norm.includes('publicac') ||
+        norm.includes('publicar') ||
+        norm.includes('publicado') ||
+        norm.includes('diario oficial') ||
+        /\bdoe\b/.test(norm))
+    );
+  });
   if (publicacaoFiles.length === 0) return [];
 
   // 2. Identify ALL active NLs currently inside Obedece files
@@ -495,7 +509,20 @@ export function analyzePublicacaoRecords(
 
     const fileDia = extractDiaPublicacao(file.fileName);
 
+    const isExplicitNlHeader = Boolean(
+      numCol &&
+        /nl|liquidac|nota de lancamento|nota lancamento|documento|^doc$/i.test(
+          numCol.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        )
+    );
+
     file.rows.forEach((row, rowIdx) => {
+      const rawFavCell = favCol ? row[favCol] : '';
+      const rawNumCell = numCol ? row[numCol] : '';
+      if (isTotalizadorRow(row, rawFavCell, rawNumCell)) {
+        return;
+      }
+
       // Extract NL document number from publication row (strictly rejecting line numbers)
       let rawDoc = extractRealNlFromRow(row, numCol);
       if (!rawDoc && numCol && row[numCol]) {
@@ -527,7 +554,9 @@ export function analyzePublicacaoRecords(
       }
       if (!rawDoc && numCol && row[numCol]) {
         const fallback = String(row[numCol]).trim();
-        if (!/^linha\s*\d+$/i.test(fallback) && !/^#?\d{1,4}$/.test(fallback)) {
+        const isLinePrefix = /^linha\s*\d+$/i.test(fallback) || /^#\d+$/.test(fallback);
+        const isTinyRowCounter = !isExplicitNlHeader && /^#?\d{1,4}$/.test(fallback);
+        if (!isLinePrefix && !isTinyRowCounter && fallback !== '-' && fallback !== '0') {
           rawDoc = fallback;
         }
       }

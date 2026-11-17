@@ -11,9 +11,10 @@ export function isObFileName(fileName: string): boolean {
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
     .replace(/[^a-z0-9]/g, ' ')
+    .replace(/\s+/g, ' ')
     .trim();
 
-  return (
+  if (
     norm.includes('ordem bancaria') ||
     norm.includes('ordens bancarias') ||
     norm.includes('listar ordem') ||
@@ -23,9 +24,25 @@ export function isObFileName(fileName: string): boolean {
     norm.includes('relatorio de ob') ||
     norm.includes('planilha ob') ||
     norm.includes('planilha de ob') ||
-    ((norm.includes('obs') || norm.includes('ob')) && norm.includes('principal')) ||
-    /\bobs?\b/.test(norm)
-  );
+    ((norm.includes('obs') || norm.includes('ob')) && norm.includes('principal'))
+  ) {
+    return true;
+  }
+
+  // Não classificar planilhas funcionais (Obedece, Não Obedece, Publicação, Natureza) como Ordem Bancária pelo termo genérico "obs"
+  if (
+    norm.includes('obedece') ||
+    norm.includes('cronolog') ||
+    norm.includes('publicac') ||
+    norm.includes('publicar') ||
+    norm.includes('publicado') ||
+    norm.includes('natureza') ||
+    /\bdoe\b/.test(norm)
+  ) {
+    return false;
+  }
+
+  return /\bobs?\b/.test(norm);
 }
 
 /**
@@ -272,7 +289,7 @@ export function extractOrdensBancariasFromFileData(file: FileData): OrdemBancari
     file.detectedObCol ||
     headers.find((k) => {
       const lk = k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-      return lk.includes('ordem') || lk.includes('ob') || lk.includes('documento');
+      return lk === 'ob' || /\bob\b/.test(lk) || lk.includes('ordem') || lk.includes('documento');
     });
 
   const fonteCol =
@@ -418,7 +435,10 @@ export function extractOrdensBancariasFromFileData(file: FileData): OrdemBancari
     const isSingleRowComplete = (rawFav && rawFav.length >= 3) && isValidFonteRecursoCode(rawFonte);
     if (!isSingleRowComplete) {
       const nextRow = idx + 1 < file.rows.length ? file.rows[idx + 1] : null;
-      const nextRowHasOb = nextRow && obCol && isObNumber(nextRow[obCol]);
+      const nextRowHasOb =
+        Boolean(nextRow) &&
+        ((obCol && isObNumber(nextRow![obCol])) ||
+          Object.values(nextRow!).some((v) => /\b\d{4}OB\d+\b/i.test(String(v || ''))));
       if (!nextRowHasOb && nextRow) {
         if (!isValidFonteRecursoCode(rawFonte)) {
           const nFonte = fonteCol ? String(nextRow[fonteCol] || '').trim() : '';
