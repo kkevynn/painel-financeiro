@@ -162,8 +162,10 @@ export function indexAppKnowledge(
   if (!files || files.length === 0) return;
 
   // 1. Index files: Obedece, Não Obedece, Base de PPs, Publicação, Outros
+  // (ordem_bancaria é indexada no passo 2 via ordensBancariasList; natureza_despesa não contém NLs)
   files.forEach((file) => {
     const stage = file.stage || 'outros';
+    if (stage === 'ordem_bancaria' || stage === 'natureza_despesa') return;
     const favCol = file.detectedFavorecidoCol;
     const valCol = file.detectedValorCol;
     const numCol = file.detectedNumeroCol || file.detectedPpCol;
@@ -179,8 +181,10 @@ export function indexAppKnowledge(
 
       // Fallback search across row cells for CNPJ if not mapped
       if (!rawCnpj) {
-        for (const v of Object.values(row)) {
-          const s = String(v || '').trim();
+        for (const k in row) {
+          const v = row[k];
+          if (!v) continue;
+          const s = String(v).trim();
           const cnpjMatch = s.match(/\b\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\b/) || s.match(/\b\d{14}\b/);
           if (cnpjMatch) {
             rawCnpj = cnpjMatch[0];
@@ -223,8 +227,10 @@ export function indexAppKnowledge(
         fonte = String(row[fonteCol]).trim();
       }
       if (!fonte) {
-        for (const v of Object.values(row)) {
-          const s = String(v || '').trim();
+        for (const k in row) {
+          const v = row[k];
+          if (!v) continue;
+          const s = String(v).trim();
           if (/\b0\s*[.,]\s*600\b/i.test(s) || /600/i.test(s)) {
             fonte = '0.600';
             break;

@@ -68,6 +68,10 @@ export function App() {
   const [lastProcessedAt, setLastProcessedAt] = useState<Date | null>(null);
 
   const [session, setSession] = useState<AuthSession | null>(() => getCurrentSession());
+  const sessionRef = useRef<AuthSession | null>(session);
+  useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
 
   const handleLogout = useCallback(() => {
     authService.logout();
@@ -475,122 +479,124 @@ export function App() {
   useEffect(() => {
     filesRef.current = files;
   }, [files]);
-  const activeUploadsCountRef = useRef(0);
+  const queuedUploadsCountRef = useRef(0);
+  const uploadQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const isBatchDriveSyncRef = useRef(false);
 
-  // Trigger alert and ML inference analysis whenever files are uploaded, changed, or processed
+  // Trigger alert and analysis whenever files are uploaded, changed, or processed
   const alertAnalysisTimeoutRef = useRef<any>(null);
   const triggerAlertAnalysis = (currentFiles: FileData[], currentOBs?: OrdemBancariaItem[] | null) => {
     if (alertAnalysisTimeoutRef.current) {
       clearTimeout(alertAnalysisTimeoutRef.current);
     }
     alertAnalysisTimeoutRef.current = setTimeout(() => {
-      const targetOBs = currentOBs !== undefined ? currentOBs : ordensBancariasList;
+      const targetOBs = currentOBs !== undefined ? currentOBs : ordensBancariasListRef.current;
       toastAlertService.analyzeFileTransitions(currentFiles, targetOBs);
       mlInferenceService.processFilesForInference(currentFiles, targetOBs);
     }, 250);
   };
 
-  // Upload file action
-  const handleFileUpload = async (file: File, stage?: StageKey) => {
-    if (session?.role !== 'admin') {
+  // Run final dashboard consolidation, indexing, alert analysis, and cloud sync once per batch
+  const finalizeDataConsolidation = (syncToCloud: boolean = true) => {
+    const finalFiles = filesRef.current;
+    const finalOBs = ordensBancariasListRef.current;
+    const finalMetrics = processUploadedFiles(finalFiles);
+    const finalEnriched = applyEnrichment(finalMetrics, finalOBs);
+    setMetrics(finalEnriched);
+    const now = new Date();
+    setLastProcessedAt(now);
+    try {
+      indexAppKnowledge(finalFiles, finalOBs);
+    } catch (_) {}
+    triggerAlertAnalysis(finalFiles, finalOBs);
+    saveAppState(finalFiles, now);
+    if (syncToCloud && sessionRef.current?.role === 'admin') {
+      cloudSyncService.pushToCloud(finalFiles, finalOBs, ordensBancariasFileNameRef.current, finalEnriched).catch((e) => {
+        console.warn('Auto-save na nuvem pós-upload:', e);
+      });
+    }
+  };
+
+  // Upload file action (serialized sequentially to prevent concurrent SheetJS Out-of-Memory spikes)
+  const handleFileUpload = (file: File, stage?: StageKey): Promise<void> => {
+    if (sessionRef.current?.role !== 'admin') {
       toastAlertService.addToast({
         tipo: 'aviso',
         titulo: 'Acesso Restrito',
         mensagem: 'Apenas Administradores podem importar planilhas.',
       });
-      return;
+      return Promise.resolve();
     }
 
-    activeUploadsCountRef.current++;
+    queuedUploadsCountRef.current++;
     setIsProcessing(true);
-    setProcessingProgress(20);
-    setProcessingMessage(`Lendo e processando "${file.name}"...`);
 
-    try {
-      await new Promise((res) => setTimeout(res, 60));
-      const parsedFiles = await parseWorkbookIntoFileDatas(file, stage);
-      setProcessingProgress(55);
+    const task = async () => {
+      setProcessingProgress(20);
+      setProcessingMessage(`Lendo e processando "${file.name}"...`);
 
-      hasUserChangesRef.current = true;
-
-      // Ensure baseline captures current state before updating/replacing files
-      if (filesRef.current.length > 0) {
-        toastAlertService.ensureBaseline(filesRef.current, ordensBancariasList);
-      }
-
-      let updated = [...filesRef.current];
-      let targetOBs = ordensBancariasList;
-
-      for (const parsedFileData of parsedFiles) {
-        // If a file with the same name already exists, replace it instead of duplicating
-        const existingIdx = updated.findIndex((f) => f.fileName === parsedFileData.fileName);
-        if (existingIdx >= 0) {
-          updated = updated.map((f, i) => (i === existingIdx ? parsedFileData : f));
-        } else {
-          updated = [...updated, parsedFileData];
-        }
-
-        // Extrai ordensBancariasList EXCLUSIVAMENTE de planilhas de Ordem Bancária (jamais de base_pps)
-        if (
-          parsedFileData.stage !== 'base_pps' &&
-          (parsedFileData.stage === 'ordem_bancaria' || isObFileName(parsedFileData.fileName))
-        ) {
-          const extracted = extractOrdensBancariasFromFileData(parsedFileData);
-          if (extracted.length > 0) {
-            targetOBs = extracted;
-            handleUpdateOrdensBancariasList(extracted, parsedFileData.fileName);
-          }
-        }
-      }
-
-      filesRef.current = updated;
-      setFiles(updated);
-
-      if (activeUploadsCountRef.current <= 1) {
-        setProcessingMessage('Consolidando dados...');
-        setProcessingProgress(78);
+      try {
         await new Promise((res) => setTimeout(res, 30));
-        const newMetrics = processUploadedFiles(updated);
-        const enriched = applyEnrichment(newMetrics, targetOBs);
-        setMetrics(enriched);
-        setLastProcessedAt(new Date());
-        setProcessingProgress(92);
-        try {
-          indexAppKnowledge(updated, targetOBs);
-        } catch (_) {}
-        triggerAlertAnalysis(updated, targetOBs);
-      }
-    } catch (error: any) {
-      toastAlertService.addToast({
-        tipo: 'critico',
-        titulo: 'Erro ao carregar arquivo',
-        mensagem: error.message || 'Arquivo corrompido ou formato inválido.',
-      });
-    } finally {
-      activeUploadsCountRef.current = Math.max(0, activeUploadsCountRef.current - 1);
-      if (activeUploadsCountRef.current === 0) {
-        const finalFiles = filesRef.current;
-        const finalOBs = ordensBancariasListRef.current;
-        setTimeout(() => {
-          const finalMetrics = processUploadedFiles(finalFiles);
-          const finalEnriched = applyEnrichment(finalMetrics, finalOBs);
-          setMetrics(finalEnriched);
-          triggerAlertAnalysis(finalFiles, finalOBs);
-          saveAppState(finalFiles, lastProcessedAt);
-          // Auto-save automatically to Cloud Drive (apenas Administrador)
-          if (session?.role === 'admin') {
-            cloudSyncService.pushToCloud(finalFiles, finalOBs, ordensBancariasFileNameRef.current, finalEnriched).catch((e) => {
-              console.warn('Auto-save na nuvem pós-upload:', e);
-            });
+        const parsedFiles = await parseWorkbookIntoFileDatas(file, stage);
+        setProcessingProgress(60);
+
+        hasUserChangesRef.current = true;
+
+        // Ensure baseline captures current state before updating/replacing files
+        if (filesRef.current.length > 0) {
+          toastAlertService.ensureBaseline(filesRef.current, ordensBancariasListRef.current);
+        }
+
+        let updated = [...filesRef.current];
+
+        for (const parsedFileData of parsedFiles) {
+          // If a file with the same name already exists, replace it instead of duplicating
+          const existingIdx = updated.findIndex((f) => f.fileName === parsedFileData.fileName);
+          if (existingIdx >= 0) {
+            updated = updated.map((f, i) => (i === existingIdx ? parsedFileData : f));
+          } else {
+            updated = [...updated, parsedFileData];
           }
+
+          // Extrai ordensBancariasList EXCLUSIVAMENTE de planilhas de Ordem Bancária (jamais de base_pps)
+          if (
+            parsedFileData.stage !== 'base_pps' &&
+            (parsedFileData.stage === 'ordem_bancaria' || isObFileName(parsedFileData.fileName))
+          ) {
+            const extracted = extractOrdensBancariasFromFileData(parsedFileData);
+            if (extracted.length > 0) {
+              handleUpdateOrdensBancariasList(extracted, parsedFileData.fileName);
+            }
+          }
+        }
+
+        filesRef.current = updated;
+        setFiles(updated);
+      } catch (error: any) {
+        toastAlertService.addToast({
+          tipo: 'critico',
+          titulo: 'Erro ao carregar arquivo',
+          mensagem: error?.message || 'Arquivo corrompido ou formato inválido.',
+        });
+      } finally {
+        queuedUploadsCountRef.current = Math.max(0, queuedUploadsCountRef.current - 1);
+        if (queuedUploadsCountRef.current === 0 && !isBatchDriveSyncRef.current) {
+          setProcessingMessage('Consolidando dados...');
+          setProcessingProgress(85);
+          await new Promise((res) => setTimeout(res, 30));
+          finalizeDataConsolidation(true);
           setProcessingProgress(100);
           setTimeout(() => {
             setIsProcessing(false);
             setProcessingProgress(0);
-          }, 350);
-        }, 50);
+          }, 300);
+        }
       }
-    }
+    };
+
+    const queuedPromise = uploadQueueRef.current.then(task, task);
+    uploadQueueRef.current = queuedPromise;
+    return queuedPromise;
   };
 
   // Google Drive Integration: register file delivery callback and subscription
@@ -723,13 +729,22 @@ export function App() {
     setIsProcessing(true);
     setProcessingProgress(20);
     setProcessingMessage('Sincronizando com Google Drive e Nuvem...');
+    isBatchDriveSyncRef.current = true;
     try {
       setProcessingProgress(40);
       const result = await googleDriveService.syncNow(true);
-      
+      await uploadQueueRef.current;
+
+      if (result.hasUpdate) {
+        setProcessingMessage('Consolidando dados sincronizados...');
+        setProcessingProgress(65);
+        await new Promise((res) => setTimeout(res, 30));
+        finalizeDataConsolidation(true);
+      }
+
       // Also sync Firestore cloud state across Tablet & PC
       try {
-        setProcessingProgress(70);
+        setProcessingProgress(75);
         await cloudSyncService.checkAndAutoSync();
       } catch (cloudErr) {
         console.warn('Sincronização em nuvem:', cloudErr);
@@ -756,6 +771,7 @@ export function App() {
         mensagem: err?.message || 'Falha ao buscar planilhas no Google Drive.',
       });
     } finally {
+      isBatchDriveSyncRef.current = false;
       setIsDriveSyncing(false);
       setProcessingProgress(100);
       setTimeout(() => {

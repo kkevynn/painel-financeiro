@@ -867,6 +867,15 @@ class ToastAlertManager {
       });
     }
 
+    const findFonteInObj = (r: Record<string, any>): string => {
+      const vals: any[] = [];
+      for (const k in r) {
+        const v = r[k];
+        if (v !== null && v !== undefined && v !== '') vals.push(v);
+      }
+      return vals.length > 0 ? findFonteRecursoInRow(vals) : '';
+    };
+
     // Pré-indexa Fontes das planilhas stage === 'ordem_bancaria' sem alterar situações oficiais
     files.forEach((file) => {
       if (file.stage !== 'ordem_bancaria') return;
@@ -876,7 +885,7 @@ class ToastAlertManager {
       (file.rows || []).forEach((row) => {
         let rawFonte = fonteCol ? String(row[fonteCol] || '').trim() : '';
         if (!rawFonte || rawFonte === '-' || rawFonte === '0') {
-          rawFonte = findFonteRecursoInRow(Object.values(row));
+          rawFonte = findFonteInObj(row);
         }
         if (!rawFonte || rawFonte === 'OUTRAS') return;
         const obKey = obCol ? cleanDocStr(row[obCol]) : '';
@@ -888,17 +897,20 @@ class ToastAlertManager {
 
     // 2. Extract from Files (ignora ordem_bancaria para nunca sobrescrever situação oficial de Liquidação/Base de PPs)
     files.forEach((file) => {
-      if (file.stage === 'ordem_bancaria') return;
+      if (file.stage === 'ordem_bancaria' || !file.rows || file.rows.length === 0) return;
       const sitCol = file.detectedSituacaoCol;
       const sitObCol = file.detectedSituacaoObCol;
       const numCol = file.detectedNumeroCol || file.detectedPpCol;
-      const fonteCol = file.detectedFonteCol || file.headers?.find((k) => isFonteHeader(k));
+      const headers = (file.headers && file.headers.length > 0)
+        ? file.headers
+        : Object.keys(file.rows[0] || {});
+      const fonteCol = file.detectedFonteCol || headers.find((k) => isFonteHeader(k));
       let valCol = file.detectedValorCol;
       if (valCol && (isFonteHeader(valCol) || valCol === fonteCol)) {
         valCol = '';
       }
-      if (!valCol && file.headers) {
-        valCol = file.headers.find((k) => {
+      if (!valCol) {
+        valCol = headers.find((k) => {
           if (isFonteHeader(k) || k === fonteCol) return false;
           const lk = k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
           return (
@@ -915,6 +927,38 @@ class ToastAlertManager {
       const obCol = file.detectedObCol;
       const neCol = file.detectedNotaEmpenhoCol;
 
+      // Pre-compute fallback keys once per file
+      const sitFallbackCols: string[] = [];
+      const obStatusFallbackCols: string[] = [];
+      const obFallbackCols: string[] = [];
+      const numFallbackCols: string[] = [];
+      const neFallbackCols: string[] = [];
+      const valFallbackCols: string[] = [];
+
+      for (let hIdx = 0; hIdx < headers.length; hIdx++) {
+        const k = headers[hIdx];
+        const lk = k.toLowerCase();
+        const normLk = lk.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+        if (lk.includes('situa') || lk.includes('status') || lk === 'sigla' || lk === 'sit') {
+          sitFallbackCols.push(k);
+        }
+        if (normLk.includes('ob') || normLk.includes('pagamento') || normLk.includes('status') || normLk.includes('situac')) {
+          obStatusFallbackCols.push(k);
+        }
+        if (normLk.includes('ob') || normLk.includes('ordem bancaria')) {
+          obFallbackCols.push(k);
+        }
+        if (lk.includes('documento') || lk.includes('número') || lk.includes('numero') || lk.includes('pp') || lk.includes('processo') || lk.includes('nl')) {
+          numFallbackCols.push(k);
+        }
+        if (lk.includes('empenho') || lk.includes('ne')) {
+          neFallbackCols.push(k);
+        }
+        if (!isFonteHeader(k) && k !== fonteCol && k !== valCol && (normLk.includes('valor') || normLk.includes('liquid') || normLk.includes('pago') || normLk.includes('total'))) {
+          valFallbackCols.push(k);
+        }
+      }
+
       file.rows.forEach((row) => {
         let rawSit = '';
         if (sitObCol && row[sitObCol] !== undefined && row[sitObCol] !== null && String(row[sitObCol]).trim() !== '') {
@@ -923,77 +967,64 @@ class ToastAlertManager {
         if (!rawSit && sitCol && row[sitCol] !== undefined && row[sitCol] !== null) {
           rawSit = String(row[sitCol]).trim().toUpperCase();
         }
-        if (!rawSit) {
-          for (const [k, v] of Object.entries(row)) {
-            const lk = k.toLowerCase();
-            if (lk.includes('situa') || lk.includes('status') || lk === 'sigla' || lk === 'sit') {
-              rawSit = String(v || '').trim().toUpperCase();
+        if (!rawSit && sitFallbackCols.length > 0) {
+          for (let i = 0; i < sitFallbackCols.length; i++) {
+            const v = row[sitFallbackCols[i]];
+            if (v) {
+              rawSit = String(v).trim().toUpperCase();
               if (rawSit) break;
             }
           }
         }
 
-        // Check if any cell in the row explicitly indicates OB status (CONFIRMADA, CB, PPCB, RJ, etc.)
-        if (!rawSit || isSituacaoAOOuVazia(rawSit)) {
-          for (const [k, v] of Object.entries(row)) {
+        // Check if any cell in pre-filtered columns explicitly indicates OB status (CONFIRMADA, CB, PPCB, RJ, etc.)
+        if ((!rawSit || isSituacaoAOOuVazia(rawSit)) && obStatusFallbackCols.length > 0) {
+          for (let i = 0; i < obStatusFallbackCols.length; i++) {
+            const v = row[obStatusFallbackCols[i]];
             if (!v) continue;
-            const lk = k.toLowerCase();
-            if (lk.includes('ob') || lk.includes('pagamento') || lk.includes('status') || lk.includes('situac')) {
-              const vStr = String(v).trim().toUpperCase();
-              if (isSituacaoConfirmadaBanco(vStr).isMatch || isSituacaoRejeitadaBanco(vStr).isMatch) {
-                rawSit = vStr;
-                break;
-              }
+            const vStr = String(v).trim().toUpperCase();
+            if (isSituacaoConfirmadaBanco(vStr).isMatch || isSituacaoRejeitadaBanco(vStr).isMatch) {
+              rawSit = vStr;
+              break;
             }
           }
         }
 
         let rawOB = obCol ? String(row[obCol] || '').trim() : '';
-        if (!isValidOBString(rawOB)) {
-          for (const [k, v] of Object.entries(row)) {
-            const lk = k.toLowerCase();
-            if ((lk.includes('ob') || lk.includes('ordem bancaria') || lk.includes('ordem bancária')) && v) {
-              const valStr = String(v).trim();
-              if (isValidOBString(valStr)) {
-                rawOB = valStr;
-                break;
-              }
+        if (!isValidOBString(rawOB) && obFallbackCols.length > 0) {
+          for (let i = 0; i < obFallbackCols.length; i++) {
+            const v = row[obFallbackCols[i]];
+            if (!v) continue;
+            const valStr = String(v).trim();
+            if (isValidOBString(valStr)) {
+              rawOB = valStr;
+              break;
             }
           }
         }
 
         let rawNum = numCol ? String(row[numCol] || '').trim() : '';
-        if (!rawNum) {
-          for (const [k, v] of Object.entries(row)) {
-            const lk = k.toLowerCase();
-            if (
-              (lk.includes('documento') ||
-                lk.includes('número') ||
-                lk.includes('numero') ||
-                lk.includes('pp') ||
-                lk.includes('processo') ||
-                lk.includes('nl')) &&
-              v
-            ) {
-              const valStr = String(v).trim();
-              if (valStr && valStr !== '-' && valStr !== '0') {
-                rawNum = valStr;
-                break;
-              }
+        if (!rawNum && numFallbackCols.length > 0) {
+          for (let i = 0; i < numFallbackCols.length; i++) {
+            const v = row[numFallbackCols[i]];
+            if (!v) continue;
+            const valStr = String(v).trim();
+            if (valStr && valStr !== '-' && valStr !== '0') {
+              rawNum = valStr;
+              break;
             }
           }
         }
 
         let rawNE = neCol ? String(row[neCol] || '').trim() : '';
-        if (!rawNE) {
-          for (const [k, v] of Object.entries(row)) {
-            const lk = k.toLowerCase();
-            if ((lk.includes('empenho') || lk.includes('ne')) && v) {
-              const valStr = String(v).trim();
-              if (valStr && valStr !== '-' && valStr !== '0') {
-                rawNE = valStr;
-                break;
-              }
+        if (!rawNE && neFallbackCols.length > 0) {
+          for (let i = 0; i < neFallbackCols.length; i++) {
+            const v = row[neFallbackCols[i]];
+            if (!v) continue;
+            const valStr = String(v).trim();
+            if (valStr && valStr !== '-' && valStr !== '0') {
+              rawNE = valStr;
+              break;
             }
           }
         }
@@ -1001,7 +1032,7 @@ class ToastAlertManager {
         // Fonte extraction
         let rawFonte = fonteCol ? String(row[fonteCol] || '').trim() : '';
         if (!rawFonte || rawFonte === '-' || rawFonte === '0') {
-          rawFonte = findFonteRecursoInRow(Object.values(row));
+          rawFonte = findFonteInObj(row);
         }
 
         const isFonte600 = isFonte600OuDerivada(rawFonte);
@@ -1028,17 +1059,15 @@ class ToastAlertManager {
           val = 0;
         }
 
-        // If val is 0, find genuine monetary value from other columns
-        if (val <= 0) {
-          for (const [k, v] of Object.entries(row)) {
-            if (!v || isFonteHeader(k) || k === fonteCol || k === valCol || isFonteString(v)) continue;
-            const lk = k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-            if (lk.includes('valor') || lk.includes('liquid') || lk.includes('pago') || lk.includes('total')) {
-              const pv = parseCurrencyValue(v);
-              if (pv > 0 && pv < 1e11 && !isFonteString(v) && pv !== 600 && pv !== 500 && pv !== 1500 && pv !== 1600 && pv !== 0.6 && pv !== 0.5) {
-                val = pv;
-                break;
-              }
+        // If val is 0, find genuine monetary value from pre-filtered columns
+        if (val <= 0 && valFallbackCols.length > 0) {
+          for (let i = 0; i < valFallbackCols.length; i++) {
+            const v = row[valFallbackCols[i]];
+            if (!v || isFonteString(v)) continue;
+            const pv = parseCurrencyValue(v);
+            if (pv > 0 && pv < 1e11 && pv !== 600 && pv !== 500 && pv !== 1500 && pv !== 1600 && pv !== 0.6 && pv !== 0.5) {
+              val = pv;
+              break;
             }
           }
         }

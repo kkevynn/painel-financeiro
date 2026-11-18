@@ -480,10 +480,16 @@ class MachineLearningInferenceService {
         fileName: string;
       }> = [];
 
-      // Ingest OBs from ordensBancariasList (from Detalhamento de Pagamentos report)
+      // Ingest OBs from ordensBancariasList (strictly 14-digit CNPJ and positive value)
       if (_ordensBancariasList && _ordensBancariasList.length > 0) {
+        const seenObKeys = new Set<string>();
         _ordensBancariasList.forEach((it) => {
+          if (!it || it.valor <= 0) return;
           const cDigits = (it.favorecidoCnpj || '').replace(/\D/g, '');
+          if (cDigits.length === 11 || (cDigits.length > 0 && cDigits.length !== 14)) return;
+          const dedupeKey = `${cDigits}_${it.pp || it.ob || ''}_${it.valor}`;
+          if (seenObKeys.has(dedupeKey)) return;
+          seenObKeys.add(dedupeKey);
           currentPPsList.push({
             ppNumero: it.pp || (it.ob ? `OB ${it.ob}` : 'S/N'),
             obNumero: it.ob || '',
@@ -498,23 +504,30 @@ class MachineLearningInferenceService {
         });
       }
 
-      // Process uploaded files
+      // Process uploaded files (skipping ordem_bancaria / natureza_despesa / publicacao to avoid scanning 50k+ non-audit rows)
       (files || []).forEach((file) => {
         const stage = file.stage || 'outros';
+        if (stage === 'ordem_bancaria' || stage === 'natureza_despesa' || stage === 'publicacao') {
+          return;
+        }
+        const lowerFile = (file.fileName || '').toLowerCase();
+        if (
+          lowerFile.includes('ordem bancaria') ||
+          lowerFile.includes('ordens bancarias') ||
+          lowerFile.includes('listar ordem') ||
+          lowerFile.includes('pagamentos emitidos') ||
+          (lowerFile.includes('sigef') && lowerFile.includes('principal'))
+        ) {
+          return;
+        }
+
         const isLiquidationFile =
           stage === 'obedece' ||
           stage === 'nao_obedece' ||
-          (file.fileName && file.fileName.toLowerCase().includes('liquida')) ||
-          (file.fileName && file.fileName.toLowerCase().includes('obedece'));
+          lowerFile.includes('liquida') ||
+          lowerFile.includes('obedece');
 
-        const isPPFile =
-          stage === 'base_pps' ||
-          stage === 'pp_prontas' ||
-          (!isLiquidationFile &&
-            !file.fileName.toLowerCase().includes('ordem bancaria') &&
-            !file.fileName.toLowerCase().includes('ordens bancarias') &&
-            !file.fileName.toLowerCase().includes('listar ordem') &&
-            !file.fileName.toLowerCase().includes('pagamentos emitidos'));
+        const isPPFile = stage === 'base_pps' || stage === 'pp_prontas' || !isLiquidationFile;
 
         const favCol = file.detectedFavorecidoCol;
         const valCol = file.detectedValorCol;
@@ -524,19 +537,48 @@ class MachineLearningInferenceService {
         const procCol = file.detectedProcessoCol;
         const fonteCol = file.detectedFonteCol;
 
+        const fileHeaders = (file.headers && file.headers.length > 0)
+          ? file.headers
+          : Object.keys(file.rows[0] || {});
+
+        const nlFallbackCols: string[] = [];
+        const ppFallbackCols: string[] = [];
+        for (let hIdx = 0; hIdx < fileHeaders.length; hIdx++) {
+          const h = fileHeaders[hIdx];
+          const lk = h.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+          if (
+            !lk.includes('empenho') &&
+            !lk.includes(' ne ') &&
+            (lk.includes('nl') || lk.includes('liquidacao') || lk.includes('liquidac') || lk === 'documento' || lk === 'doc')
+          ) {
+            nlFallbackCols.push(h);
+          }
+          if (lk.includes('pp') || lk.includes('documento') || lk.includes('numero')) {
+            ppFallbackCols.push(h);
+          }
+        }
+
+        const findFonteInObj = (r: Record<string, any>): string => {
+          const vals: any[] = [];
+          for (const k in r) {
+            const v = r[k];
+            if (v !== null && v !== undefined && v !== '') vals.push(v);
+          }
+          return vals.length > 0 ? findFonteRecursoInRow(vals) : '';
+        };
+
         file.rows.forEach((row) => {
           const rawFav = favCol ? row[favCol] : '';
           const { name, cnpj } = parseFavorecidoField(rawFav);
           const cnpjDigits = (cnpj || '').replace(/\D/g, '');
           const val = valCol ? parseCurrencyValue(row[valCol]) : 0;
-          let rawNum = numCol ? String(row[numCol] || '').trim() : '';
-          let rawOB = obCol ? String(row[obCol] || '').trim() : '';
+          const rawNum = numCol ? String(row[numCol] || '').trim() : '';
+          const rawOB = obCol ? String(row[obCol] || '').trim() : '';
           const rawProc = procCol ? String(row[procCol] || '').trim() : '';
           const rawSit = sitCol ? String(row[sitCol] || '').trim().toUpperCase() : '';
 
           if (val <= 0) return;
 
-          // RULE: "Na análise de auditoria, está me mostrando liquidações de cpf, quero que me mostre apenas de cnpj"
           // Strictly exclude CPFs (11 digits, pessoa física) from audit analysis
           if (cnpjDigits.length === 11 || (cnpjDigits.length > 0 && cnpjDigits.length !== 14)) {
             return;
@@ -547,23 +589,14 @@ class MachineLearningInferenceService {
           if (!docNum && rawNum && isValidNL(rawNum)) {
             docNum = formatCleanNL(rawNum);
           }
-          if (!docNum) {
-            for (const [k, v] of Object.entries(row)) {
+          if (!docNum && nlFallbackCols.length > 0) {
+            for (let cIdx = 0; cIdx < nlFallbackCols.length; cIdx++) {
+              const v = row[nlFallbackCols[cIdx]];
               if (!v) continue;
-              const lk = k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-              if (lk.includes('empenho') || lk.includes(' ne ')) continue;
-              if (
-                lk.includes('nl') ||
-                lk.includes('liquidacao') ||
-                lk.includes('liquidac') ||
-                lk === 'documento' ||
-                lk === 'doc'
-              ) {
-                const s = String(v).trim();
-                if (s && s !== '-' && s !== '0' && isValidNL(s)) {
-                  docNum = formatCleanNL(s);
-                  break;
-                }
+              const s = String(v).trim();
+              if (s && s !== '-' && s !== '0' && isValidNL(s)) {
+                docNum = formatCleanNL(s);
+                break;
               }
             }
           }
@@ -583,7 +616,7 @@ class MachineLearningInferenceService {
             // Extract Fonte de Recursos and check if it is F600 or derivative
             let rawFonte = fonteCol ? String(row[fonteCol] || '').trim() : '';
             if (!rawFonte || rawFonte === '-' || rawFonte === '0') {
-              rawFonte = findFonteRecursoInRow(Object.values(row));
+              rawFonte = findFonteInObj(row);
             }
             const isF600 = isFonte600OuDerivada(rawFonte);
 
@@ -605,21 +638,14 @@ class MachineLearningInferenceService {
           } else if (isPPFile) {
             // It's a PP file ("A Pagar" / Base de PPs)
             let ppNum = rawNum || rawOB;
-            if (!ppNum || ppNum === '-' || ppNum === '0') {
-              for (const [k, v] of Object.entries(row)) {
-                const lk = k.toLowerCase();
-                if (
-                  (lk.includes('pp') ||
-                    lk.includes('documento') ||
-                    lk.includes('numero') ||
-                    lk.includes('número')) &&
-                  v
-                ) {
-                  const s = String(v).trim();
-                  if (s && s !== '-' && s !== '0') {
-                    ppNum = s;
-                    break;
-                  }
+            if ((!ppNum || ppNum === '-' || ppNum === '0') && ppFallbackCols.length > 0) {
+              for (let cIdx = 0; cIdx < ppFallbackCols.length; cIdx++) {
+                const v = row[ppFallbackCols[cIdx]];
+                if (!v) continue;
+                const s = String(v).trim();
+                if (s && s !== '-' && s !== '0') {
+                  ppNum = s;
+                  break;
                 }
               }
             }

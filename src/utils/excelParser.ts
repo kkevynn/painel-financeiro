@@ -2001,249 +2001,310 @@ export async function readSpreadsheetSheets(file: File): Promise<RawSheetResult[
   // Small asynchronous pause to allow the browser to paint the loading spinner
   await new Promise((resolve) => setTimeout(resolve, 30));
 
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
+  let buffer: ArrayBuffer | null = await file.arrayBuffer();
+  if (!buffer || buffer.byteLength === 0) {
+    throw new Error('O arquivo selecionado está completamente vazio (0 bytes).');
+  }
 
-    reader.onload = async (e) => {
+  let uint8: Uint8Array | null = new Uint8Array(buffer);
+  buffer = null; // Allow GC of backing reference wrapper when uint8 is cleared
+
+  // Check if file starts with %PDF magic bytes
+  if (uint8[0] === 0x25 && uint8[1] === 0x50 && uint8[2] === 0x44 && uint8[3] === 0x46) {
+    throw new Error(
+      'O arquivo selecionado é um documento PDF. Por favor, exporte o relatório do sistema financeiro em formato Excel (.xlsx/.xls) ou CSV.'
+    );
+  }
+
+  const isZip = uint8[0] === 0x50 && uint8[1] === 0x4B; // PK (xlsx, ods, xlsm)
+  const isOle = uint8[0] === 0xD0 && uint8[1] === 0xCF && uint8[2] === 0x11 && uint8[3] === 0xE0; // OLE2 (xls binário)
+  const isCsvOrText =
+    lowerName.endsWith('.csv') ||
+    lowerName.endsWith('.tsv') ||
+    lowerName.endsWith('.txt') ||
+    file.type.includes('text/csv') ||
+    file.type.includes('text/plain');
+
+  // Fast path for CSV/TSV/TXT
+  if (isCsvOrText && !isZip && !isOle) {
+    let text = '';
+    try {
+      text = new TextDecoder('utf-8', { fatal: false }).decode(uint8);
+    } catch {
+      text = new TextDecoder('iso-8859-1').decode(uint8);
+    }
+
+    if (text.includes('\uFFFD') || (text.includes('Ã') && !text.includes('ão') && !text.includes('ões'))) {
       try {
-        const buffer = e.target?.result as ArrayBuffer;
-        if (!buffer || buffer.byteLength === 0) {
-          throw new Error('O arquivo selecionado está completamente vazio (0 bytes).');
+        const textLatin1 = new TextDecoder('iso-8859-1').decode(uint8);
+        if (textLatin1 && textLatin1.length > 0) text = textLatin1;
+      } catch {
+        // ignore
+      }
+    }
+    uint8 = null;
+
+    const parsed = parseDelimitedText(text);
+    text = '';
+    if (parsed.length > 0) {
+      const matrix = cleanAndFilterMatrix(fixDelimitedColumnsIfNeeded(parsed));
+      if (matrix.length > 0) {
+        return [{
+          sheetName: file.name,
+          matrix,
+          stage: detectStageFromFileName(file.name),
+        }];
+      }
+    }
+    throw new Error('A planilha inserida não contém linhas ou dados válidos. Verifique se o arquivo possui conteúdo.');
+  }
+
+  const normalizedLowerName = lowerName
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const isObsSigefPrincipal =
+    (normalizedLowerName.includes('obs') || normalizedLowerName.includes('ob')) &&
+    normalizedLowerName.includes('sigef') &&
+    normalizedLowerName.includes('principal');
+
+  const isProcessamentoDeDados =
+    lowerName.includes('processamento') && lowerName.includes('dados');
+
+  const normalizeSheet = (sName: string) =>
+    sName
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .trim();
+
+  // Pass 1 (Metadata only): Discover SheetNames without inflating dense cells for irrelevant tabs
+  let targetSheetsFilter: string[] | undefined;
+  if (isObsSigefPrincipal || isProcessamentoDeDados) {
+    try {
+      const metaWb = XLSX.read(uint8, { type: 'array', bookSheets: true });
+      const allSheetNames = metaWb?.SheetNames || [];
+      if (isObsSigefPrincipal) {
+        const pagina3 =
+          allSheetNames.find((sName) => normalizeSheet(sName).replace(/\s+/g, '') === 'pagina3') ||
+          allSheetNames.find((sName) => /\bpagina\s*3\b/.test(normalizeSheet(sName)));
+        if (pagina3) {
+          targetSheetsFilter = [pagina3];
+        }
+      } else if (isProcessamentoDeDados && allSheetNames.length > 0) {
+        const obedeceNames = allSheetNames.filter((sName) => {
+          const sn = normalizeSheet(sName);
+          return sn.includes('obedece') && !sn.includes('nao');
+        });
+        const naoObedeceNames = allSheetNames.filter((sName) => {
+          const sn = normalizeSheet(sName);
+          return sn.includes('nao obedece') || (sn.includes('nao') && sn.includes('obedec'));
+        });
+        // Keep last 2 candidates of each type so only the latest valid tabs are unzipped into memory
+        const picked = [
+          ...obedeceNames.slice(-2),
+          ...naoObedeceNames.slice(-2),
+        ];
+        if (picked.length > 0) {
+          targetSheetsFilter = Array.from(new Set(picked));
+        }
+      }
+    } catch {
+      targetSheetsFilter = undefined;
+    }
+  }
+
+  // Strategy A: SheetJS read with maximum performance & low-memory flags
+  let workbook: XLSX.WorkBook | null = null;
+  try {
+    workbook = XLSX.read(uint8, {
+      type: 'array',
+      dense: true,
+      cellFormula: false,
+      cellHTML: false,
+      cellStyles: false,
+      cellText: false,
+      raw: true,
+      codepage: 1252,
+      ...(targetSheetsFilter ? { sheets: targetSheetsFilter } : {}),
+    });
+    // If selective sheets filter returned empty sheets (rare legacy BIFF edge case), fallback to full read
+    if (targetSheetsFilter && (!workbook || !workbook.SheetNames || workbook.SheetNames.length === 0)) {
+      workbook = XLSX.read(uint8, {
+        type: 'array',
+        dense: true,
+        cellFormula: false,
+        cellHTML: false,
+        cellStyles: false,
+        cellText: false,
+        raw: true,
+        codepage: 1252,
+      });
+    }
+  } catch {
+    workbook = null;
+  }
+
+  if (workbook && workbook.SheetNames && workbook.SheetNames.length > 0) {
+    // Workbook parsed cleanly via SheetJS; free compressed raw file bytes immediately
+    uint8 = null;
+
+    // STRICT FILTER FOR "OBs - sigef - Principal":
+    // Lê exclusivamente a página "Página3" (ignorando demais abas da planilha).
+    // Se houver cabeçalhos/resumos nas linhas 1 a 6, inicia na linha 7 física do Excel (índice 6);
+    // se a aba já iniciar com dados de OBs antes da linha 7, lê desde o início da aba.
+    if (isObsSigefPrincipal) {
+      const targetSheetName =
+        workbook.SheetNames.find((sName) => normalizeSheet(sName).replace(/\s+/g, '') === 'pagina3') ||
+        workbook.SheetNames.find((sName) => /\bpagina\s*3\b/.test(normalizeSheet(sName)));
+
+      if (targetSheetName) {
+        const ws = workbook.Sheets[targetSheetName];
+        if (!ws || !ws['!ref']) {
+          throw new Error(`A aba "${targetSheetName}" da planilha "${file.name}" está vazia.`);
         }
 
-        const uint8 = new Uint8Array(buffer);
+        const ref = XLSX.utils.decode_range(ws['!ref']);
+        const EXCEL_ROW_7_INDEX = 6; // Linha 7 do Excel (1-indexed) = índice 6 (0-indexed)
 
-        // Check if file starts with %PDF magic bytes
-        if (uint8[0] === 0x25 && uint8[1] === 0x50 && uint8[2] === 0x44 && uint8[3] === 0x46) {
-          throw new Error(
-            'O arquivo selecionado é um documento PDF. Por favor, exporte o relatório do sistema financeiro em formato Excel (.xlsx/.xls) ou CSV.'
+        // Verifica nas linhas iniciais (1 a 5) se a "Página3" já traz registros reais de OB/PP antes da linha 7
+        let hasEarlyObData = ref.e.r < EXCEL_ROW_7_INDEX;
+        if (!hasEarlyObData && ref.s.r < EXCEL_ROW_7_INDEX - 1) {
+          const earlyRows: any[][] = XLSX.utils.sheet_to_json(ws, {
+            header: 1,
+            defval: '',
+            blankrows: false,
+            range: {
+              s: { r: ref.s.r, c: ref.s.c },
+              e: { r: Math.min(ref.e.r, EXCEL_ROW_7_INDEX - 2), c: ref.e.c },
+            },
+          });
+          hasEarlyObData = earlyRows.some(
+            (row) =>
+              Array.isArray(row) &&
+              row.some((cell) => /\b\d{4}(?:OB|PP)\d{3,}\b/i.test(String(cell ?? '').trim()))
           );
         }
 
-        const isZip = uint8[0] === 0x50 && uint8[1] === 0x4B; // PK (xlsx, ods, xlsm)
-        const isOle = uint8[0] === 0xD0 && uint8[1] === 0xCF && uint8[2] === 0x11 && uint8[3] === 0xE0; // OLE2 (xls binário)
-        const isCsvOrText =
-          lowerName.endsWith('.csv') ||
-          lowerName.endsWith('.tsv') ||
-          lowerName.endsWith('.txt') ||
-          file.type.includes('text/csv') ||
-          file.type.includes('text/plain');
+        const startRowIndex = hasEarlyObData ? ref.s.r : Math.max(ref.s.r, EXCEL_ROW_7_INDEX);
+        const rowsFromStart: any[][] = XLSX.utils.sheet_to_json(ws, {
+          header: 1,
+          defval: '',
+          blankrows: false,
+          range: {
+            s: { r: startRowIndex, c: ref.s.c },
+            e: ref.e,
+          },
+        });
 
-        // Fast path for CSV/TSV/TXT
-        if (isCsvOrText && !isZip && !isOle) {
-          let text = '';
-          try {
-            text = new TextDecoder('utf-8', { fatal: false }).decode(uint8);
-          } catch {
-            text = new TextDecoder('iso-8859-1').decode(uint8);
-          }
-
-          if (text.includes('\uFFFD') || (text.includes('Ã') && !text.includes('ão') && !text.includes('ões'))) {
-            try {
-              const textLatin1 = new TextDecoder('iso-8859-1').decode(uint8);
-              if (textLatin1 && textLatin1.length > 0) text = textLatin1;
-            } catch {
-              // ignore
-            }
-          }
-
-          const parsed = parseDelimitedText(text);
-          if (parsed.length > 0) {
-            const matrix = cleanAndFilterMatrix(fixDelimitedColumnsIfNeeded(parsed));
-            if (matrix.length > 0) {
-              resolve([{
-                sheetName: file.name,
-                matrix,
-                stage: detectStageFromFileName(file.name),
-              }]);
-              return;
-            }
-          }
-        }
-
-        // Strategy A: SheetJS read with maximum performance & low-memory flags
-        let workbook: XLSX.WorkBook | null = null;
-        try {
-          workbook = XLSX.read(uint8, {
-            type: 'array',
-            dense: true,
-            cellFormula: false,
-            cellHTML: false,
-            cellStyles: false,
-            cellText: false,
-            raw: true,
-            codepage: 1252,
+        let prevHeaderCandidate: any[] | null = null;
+        if (!hasEarlyObData && ref.s.r <= EXCEL_ROW_7_INDEX - 1) {
+          const row6Arr: any[][] = XLSX.utils.sheet_to_json(ws, {
+            header: 1,
+            defval: '',
+            blankrows: true,
+            range: {
+              s: { r: EXCEL_ROW_7_INDEX - 1, c: ref.s.c },
+              e: { r: EXCEL_ROW_7_INDEX - 1, c: ref.e.c },
+            },
           });
-        } catch {
-          workbook = null;
+          const candidate = row6Arr[0];
+          if (Array.isArray(candidate) && isSheetHeaderRow(candidate)) {
+            prevHeaderCandidate = candidate;
+          }
         }
 
-        if (workbook && workbook.SheetNames && workbook.SheetNames.length > 0) {
-          const normalizedLowerName = lowerName
-            .normalize('NFD')
-            .replace(/[\u0300-\u036f]/g, '')
-            .replace(/[^a-z0-9]/g, ' ')
-            .replace(/\s+/g, ' ')
-            .trim();
+        // Release heavy SheetJS worksheet object immediately
+        delete workbook.Sheets[targetSheetName];
+        workbook = null;
 
-          // STRICT FILTER FOR "OBs - sigef - Principal":
-          // Lê exclusivamente a página "Página3" (ignorando demais abas da planilha).
-          // Se houver cabeçalhos/resumos nas linhas 1 a 6, inicia na linha 7 física do Excel (índice 6);
-          // se a aba já iniciar com dados de OBs antes da linha 7, lê desde o início da aba.
-          const isObsSigefPrincipal =
-            (normalizedLowerName.includes('obs') || normalizedLowerName.includes('ob')) &&
-            normalizedLowerName.includes('sigef') &&
-            normalizedLowerName.includes('principal');
+        const cleanRows = rowsFromStart.filter(
+          (row) => Array.isArray(row) && row.some((c) => c !== null && c !== undefined && String(c).trim() !== '')
+        );
 
-          if (isObsSigefPrincipal) {
-            const normalizeSheet = (sName: string) =>
-              sName
-                .toLowerCase()
-                .normalize('NFD')
-                .replace(/[\u0300-\u036f]/g, '')
-                .trim();
+        if (cleanRows.length === 0) {
+          throw new Error(
+            `A aba "${targetSheetName}" da planilha "${file.name}" não contém informações de OBs.`
+          );
+        }
 
-            const targetSheetName =
-              workbook.SheetNames.find((sName) => normalizeSheet(sName).replace(/\s+/g, '') === 'pagina3') ||
-              workbook.SheetNames.find((sName) => /\bpagina\s*3\b/.test(normalizeSheet(sName)));
+        const firstRow = cleanRows[0];
+        const firstRowIsObData = firstRow.some((cell) => {
+          const s = String(cell ?? '').trim();
+          return (
+            /\b\d{4}OB\d+\b/i.test(s) ||
+            /\b\d{4}PP\d+\b/i.test(s) ||
+            /\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}/.test(s)
+          );
+        });
 
-            if (targetSheetName) {
-              const ws = workbook.Sheets[targetSheetName];
-              if (!ws || !ws['!ref']) {
-                throw new Error(`A aba "${targetSheetName}" da planilha "${file.name}" está vazia.`);
-              }
-
-              const ref = XLSX.utils.decode_range(ws['!ref']);
-              const EXCEL_ROW_7_INDEX = 6; // Linha 7 do Excel (1-indexed) = índice 6 (0-indexed)
-
-              // Verifica nas linhas iniciais (1 a 5) se a "Página3" já traz registros reais de OB/PP antes da linha 7
-              let hasEarlyObData = ref.e.r < EXCEL_ROW_7_INDEX;
-              if (!hasEarlyObData && ref.s.r < EXCEL_ROW_7_INDEX - 1) {
-                const earlyRows: any[][] = XLSX.utils.sheet_to_json(ws, {
-                  header: 1,
-                  defval: '',
-                  blankrows: false,
-                  range: {
-                    s: { r: ref.s.r, c: ref.s.c },
-                    e: { r: Math.min(ref.e.r, EXCEL_ROW_7_INDEX - 2), c: ref.e.c },
-                  },
-                });
-                hasEarlyObData = earlyRows.some(
-                  (row) =>
-                    Array.isArray(row) &&
-                    row.some((cell) => /\b\d{4}(?:OB|PP)\d{3,}\b/i.test(String(cell ?? '').trim()))
-                );
-              }
-
-              const startRowIndex = hasEarlyObData ? ref.s.r : Math.max(ref.s.r, EXCEL_ROW_7_INDEX);
-              const rowsFromStart: any[][] = XLSX.utils.sheet_to_json(ws, {
-                header: 1,
-                defval: '',
-                blankrows: false,
-                range: {
-                  s: { r: startRowIndex, c: ref.s.c },
-                  e: ref.e,
-                },
-              });
-
-              const cleanRows = rowsFromStart.filter(
-                (row) => Array.isArray(row) && row.some((c) => c !== null && c !== undefined && String(c).trim() !== '')
-              );
-
-              if (cleanRows.length === 0) {
-                throw new Error(
-                  `A aba "${targetSheetName}" da planilha "${file.name}" não contém informações de OBs.`
-                );
-              }
-
-              // Se a primeira linha lida já for um registro de OB (ex: 2026OB..., PP ou CNPJ), preserva-a como dado:
-              // utiliza os nomes das colunas da linha 6 (quando lendo a partir da linha 7) se for cabeçalho válido, ou gera Coluna_1..N.
-              const firstRow = cleanRows[0];
-              const firstRowIsObData = firstRow.some((cell) => {
-                const s = String(cell ?? '').trim();
-                return (
-                  /\b\d{4}OB\d+\b/i.test(s) ||
-                  /\b\d{4}PP\d+\b/i.test(s) ||
-                  /\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}/.test(s)
-                );
-              });
-
-              let finalRawRows = cleanRows;
-              if (firstRowIsObData) {
-                let prevHeader: any[] | null = null;
-                if (!hasEarlyObData && ref.s.r <= EXCEL_ROW_7_INDEX - 1) {
-                  const row6Arr: any[][] = XLSX.utils.sheet_to_json(ws, {
-                    header: 1,
-                    defval: '',
-                    blankrows: true,
-                    range: {
-                      s: { r: EXCEL_ROW_7_INDEX - 1, c: ref.s.c },
-                      e: { r: EXCEL_ROW_7_INDEX - 1, c: ref.e.c },
-                    },
-                  });
-                  const candidate = row6Arr[0];
-                  if (Array.isArray(candidate) && isSheetHeaderRow(candidate)) {
-                    prevHeader = candidate;
-                  }
-                }
-
-                if (prevHeader) {
-                  finalRawRows = [prevHeader, ...cleanRows];
-                } else {
-                  const maxCols = cleanRows.reduce(
-                    (max, r) => Math.max(max, Array.isArray(r) ? r.length : 0),
-                    0
-                  );
-                  const syntheticHeaders = Array.from({ length: maxCols }, (_, idx) => `Coluna_${idx + 1}`);
-                  finalRawRows = [syntheticHeaders, ...cleanRows];
-                }
-              }
-
-              const cleanMatrix = cleanAndFilterMatrix(finalRawRows);
-              if (cleanMatrix.length > 0) {
-                resolve([{
-                  sheetName: `${file.name} - ${targetSheetName}`,
-                  matrix: cleanMatrix,
-                  stage: 'ordem_bancaria',
-                }]);
-                return;
-              }
-            }
+        let finalRawRows = cleanRows;
+        if (firstRowIsObData) {
+          if (prevHeaderCandidate) {
+            finalRawRows = [prevHeaderCandidate, ...cleanRows];
+          } else {
+            const maxCols = cleanRows.reduce(
+              (max, r) => Math.max(max, Array.isArray(r) ? r.length : 0),
+              0
+            );
+            const syntheticHeaders = Array.from({ length: maxCols }, (_, idx) => `Coluna_${idx + 1}`);
+            finalRawRows = [syntheticHeaders, ...cleanRows];
           }
+        }
 
-          const sheetItems: { name: string; rows: any[][]; stage: StageKey }[] = [];
+        const cleanMatrix = cleanAndFilterMatrix(finalRawRows);
+        if (cleanMatrix.length > 0) {
+          return [{
+            sheetName: `${file.name} - ${targetSheetName}`,
+            matrix: cleanMatrix,
+            stage: 'ordem_bancaria',
+          }];
+        }
+        throw new Error(`A aba "${targetSheetName}" da planilha "${file.name}" não contém informações válidas de OBs.`);
+      }
+    }
 
-          for (const sName of workbook.SheetNames) {
-            const ws = workbook.Sheets[sName];
-            if (!ws || !ws['!ref']) continue;
-            try {
-              const sheetRows: any[][] = XLSX.utils.sheet_to_json(ws, {
-                header: 1,
-                defval: '',
-                blankrows: false,
-              });
-              if (!sheetRows || sheetRows.length === 0) continue;
+    const sheetItems: { name: string; rows: any[][]; stage: StageKey }[] = [];
+    const sheetNamesCopy = [...workbook.SheetNames];
 
-              const cleanSheetRows = sheetRows.filter(
-                (row) => Array.isArray(row) && row.some((c) => c !== null && c !== undefined && String(c).trim() !== '')
-              );
-              if (cleanSheetRows.length === 0) continue;
+    for (const sName of sheetNamesCopy) {
+      const ws = workbook.Sheets[sName];
+      if (!ws || !ws['!ref']) {
+        delete workbook.Sheets[sName];
+        continue;
+      }
+      try {
+        const sheetRows: any[][] = XLSX.utils.sheet_to_json(ws, {
+          header: 1,
+          defval: '',
+          blankrows: false,
+        });
+        // Release each SheetJS dense worksheet immediately after conversion
+        delete workbook.Sheets[sName];
+        if (!sheetRows || sheetRows.length === 0) continue;
 
-              const detected = detectStageFromFileName(sName);
-              sheetItems.push({
-                name: sName,
-                rows: cleanSheetRows,
-                stage: detected,
-              });
-            } catch {
-              // ignore sheet read error
-            }
-          }
+        const cleanSheetRows = sheetRows.filter(
+          (row) => Array.isArray(row) && row.some((c) => c !== null && c !== undefined && String(c).trim() !== '')
+        );
+        if (cleanSheetRows.length === 0) continue;
 
-          // Check for distinct functional stages across sheets
-          // (e.g. "Processamento de dados" having "Obedece - DD/MM" and "Não Obedece - DD/MM")
-          const isProcessamentoDeDados =
-            lowerName.includes('processamento') && lowerName.includes('dados');
+        const detected = detectStageFromFileName(sName);
+        sheetItems.push({
+          name: sName,
+          rows: cleanSheetRows,
+          stage: detected,
+        });
+      } catch {
+        delete workbook.Sheets[sName];
+      }
+    }
+    workbook = null;
+
+    // Check for distinct functional stages across sheets
+    // (e.g. "Processamento de dados" having "Obedece - DD/MM" and "Não Obedece - DD/MM")
 
           const hasDistinctStages =
             sheetItems.length > 1 &&
@@ -2306,182 +2367,176 @@ export async function readSpreadsheetSheets(file: File): Promise<RawSheetResult[
               });
             }
 
-            if (results.length > 0) {
-              resolve(results);
-              return;
-            }
-          }
-
-          if (hasDistinctStages || hasMultipleKnownStages) {
-            const stageGroups: Record<string, { sheetName: string; rows: any[][]; stage: StageKey }> = {};
-
-            sheetItems.forEach((item) => {
-              let finalStage = item.stage;
-              const sn = item.name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-
-              if (finalStage === 'outros') {
-                if ((sn.includes('nao') && sn.includes('obedec')) || sn.includes('nao cron')) {
-                  finalStage = 'nao_obedece';
-                } else if (sn.includes('obedece') || sn.includes('cronolog')) {
-                  finalStage = 'obedece';
-                } else if (sn.includes('publicac') || sn.includes('publicar') || /\bdoe\b/.test(sn)) {
-                  finalStage = 'publicacao';
-                }
-              }
-
-              // Se uma planilha nomeada explicitamente (ex: Publicação) tiver abas de capa/resumo sem etapa conhecida e menos de 2 linhas úteis, ignorar ruído
-              const groupKey = `${finalStage}_${item.name}`;
-
-              if (!stageGroups[groupKey]) {
-                stageGroups[groupKey] = {
-                  sheetName: item.name,
-                  rows: [...item.rows],
-                  stage: finalStage,
-                };
-              } else {
-                const existing = stageGroups[groupKey];
-                let headerRowIdx = -1;
-                for (let r = 0; r < Math.min(item.rows.length, 5); r++) {
-                  if (isSheetHeaderRow(item.rows[r])) {
-                    headerRowIdx = r;
-                    break;
-                  }
-                }
-                const rowsToAdd = headerRowIdx >= 0 ? item.rows.slice(headerRowIdx + 1) : item.rows;
-                existing.rows.push(...rowsToAdd);
-              }
-            });
-
-            const results: RawSheetResult[] = [];
-            for (const g of Object.values(stageGroups)) {
-              const cleanMatrix = cleanAndFilterMatrix(g.rows);
-              if (cleanMatrix.length >= 2) {
-                results.push({
-                  sheetName: g.sheetName,
-                  matrix: cleanMatrix,
-                  stage: g.stage,
-                });
-              }
-            }
-
-            if (results.length > 0) {
-              resolve(results);
-              return;
-            }
-          }
-
-          // Default fallback: combine pages as continuation rows of the same single report
-          // (ex: Sheet1, Sheet2, Sheet3 no relatório .xls do SIGEF onde apenas a primeira aba tem cabeçalho)
-          const combinedRows: any[][] = [];
-          for (const item of sheetItems) {
-            if (combinedRows.length === 0) {
-              combinedRows.push(...item.rows);
-            } else {
-              // Verifica se a aba de continuação repete o cabeçalho
-              let headerRowIdx = -1;
-              for (let r = 0; r < Math.min(item.rows.length, 5); r++) {
-                if (isSheetHeaderRow(item.rows[r])) {
-                  headerRowIdx = r;
-                  break;
-                }
-              }
-
-              // Se a aba de continuação não possui cabeçalho (caso do Sheet2/Sheet3 do SIGEF),
-              // inclui todas as linhas a partir do índice 0 sem perder nenhum registro de dados
-              const rowsToAdd = headerRowIdx >= 0
-                ? item.rows.slice(headerRowIdx + 1)
-                : item.rows;
-              combinedRows.push(...rowsToAdd);
-            }
-          }
-
-          if (combinedRows.length > 0) {
-            const cleanMatrix = cleanAndFilterMatrix(combinedRows);
-            if (cleanMatrix.length > 0) {
-              resolve([{
-                sheetName: file.name,
-                matrix: cleanMatrix,
-                stage: detectStageFromFileName(file.name),
-              }]);
-              return;
-            }
-          }
-        }
-
-        // Strategy B: For non-binary files (HTML tables or XML disguised as .xls)
-        let text = '';
-        try {
-          text = new TextDecoder('utf-8', { fatal: false }).decode(uint8);
-        } catch {
-          text = new TextDecoder('iso-8859-1').decode(uint8);
-        }
-
-        if (text.includes('\uFFFD') || (text.includes('Ã') && !text.includes('ão') && !text.includes('ões'))) {
-          try {
-            const textLatin1 = new TextDecoder('iso-8859-1').decode(uint8);
-            if (textLatin1 && textLatin1.length > 0) text = textLatin1;
-          } catch {
-            // ignore
-          }
-        }
-
-        const lowerText = text.toLowerCase();
-        let htmlOrXmlMatrix: any[][] = [];
-
-        if (lowerText.includes('<table') || lowerText.includes('<tr')) {
-          htmlOrXmlMatrix = parseHtmlTableFast(text);
-        }
-
-        if (htmlOrXmlMatrix.length === 0 && (lowerText.includes('<?xml') || lowerText.includes('<workbook'))) {
-          try {
-            const parser = new DOMParser();
-            const doc = parser.parseFromString(text, 'application/xml');
-            const rows = doc.querySelectorAll('Row');
-            if (rows.length > 0) {
-              const xmlMatrix: any[][] = [];
-              rows.forEach((r) => {
-                const rowData: any[] = [];
-                r.querySelectorAll('Cell').forEach((c) => {
-                  const dataElem = c.querySelector('Data');
-                  rowData.push((dataElem ? dataElem.textContent : c.textContent) || '');
-                });
-                if (rowData.some((cell) => cell.trim() !== '')) {
-                  xmlMatrix.push(rowData);
-                }
-              });
-              if (xmlMatrix.length > 0) htmlOrXmlMatrix = xmlMatrix;
-            }
-          } catch (errXml) {
-            console.warn('Falha ao processar XML Spreadsheet:', errXml);
-          }
-        }
-
-        if (htmlOrXmlMatrix.length === 0 && text.trim().length > 0) {
-          htmlOrXmlMatrix = parseDelimitedText(text);
-        }
-
-        if (htmlOrXmlMatrix.length > 0) {
-          const cleanMatrix = cleanAndFilterMatrix(fixDelimitedColumnsIfNeeded(htmlOrXmlMatrix));
-          if (cleanMatrix.length > 0) {
-            resolve([{
-              sheetName: file.name,
-              matrix: cleanMatrix,
-              stage: detectStageFromFileName(file.name),
-            }]);
-            return;
-          }
-        }
-
-        throw new Error('A planilha inserida não contém linhas ou dados válidos. Verifique se o arquivo possui conteúdo.');
-      } catch (err: any) {
-        reject(err);
+      if (results.length > 0) {
+        return results;
       }
-    };
+    }
 
-    reader.onerror = () =>
-      reject(new Error('Erro de I/O ao ler o arquivo selecionado no disco. Verifique as permissões.'));
-    reader.readAsArrayBuffer(file);
-  });
+    if (hasDistinctStages || hasMultipleKnownStages) {
+      const stageGroups: Record<string, { sheetName: string; rows: any[][]; stage: StageKey }> = {};
+
+      sheetItems.forEach((item) => {
+        let finalStage = item.stage;
+        const sn = item.name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+        if (finalStage === 'outros') {
+          if ((sn.includes('nao') && sn.includes('obedec')) || sn.includes('nao cron')) {
+            finalStage = 'nao_obedece';
+          } else if (sn.includes('obedece') || sn.includes('cronolog')) {
+            finalStage = 'obedece';
+          } else if (sn.includes('publicac') || sn.includes('publicar') || /\bdoe\b/.test(sn)) {
+            finalStage = 'publicacao';
+          }
+        }
+
+        // Se uma planilha nomeada explicitamente (ex: Publicação) tiver abas de capa/resumo sem etapa conhecida e menos de 2 linhas úteis, ignorar ruído
+        const groupKey = `${finalStage}_${item.name}`;
+
+        if (!stageGroups[groupKey]) {
+          stageGroups[groupKey] = {
+            sheetName: item.name,
+            rows: [...item.rows],
+            stage: finalStage,
+          };
+        } else {
+          const existing = stageGroups[groupKey];
+          let headerRowIdx = -1;
+          for (let r = 0; r < Math.min(item.rows.length, 5); r++) {
+            if (isSheetHeaderRow(item.rows[r])) {
+              headerRowIdx = r;
+              break;
+            }
+          }
+          const rowsToAdd = headerRowIdx >= 0 ? item.rows.slice(headerRowIdx + 1) : item.rows;
+          existing.rows.push(...rowsToAdd);
+        }
+        item.rows = [];
+      });
+
+      const results: RawSheetResult[] = [];
+      for (const g of Object.values(stageGroups)) {
+        const cleanMatrix = cleanAndFilterMatrix(g.rows);
+        g.rows = [];
+        if (cleanMatrix.length >= 2) {
+          results.push({
+            sheetName: g.sheetName,
+            matrix: cleanMatrix,
+            stage: g.stage,
+          });
+        }
+      }
+
+      if (results.length > 0) {
+        return results;
+      }
+    }
+
+    // Default fallback: combine pages as continuation rows of the same single report
+    // (ex: Sheet1, Sheet2, Sheet3 no relatório .xls do SIGEF onde apenas a primeira aba tem cabeçalho)
+    const combinedRows: any[][] = [];
+    for (const item of sheetItems) {
+      if (combinedRows.length === 0) {
+        combinedRows.push(...item.rows);
+      } else {
+        // Verifica se a aba de continuação repete o cabeçalho
+        let headerRowIdx = -1;
+        for (let r = 0; r < Math.min(item.rows.length, 5); r++) {
+          if (isSheetHeaderRow(item.rows[r])) {
+            headerRowIdx = r;
+            break;
+          }
+        }
+
+        // Se a aba de continuação não possui cabeçalho (caso do Sheet2/Sheet3 do SIGEF),
+        // inclui todas as linhas a partir do índice 0 sem perder nenhum registro de dados
+        const rowsToAdd = headerRowIdx >= 0
+          ? item.rows.slice(headerRowIdx + 1)
+          : item.rows;
+        combinedRows.push(...rowsToAdd);
+      }
+      item.rows = [];
+    }
+
+    if (combinedRows.length > 0) {
+      const cleanMatrix = cleanAndFilterMatrix(combinedRows);
+      if (cleanMatrix.length > 0) {
+        return [{
+          sheetName: file.name,
+          matrix: cleanMatrix,
+          stage: detectStageFromFileName(file.name),
+        }];
+      }
+    }
+  }
+
+  // Strategy B: For non-binary files (HTML tables or XML disguised as .xls)
+  let text = '';
+  if (uint8) {
+    try {
+      text = new TextDecoder('utf-8', { fatal: false }).decode(uint8);
+    } catch {
+      text = new TextDecoder('iso-8859-1').decode(uint8);
+    }
+
+    if (text.includes('\uFFFD') || (text.includes('Ã') && !text.includes('ão') && !text.includes('ões'))) {
+      try {
+        const textLatin1 = new TextDecoder('iso-8859-1').decode(uint8);
+        if (textLatin1 && textLatin1.length > 0) text = textLatin1;
+      } catch {
+        // ignore
+      }
+    }
+    uint8 = null;
+  }
+
+  const lowerText = text.toLowerCase();
+  let htmlOrXmlMatrix: any[][] = [];
+
+  if (lowerText.includes('<table') || lowerText.includes('<tr')) {
+    htmlOrXmlMatrix = parseHtmlTableFast(text);
+  }
+
+  if (htmlOrXmlMatrix.length === 0 && (lowerText.includes('<?xml') || lowerText.includes('<workbook'))) {
+    try {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(text, 'application/xml');
+      const rows = doc.querySelectorAll('Row');
+      if (rows.length > 0) {
+        const xmlMatrix: any[][] = [];
+        rows.forEach((r) => {
+          const rowData: any[] = [];
+          r.querySelectorAll('Cell').forEach((c) => {
+            const dataElem = c.querySelector('Data');
+            rowData.push((dataElem ? dataElem.textContent : c.textContent) || '');
+          });
+          if (rowData.some((cell) => cell.trim() !== '')) {
+            xmlMatrix.push(rowData);
+          }
+        });
+        if (xmlMatrix.length > 0) htmlOrXmlMatrix = xmlMatrix;
+      }
+    } catch (errXml) {
+      console.warn('Falha ao processar XML Spreadsheet:', errXml);
+    }
+  }
+
+  if (htmlOrXmlMatrix.length === 0 && text.trim().length > 0) {
+    htmlOrXmlMatrix = parseDelimitedText(text);
+  }
+  text = '';
+
+  if (htmlOrXmlMatrix.length > 0) {
+    const cleanMatrix = cleanAndFilterMatrix(fixDelimitedColumnsIfNeeded(htmlOrXmlMatrix));
+    if (cleanMatrix.length > 0) {
+      return [{
+        sheetName: file.name,
+        matrix: cleanMatrix,
+        stage: detectStageFromFileName(file.name),
+      }];
+    }
+  }
+
+  throw new Error('A planilha inserida não contém linhas ou dados válidos. Verifique se o arquivo possui conteúdo.');
 }
 
 // Universal, high-performance spreadsheet and matrix reader (optimized for large files)
@@ -2742,28 +2797,39 @@ export function parseMatrixToFileData(
 
     const rowObj: Record<string, any> = {};
     let hasAnyData = false;
-    headers.forEach((h, colIdx) => {
-      const val = row[colIdx] ?? '';
-      rowObj[h] = val;
-      if (val !== null && val !== undefined && String(val).trim() !== '') {
-        hasAnyData = true;
+    for (let colIdx = 0; colIdx < headers.length; colIdx++) {
+      const val = row[colIdx];
+      if (val !== null && val !== undefined && val !== '') {
+        rowObj[headers[colIdx]] = val;
+        if (typeof val !== 'string' || val.trim() !== '') {
+          hasAnyData = true;
+        }
       }
-    });
+    }
 
-    const isTotalOrSummaryRow =
-      isSigefPageOrAdministrativeRow(row) ||
-      row.some((cell) => {
-        if (cell === null || cell === undefined) return false;
-        const s = String(cell)
-          .normalize('NFD')
-          .replace(/[\u0300-\u036f]/g, '')
-          .trim()
-          .toLowerCase();
-        return (
-          s.startsWith('c - cancelada; ap - a pagar') ||
+    if (!hasAnyData) continue;
+
+    let isSummaryCell = false;
+    for (let colIdx = 0; colIdx < row.length; colIdx++) {
+      const cell = row[colIdx];
+      if (cell === null || cell === undefined || cell === '') continue;
+      if (typeof cell !== 'string') continue;
+      const trimmed = cell.trim();
+      if (!trimmed) continue;
+      const c0 = trimmed.charCodeAt(0);
+      // Fast filter: summary prefixes only begin with C/c, R/r, T/t, S/s, D/d, Q/q
+      if (
+        c0 === 67 || c0 === 99 || // C / c
+        c0 === 82 || c0 === 114 || // R / r
+        c0 === 84 || c0 === 116 || // T / t
+        c0 === 83 || c0 === 115 || // S / s
+        c0 === 68 || c0 === 100 || // D / d
+        c0 === 81 || c0 === 113    // Q / q
+      ) {
+        const s = trimmed.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+        if (
           s.startsWith('c - cancelada') ||
           s.startsWith('relatorio emitido em') ||
-          s.startsWith('relatório emitido em') ||
           s === 'total' ||
           s === 'subtotal' ||
           s === 'total geral' ||
@@ -2780,10 +2846,14 @@ export function parseMatrixToFileData(
           s.startsWith('dotacao orcamentaria') ||
           s.startsWith('dotacao atualizada') ||
           s.startsWith('quantidade de')
-        );
-      });
+        ) {
+          isSummaryCell = true;
+          break;
+        }
+      }
+    }
 
-    if (hasAnyData && !isTotalOrSummaryRow) {
+    if (!isSummaryCell && !isSigefPageOrAdministrativeRow(row)) {
       jsonRows.push(rowObj);
     }
   }
@@ -2849,6 +2919,17 @@ export function parseMatrixToFileData(
     });
   }
 
+  // Ensure row 0 preserves all header keys so Object.keys(file.rows[0]) callers work identically while subsequent rows omit empty keys
+  if (finalRows.length > 0) {
+    const first = finalRows[0];
+    for (let hIdx = 0; hIdx < headers.length; hIdx++) {
+      const h = headers[hIdx];
+      if (!(h in first)) {
+        first[h] = '';
+      }
+    }
+  }
+
   return {
     id: `file_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     fileName,
@@ -2905,6 +2986,9 @@ export async function parseWorkbookIntoFileDatas(
       parsedFiles.push(fileData);
     } catch (err: any) {
       console.warn(`Aviso ao processar aba "${s.sheetName}" de "${file.name}":`, err?.message || err);
+    } finally {
+      // Free raw matrix memory immediately after converting this tab
+      s.matrix = [];
     }
   }
 
@@ -3048,16 +3132,21 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
       const val = parseCurrencyValue(row[valCol]);
 
       // Descartar linhas de rodapé/legenda do SIGEF (C - Cancelada; AP - A pagar / Relatório Emitido em)
-      const isLegendOrFooter = Object.values(row).some((cell) => {
-        if (cell === null || cell === undefined) return false;
-        const s = String(cell).normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toLowerCase();
-        return (
-          s.startsWith('c - cancelada; ap - a pagar') ||
-          s.startsWith('c - cancelada') ||
-          s.startsWith('relatorio emitido em') ||
-          s.startsWith('relatório emitido em')
-        );
-      });
+      let isLegendOrFooter = false;
+      for (const k in row) {
+        const cell = row[k];
+        if (typeof cell !== 'string' || !cell) continue;
+        const trimmed = cell.trim();
+        if (!trimmed) continue;
+        const c0 = trimmed.charCodeAt(0);
+        if (c0 === 67 || c0 === 99 || c0 === 82 || c0 === 114) {
+          const s = trimmed.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+          if (s.startsWith('c - cancelada') || s.startsWith('relatorio emitido em')) {
+            isLegendOrFooter = true;
+            break;
+          }
+        }
+      }
       if (isLegendOrFooter) return;
 
       // Regra estrita SIGEF apenas para Base de PPs / PPs Prontas: descarta subtotais ocultos sem Número/PP e OB

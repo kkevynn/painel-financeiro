@@ -284,13 +284,18 @@ export function extractOrdensBancariasFromFileData(file: FileData): OrdemBancari
   const items: OrdemBancariaItem[] = [];
   const isFonteOnlyOb = file.stage === 'ordem_bancaria' || isObFileName(file.fileName || '');
 
-  const headers = Object.keys(file.rows[0] || {});
+  const headers = (file.headers && file.headers.length > 0)
+    ? file.headers
+    : Object.keys(file.rows[0] || {});
+
+  const normalizedHeaders = headers.map((k) => ({
+    key: k,
+    lk: k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''),
+  }));
+
   const obCol =
     file.detectedObCol ||
-    headers.find((k) => {
-      const lk = k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-      return lk === 'ob' || /\bob\b/.test(lk) || lk.includes('ordem') || lk.includes('documento');
-    });
+    normalizedHeaders.find(({ lk }) => lk === 'ob' || /\bob\b/.test(lk) || lk.includes('ordem') || lk.includes('documento'))?.key;
 
   const fonteCol =
     file.detectedFonteCol ||
@@ -298,37 +303,24 @@ export function extractOrdensBancariasFromFileData(file: FileData): OrdemBancari
 
   const valCol =
     (file.detectedValorCol && !isFonteHeader(file.detectedValorCol) && file.detectedValorCol !== fonteCol ? file.detectedValorCol : null) ||
-    headers.find((k) => {
-      if (isFonteHeader(k) || k === fonteCol) return false;
-      const lk = k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    normalizedHeaders.find(({ key, lk }) => {
+      if (isFonteHeader(key) || key === fonteCol) return false;
       return lk.includes('valor') || lk.includes('pago') || lk.includes('vlr');
-    });
+    })?.key;
 
   const favCol =
     file.detectedFavorecidoCol ||
-    headers.find((k) => {
-      const lk = k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-      return lk.includes('favorecido') || lk.includes('credor') || lk.includes('fornecedor');
-    });
+    normalizedHeaders.find(({ lk }) => lk.includes('favorecido') || lk.includes('credor') || lk.includes('fornecedor'))?.key;
   const cnpjCol =
     file.detectedCnpjCol ||
-    headers.find((k) => {
-      const lk = k.toLowerCase();
-      return lk.includes('cnpj') || lk.includes('cpf');
-    });
+    normalizedHeaders.find(({ lk }) => lk.includes('cnpj') || lk.includes('cpf'))?.key;
   const sitCol =
     file.detectedSituacaoCol ||
-    headers.find((k) => {
-      const lk = k.toLowerCase();
-      return lk.includes('situacao') || lk.includes('status');
-    });
+    normalizedHeaders.find(({ lk }) => lk.includes('situacao') || lk.includes('status'))?.key;
   const ppCol =
     file.detectedPpCol ||
     file.detectedNumeroCol ||
-    headers.find((k) => {
-      const lk = k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-      return lk === 'pp' || lk.includes('proposta') || lk.includes('preparacao') || lk.includes('num pp') || lk.includes('no pp') || lk.includes('num. pp');
-    });
+    normalizedHeaders.find(({ lk }) => lk === 'pp' || lk.includes('proposta') || lk.includes('preparacao') || lk.includes('num pp') || lk.includes('no pp') || lk.includes('num. pp'))?.key;
 
   // Prioritize Payment/OB/Confirmation date column over Emission/Proposal date column
   const paymentDateKeywords = [
@@ -337,18 +329,33 @@ export function extractOrdensBancariasFromFileData(file: FileData): OrdemBancari
     'data situacao', 'data da situacao', 'dt situacao', 'data movimento', 'data baixa', 'data efetivacao'
   ];
 
-  const paymentDateCol = headers.find((k) => {
-    const lk = k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
-    return paymentDateKeywords.some((kw) => lk.includes(kw));
-  });
+  const paymentDateCol = normalizedHeaders.find(({ lk }) => {
+    const trimmedLk = lk.trim();
+    return paymentDateKeywords.some((kw) => trimmedLk.includes(kw));
+  })?.key;
 
   const generalDateCol =
     paymentDateCol ||
     file.detectedDataCol ||
-    headers.find((k) => {
-      const lk = k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-      return lk.includes('data') || lk.includes('dt');
-    });
+    normalizedHeaders.find(({ lk }) => lk.includes('data') || lk.includes('dt'))?.key;
+
+  // Pre-compute fallback value and date column lists ONCE before looping over rows
+  const fallbackValCols = normalizedHeaders
+    .filter(({ key, lk }) => !isFonteHeader(key) && key !== fonteCol && key !== valCol && (lk.includes('valor') || lk.includes('pago') || lk.includes('liquid') || lk.includes('total')))
+    .map(({ key }) => key);
+
+  const fallbackDateCols = normalizedHeaders
+    .filter(({ lk }) => lk.includes('data') || lk.includes('dt') || lk.includes('emiss') || lk.includes('pagamento') || lk.includes('ob'))
+    .map(({ key }) => key);
+
+  const findFonteInObj = (row: Record<string, any>): string => {
+    const vals: any[] = [];
+    for (const k in row) {
+      const v = row[k];
+      if (v !== null && v !== undefined && v !== '') vals.push(v);
+    }
+    return vals.length > 0 ? findFonteRecursoInRow(vals) : '';
+  };
 
   for (let idx = 0; idx < file.rows.length; idx++) {
     const row = file.rows[idx];
@@ -374,17 +381,15 @@ export function extractOrdensBancariasFromFileData(file: FileData): OrdemBancari
     }
     let valor = typeof rawVal === 'number' ? rawVal : parseCurrencyValue(rawVal);
     if (valor >= 1e11 || isFonteString(valor) || valor === 600 || valor === 500 || valor === 1500 || valor === 1600 || valor === 0.6 || valor === 0.5) {
-      // Re-scan other columns to find true monetary value if rawVal was a fonte code or empty
+      // Re-scan pre-filtered monetary columns if rawVal was a fonte code or empty
       let realVal = 0;
-      for (const [k, v] of Object.entries(row)) {
-        if (!v || isFonteHeader(k) || k === fonteCol || k === valCol || isFonteString(v)) continue;
-        const lk = k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-        if (lk.includes('valor') || lk.includes('pago') || lk.includes('liquid') || lk.includes('total')) {
-          const pv = parseCurrencyValue(v);
-          if (pv > 0 && pv < 1e11 && !isFonteString(v) && pv !== 600 && pv !== 500 && pv !== 1500 && pv !== 1600 && pv !== 0.6 && pv !== 0.5) {
-            realVal = pv;
-            break;
-          }
+      for (let vcIdx = 0; vcIdx < fallbackValCols.length; vcIdx++) {
+        const v = row[fallbackValCols[vcIdx]];
+        if (!v || isFonteString(v)) continue;
+        const pv = parseCurrencyValue(v);
+        if (pv > 0 && pv < 1e11 && pv !== 600 && pv !== 500 && pv !== 1500 && pv !== 1600 && pv !== 0.6 && pv !== 0.5) {
+          realVal = pv;
+          break;
         }
       }
       valor = realVal;
@@ -394,34 +399,33 @@ export function extractOrdensBancariasFromFileData(file: FileData): OrdemBancari
     // e sua propriedade situacao serve apenas como metadado auxiliar, nunca sobrescrevendo situações oficiais de outras bases.
     const rawSit = sitCol ? String(row[sitCol] || '').trim().toUpperCase() : (isFonteOnlyOb ? '' : 'CB');
 
-    // Prioritize payment date column, then general date column, then find the most recent valid date in row
+    // Prioritize payment date column, then general date column, then pre-computed candidate date columns
     let rawData = paymentDateCol ? row[paymentDateCol] : (generalDateCol ? row[generalDateCol] : '');
     let dateInfo = parseDateToMonthInfo(rawData);
 
-    for (const [k, v] of Object.entries(row)) {
+    for (let dcIdx = 0; dcIdx < fallbackDateCols.length; dcIdx++) {
+      const v = row[fallbackDateCols[dcIdx]];
       if (!v) continue;
-      const lk = k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-      if (lk.includes('data') || lk.includes('dt') || lk.includes('emiss') || lk.includes('pagamento') || lk.includes('ob')) {
-        const cand = parseDateToMonthInfo(v);
-        if (cand.dateIso) {
-          if (!dateInfo.dateIso || cand.dateIso > dateInfo.dateIso) {
-            dateInfo = cand;
-            rawData = v;
-          }
+      const cand = parseDateToMonthInfo(v);
+      if (cand.dateIso) {
+        if (!dateInfo.dateIso || cand.dateIso > dateInfo.dateIso) {
+          dateInfo = cand;
+          rawData = v;
         }
       }
     }
 
     let rawFonte = fonteCol ? String(row[fonteCol] || '').trim() : '';
     if (!isValidFonteRecursoCode(rawFonte)) {
-      const scannedFonte = findFonteRecursoInRow(Object.values(row));
+      const scannedFonte = findFonteInObj(row);
       if (scannedFonte) rawFonte = scannedFonte;
     }
     let rawFav = favCol ? String(row[favCol] || '').trim() : '';
     let finalCnpj = cnpjCol ? String(row[cnpjCol] || '').trim() : '';
     let ppVal = ppCol ? String(row[ppCol] || '').trim() : '';
     if (!ppVal) {
-      for (const cellVal of Object.values(row)) {
+      for (const k in row) {
+        const cellVal = row[k];
         if (cellVal === null || cellVal === undefined) continue;
         const m = String(cellVal).trim().match(/\b\d{4}PP\d+\b/i);
         if (m) {
@@ -435,17 +439,27 @@ export function extractOrdensBancariasFromFileData(file: FileData): OrdemBancari
     const isSingleRowComplete = (rawFav && rawFav.length >= 3) && isValidFonteRecursoCode(rawFonte);
     if (!isSingleRowComplete) {
       const nextRow = idx + 1 < file.rows.length ? file.rows[idx + 1] : null;
-      const nextRowHasOb =
-        Boolean(nextRow) &&
-        ((obCol && isObNumber(nextRow![obCol])) ||
-          Object.values(nextRow!).some((v) => /\b\d{4}OB\d+\b/i.test(String(v || ''))));
+      let nextRowHasOb = false;
+      if (nextRow) {
+        if (obCol && isObNumber(nextRow[obCol])) {
+          nextRowHasOb = true;
+        } else {
+          for (const k in nextRow) {
+            const v = nextRow[k];
+            if (v && /\b\d{4}OB\d+\b/i.test(String(v))) {
+              nextRowHasOb = true;
+              break;
+            }
+          }
+        }
+      }
       if (!nextRowHasOb && nextRow) {
         if (!isValidFonteRecursoCode(rawFonte)) {
           const nFonte = fonteCol ? String(nextRow[fonteCol] || '').trim() : '';
           if (isValidFonteRecursoCode(nFonte)) {
             rawFonte = nFonte;
           } else {
-            const scannedNext = findFonteRecursoInRow(Object.values(nextRow));
+            const scannedNext = findFonteInObj(nextRow);
             if (scannedNext) rawFonte = scannedNext;
           }
         }
@@ -459,7 +473,8 @@ export function extractOrdensBancariasFromFileData(file: FileData): OrdemBancari
           if (ppCol && nextRow[ppCol]) {
             ppVal = String(nextRow[ppCol]).trim();
           } else {
-            for (const cellVal of Object.values(nextRow)) {
+            for (const k in nextRow) {
+              const cellVal = nextRow[k];
               if (cellVal === null || cellVal === undefined) continue;
               const m = String(cellVal).trim().match(/\b\d{4}PP\d+\b/i);
               if (m) {
