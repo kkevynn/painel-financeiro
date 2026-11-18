@@ -2087,18 +2087,25 @@ export async function readSpreadsheetSheets(file: File): Promise<RawSheetResult[
             .trim();
 
           // STRICT FILTER FOR "OBs - sigef - Principal":
-          // Lê exclusivamente a página "Dados Ajustados" a partir da linha 7 física do Excel (índice 6, 0-indexed),
-          // ignorando completamente títulos/resumos das linhas 1 a 6 e quaisquer outras abas da planilha.
+          // Lê exclusivamente a página "Página3" (ignorando demais abas da planilha).
+          // Se houver cabeçalhos/resumos nas linhas 1 a 6, inicia na linha 7 física do Excel (índice 6);
+          // se a aba já iniciar com dados de OBs antes da linha 7, lê desde o início da aba.
           const isObsSigefPrincipal =
             (normalizedLowerName.includes('obs') || normalizedLowerName.includes('ob')) &&
             normalizedLowerName.includes('sigef') &&
             normalizedLowerName.includes('principal');
 
           if (isObsSigefPrincipal) {
-            const targetSheetName = workbook.SheetNames.find((sName) => {
-              const sn = sName.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-              return sn.includes('dados') && sn.includes('ajustad');
-            });
+            const normalizeSheet = (sName: string) =>
+              sName
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .trim();
+
+            const targetSheetName =
+              workbook.SheetNames.find((sName) => normalizeSheet(sName).replace(/\s+/g, '') === 'pagina3') ||
+              workbook.SheetNames.find((sName) => /\bpagina\s*3\b/.test(normalizeSheet(sName)));
 
             if (targetSheetName) {
               const ws = workbook.Sheets[targetSheetName];
@@ -2109,14 +2116,27 @@ export async function readSpreadsheetSheets(file: File): Promise<RawSheetResult[
               const ref = XLSX.utils.decode_range(ws['!ref']);
               const EXCEL_ROW_7_INDEX = 6; // Linha 7 do Excel (1-indexed) = índice 6 (0-indexed)
 
-              if (ref.e.r < EXCEL_ROW_7_INDEX) {
-                throw new Error(
-                  `A aba "${targetSheetName}" da planilha "${file.name}" não possui dados a partir da linha 7.`
+              // Verifica nas linhas iniciais (1 a 5) se a "Página3" já traz registros reais de OB/PP antes da linha 7
+              let hasEarlyObData = ref.e.r < EXCEL_ROW_7_INDEX;
+              if (!hasEarlyObData && ref.s.r < EXCEL_ROW_7_INDEX - 1) {
+                const earlyRows: any[][] = XLSX.utils.sheet_to_json(ws, {
+                  header: 1,
+                  defval: '',
+                  blankrows: false,
+                  range: {
+                    s: { r: ref.s.r, c: ref.s.c },
+                    e: { r: Math.min(ref.e.r, EXCEL_ROW_7_INDEX - 2), c: ref.e.c },
+                  },
+                });
+                hasEarlyObData = earlyRows.some(
+                  (row) =>
+                    Array.isArray(row) &&
+                    row.some((cell) => /\b\d{4}(?:OB|PP)\d{3,}\b/i.test(String(cell ?? '').trim()))
                 );
               }
 
-              const startRowIndex = Math.max(ref.s.r, EXCEL_ROW_7_INDEX);
-              const rowsFromRow7: any[][] = XLSX.utils.sheet_to_json(ws, {
+              const startRowIndex = hasEarlyObData ? ref.s.r : Math.max(ref.s.r, EXCEL_ROW_7_INDEX);
+              const rowsFromStart: any[][] = XLSX.utils.sheet_to_json(ws, {
                 header: 1,
                 defval: '',
                 blankrows: false,
@@ -2126,19 +2146,19 @@ export async function readSpreadsheetSheets(file: File): Promise<RawSheetResult[
                 },
               });
 
-              const cleanRowsFromRow7 = rowsFromRow7.filter(
+              const cleanRows = rowsFromStart.filter(
                 (row) => Array.isArray(row) && row.some((c) => c !== null && c !== undefined && String(c).trim() !== '')
               );
 
-              if (cleanRowsFromRow7.length === 0) {
+              if (cleanRows.length === 0) {
                 throw new Error(
-                  `A aba "${targetSheetName}" da planilha "${file.name}" não contém informações de OBs a partir da linha 7.`
+                  `A aba "${targetSheetName}" da planilha "${file.name}" não contém informações de OBs.`
                 );
               }
 
-              // Se a própria linha 7 já for um registro de OB (ex: 2026OB..., PP ou CNPJ), preserva a linha 7 como dado:
-              // utiliza apenas os nomes das colunas da linha 6 se ela for um cabeçalho válido, ou gera Coluna_1..N.
-              const firstRow = cleanRowsFromRow7[0];
+              // Se a primeira linha lida já for um registro de OB (ex: 2026OB..., PP ou CNPJ), preserva-a como dado:
+              // utiliza os nomes das colunas da linha 6 (quando lendo a partir da linha 7) se for cabeçalho válido, ou gera Coluna_1..N.
+              const firstRow = cleanRows[0];
               const firstRowIsObData = firstRow.some((cell) => {
                 const s = String(cell ?? '').trim();
                 return (
@@ -2148,10 +2168,10 @@ export async function readSpreadsheetSheets(file: File): Promise<RawSheetResult[
                 );
               });
 
-              let finalRawRows = cleanRowsFromRow7;
+              let finalRawRows = cleanRows;
               if (firstRowIsObData) {
-                let row6Header: any[] | null = null;
-                if (ref.s.r <= EXCEL_ROW_7_INDEX - 1) {
+                let prevHeader: any[] | null = null;
+                if (!hasEarlyObData && ref.s.r <= EXCEL_ROW_7_INDEX - 1) {
                   const row6Arr: any[][] = XLSX.utils.sheet_to_json(ws, {
                     header: 1,
                     defval: '',
@@ -2163,19 +2183,19 @@ export async function readSpreadsheetSheets(file: File): Promise<RawSheetResult[
                   });
                   const candidate = row6Arr[0];
                   if (Array.isArray(candidate) && isSheetHeaderRow(candidate)) {
-                    row6Header = candidate;
+                    prevHeader = candidate;
                   }
                 }
 
-                if (row6Header) {
-                  finalRawRows = [row6Header, ...cleanRowsFromRow7];
+                if (prevHeader) {
+                  finalRawRows = [prevHeader, ...cleanRows];
                 } else {
-                  const maxCols = cleanRowsFromRow7.reduce(
+                  const maxCols = cleanRows.reduce(
                     (max, r) => Math.max(max, Array.isArray(r) ? r.length : 0),
                     0
                   );
                   const syntheticHeaders = Array.from({ length: maxCols }, (_, idx) => `Coluna_${idx + 1}`);
-                  finalRawRows = [syntheticHeaders, ...cleanRowsFromRow7];
+                  finalRawRows = [syntheticHeaders, ...cleanRows];
                 }
               }
 

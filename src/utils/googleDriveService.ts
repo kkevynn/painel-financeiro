@@ -659,7 +659,7 @@ class GoogleDriveService {
       }
     });
 
-    // C. "OBs - sigef - Principal" (holds "Dados Ajustados" from row 7 for OB consolidation)
+    // C. "OBs - sigef - Principal" (reads "Página3" for OB consolidation)
     const obsPrincipalFile = files.find((f) => {
       const norm = normalize(f.name);
       return (
