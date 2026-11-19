@@ -8,6 +8,7 @@
  */
 
 // Production Client ID configured in Google Cloud Console
+import * as XLSX from 'xlsx';
 import {
   scheduleBackgroundInterval,
   scheduleBackgroundTimeout,
@@ -19,6 +20,7 @@ export const GOOGLE_CLIENT_ID = '866738622063-trtjudvl95g2c3lu0fhga9q79nn4eol6.a
 
 export const DRIVE_DATABASE_FOLDER_NAME = 'Painel_Financeiro_SESAP_Dados';
 const DRIVE_SESSION_STORAGE_KEY = 'sesap_drive_session_v1';
+const DRIVE_FILE_MOD_MAP_KEY = 'sesap_drive_file_mod_map_v1';
 const TOKEN_REFRESH_LEAD_MS = 4 * 60 * 1000; // Renova silenciosamente 4 min antes de expirar
 
 // Scopes supporting spreadsheet reading and dedicated app database folder storage
@@ -102,6 +104,7 @@ class GoogleDriveService {
   private lastPollCheckAt: number = 0;
   private isBackgroundPollRunning: boolean = false;
   private cachedDatabaseFolderId: string | null = null;
+  private fileModifiedMap: Record<string, string> = {};
   private onNewFileCallback: ((file: File, isAuto: boolean) => Promise<void> | void) | null = null;
 
   // 20 minutes polling interval
@@ -120,8 +123,46 @@ class GoogleDriveService {
 
   constructor() {
     this.loadPersistedMetadata();
+    this.loadFileModifiedMap();
     this.restorePersistedSession();
     this.initCrossTabSync();
+  }
+
+  private loadFileModifiedMap() {
+    try {
+      const raw = localStorage.getItem(DRIVE_FILE_MOD_MAP_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') {
+          this.fileModifiedMap = parsed;
+        }
+      }
+    } catch {
+      this.fileModifiedMap = {};
+    }
+  }
+
+  private persistFileModifiedMap() {
+    try {
+      localStorage.setItem(DRIVE_FILE_MOD_MAP_KEY, JSON.stringify(this.fileModifiedMap));
+    } catch {
+      // Ignore localStorage quota errors
+    }
+  }
+
+  private isObsPrincipalName(name: string): boolean {
+    const norm = (name || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return (
+      (norm.includes('obs') || norm.includes('ob')) &&
+      norm.includes('sigef') &&
+      norm.includes('principal')
+    );
   }
 
   private loadPersistedMetadata() {
@@ -866,7 +907,30 @@ class GoogleDriveService {
     url.searchParams.set('includeItemsFromAllDrives', 'true');
     url.searchParams.set('fields', 'files(id, name, mimeType, modifiedTime, size)');
 
-    const res = await this.authorizedFetch(url.toString());
+    // Busca dedicada e direta para "OBs - sigef - Principal" (garante que nunca fique oculta após 100 arquivos recentes)
+    const obsPrincipalQuery =
+      "trashed = false and (" +
+      "mimeType = 'application/vnd.google-apps.spreadsheet' or " +
+      "mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' or " +
+      "mimeType = 'application/vnd.ms-excel' or " +
+      "name contains '.xls' or " +
+      "name contains '.xlsx'" +
+      ") and name contains 'Principal' and (" +
+      "name contains 'OB' or name contains 'ob' or name contains 'SIGEF' or name contains 'sigef'" +
+      ")";
+
+    const obsPrincipalUrl = new URL('https://www.googleapis.com/drive/v3/files');
+    obsPrincipalUrl.searchParams.set('q', obsPrincipalQuery);
+    obsPrincipalUrl.searchParams.set('orderBy', 'modifiedTime desc');
+    obsPrincipalUrl.searchParams.set('pageSize', '20');
+    obsPrincipalUrl.searchParams.set('supportsAllDrives', 'true');
+    obsPrincipalUrl.searchParams.set('includeItemsFromAllDrives', 'true');
+    obsPrincipalUrl.searchParams.set('fields', 'files(id, name, mimeType, modifiedTime, size)');
+
+    const [res, obsPrincipalRes] = await Promise.all([
+      this.authorizedFetch(url.toString()),
+      this.authorizedFetch(obsPrincipalUrl.toString()).catch(() => null),
+    ]);
 
     if (!res.ok) {
       const errJson = await res.json().catch(() => ({}));
@@ -874,7 +938,21 @@ class GoogleDriveService {
     }
 
     const data = await res.json();
-    const files: DriveFileMetadata[] = data.files || [];
+    const generalFiles: DriveFileMetadata[] = data.files || [];
+    let dedicatedObsFiles: DriveFileMetadata[] = [];
+    if (obsPrincipalRes && obsPrincipalRes.ok) {
+      const obsData = await obsPrincipalRes.json().catch(() => ({}));
+      dedicatedObsFiles = Array.isArray(obsData.files) ? obsData.files : [];
+    }
+
+    // Mescla sem duplicar por ID (priorizando a descoberta dedicada de OBs - sigef - Principal)
+    const filesById = new Map<string, DriveFileMetadata>();
+    for (const f of [...dedicatedObsFiles, ...generalFiles]) {
+      if (f?.id && !filesById.has(f.id)) {
+        filesById.set(f.id, f);
+      }
+    }
+    const files: DriveFileMetadata[] = Array.from(filesById.values());
 
     if (files.length === 0) {
       // Secondary fallback query: any spreadsheet in drive
@@ -944,31 +1022,32 @@ class GoogleDriveService {
       }
     });
 
-    // C. "OBs - sigef - Principal" (reads "Página3" for OB consolidation)
-    const obsPrincipalFile = files.find((f) => {
-      const norm = normalize(f.name);
-      return (
-        (norm.includes('obs') || norm.includes('ob')) &&
-        norm.includes('sigef') &&
-        norm.includes('principal')
-      ) && !addedIds.has(f.id);
-    });
+    // C. "OBs - sigef - Principal" (lê exclusivamente a aba "Página3" para consolidação das OBs)
+    const obsPrincipalFile = files.find((f) => this.isObsPrincipalName(f.name) && !addedIds.has(f.id));
     if (obsPrincipalFile && !addedIds.has(obsPrincipalFile.id)) {
       selected.push(obsPrincipalFile);
       addedIds.add(obsPrincipalFile.id);
     }
 
-    // D. SIGEF / OB / PP report (distinct from OBs - sigef - Principal)
+    // D. Base de PPs / SIGEF (quando "OBs - sigef - Principal" já foi encontrada, NÃO puxa outra planilha de OB concorrente)
+    const isSecondaryObFile = (norm: string) =>
+      norm.includes('ordem bancaria') ||
+      norm.includes('ordens bancarias') ||
+      norm.includes('listar ob') ||
+      norm.includes('listar ordem') ||
+      (/\bobs?\b/.test(norm) && !norm.includes('pp') && !norm.includes('proposta'));
+
     const sigefFile = files.find((f) => {
+      if (addedIds.has(f.id)) return false;
       const norm = normalize(f.name);
+      if (obsPrincipalFile && isSecondaryObFile(norm)) return false;
       return (
-        norm.includes('sigef') ||
         norm.includes('relatorio') ||
-        norm.includes('ordem bancaria') ||
-        norm.includes('listar') ||
-        /\bobs?\b/.test(norm) ||
-        /\bpps?\b/.test(norm)
-      ) && !addedIds.has(f.id);
+        norm.includes('proposta') ||
+        /\bpps?\b/.test(norm) ||
+        norm.includes('sigef') ||
+        (!obsPrincipalFile && isSecondaryObFile(norm))
+      );
     });
     if (sigefFile && !addedIds.has(sigefFile.id)) {
       selected.push(sigefFile);
@@ -1002,13 +1081,109 @@ class GoogleDriveService {
   }
 
   /**
+   * Lê EXCLUSIVAMENTE a aba "Página3" da planilha nativa Google Sheets "OBs - sigef - Principal"
+   * diretamente via Google Sheets API v4 (evita limite de 10 MB do export do Drive e ignora demais abas).
+   */
+  private async downloadObsPrincipalPagina3ViaSheetsApi(meta: DriveFileMetadata): Promise<File | null> {
+    try {
+      const metaUrl = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(
+        meta.id
+      )}?fields=sheets.properties(sheetId,title)`;
+      const metaRes = await this.authorizedFetch(metaUrl);
+      if (!metaRes.ok) {
+        console.warn(
+          `[GoogleDriveService] Sheets API metadata retornou ${metaRes.status} para "${meta.name}"; usando fallback Drive export.`
+        );
+        return null;
+      }
+
+      const metaJson = await metaRes.json();
+      const sheetTitles: string[] = Array.isArray(metaJson?.sheets)
+        ? metaJson.sheets
+            .map((s: any) => String(s?.properties?.title || '').trim())
+            .filter(Boolean)
+        : [];
+
+      const normTitle = (t: string) =>
+        t
+          .toLowerCase()
+          .normalize('NFD')
+          .replace(/[\u0300-\u036f]/g, '')
+          .trim();
+
+      const targetTitle =
+        sheetTitles.find((t) => normTitle(t).replace(/\s+/g, '') === 'pagina3') ||
+        sheetTitles.find((t) => /\bpagina\s*3\b/.test(normTitle(t))) ||
+        sheetTitles.find((t) => /\bpag\.?\s*3\b/.test(normTitle(t)));
+
+      if (!targetTitle) {
+        throw new Error(
+          `A aba "Página3" não foi encontrada na planilha "${meta.name}". Abas encontradas: ${sheetTitles.join(', ') || 'nenhuma'}.`
+        );
+      }
+
+      const escapedRange = `'${targetTitle.replace(/'/g, "''")}'`;
+      const valuesUrl = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(
+        meta.id
+      )}/values/${encodeURIComponent(escapedRange)}?valueRenderOption=FORMATTED_VALUE`;
+
+      const valuesRes = await this.authorizedFetch(valuesUrl);
+      if (!valuesRes.ok) {
+        console.warn(
+          `[GoogleDriveService] Sheets API values retornou ${valuesRes.status} para "${targetTitle}"; usando fallback Drive export.`
+        );
+        return null;
+      }
+
+      const valuesJson = await valuesRes.json();
+      const rows: any[][] = Array.isArray(valuesJson?.values) ? valuesJson.values : [];
+      if (rows.length === 0) {
+        throw new Error(`A aba "${targetTitle}" da planilha "${meta.name}" está vazia.`);
+      }
+
+      // Empacota EXCLUSIVAMENTE a aba "Página3" em um workbook .xlsx leve em memória
+      const wb = XLSX.utils.book_new();
+      const ws = XLSX.utils.aoa_to_sheet(rows);
+      XLSX.utils.book_append_sheet(wb, ws, targetTitle);
+      const xlsxArray = XLSX.write(wb, { type: 'array', bookType: 'xlsx' });
+
+      let fileName = meta.name;
+      if (!fileName.toLowerCase().endsWith('.xlsx')) {
+        fileName = `${fileName}.xlsx`;
+      }
+
+      return new File([xlsxArray], fileName, {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        lastModified: new Date(meta.modifiedTime).getTime(),
+      });
+    } catch (err: any) {
+      // Se o erro for especificamente aba Página3 ausente ou vazia, propaga claramente
+      if (err?.message && String(err.message).includes('Página3')) {
+        throw err;
+      }
+      console.warn('[GoogleDriveService] Falha ao ler Página3 via Sheets API v4, usando fallback:', err);
+      return null;
+    }
+  }
+
+  /**
    * Downloads a specific file from Google Drive into memory as a File object.
-   * If it's a native Google Sheet, exports it as an XLSX file.
-   * If it's an existing Excel or CSV file, downloads it via alt=media.
+   * For "OBs - sigef - Principal" Google Sheets, pulls EXCLUSIVELY "Página3" via Sheets API v4.
+   * For other native Google Sheets, exports as XLSX.
+   * For existing Excel or CSV files, downloads via alt=media.
    */
   public async downloadFileAsBrowserFile(meta: DriveFileMetadata): Promise<File> {
-    if (!this.accessToken) {
-      throw new Error('Usuário não autenticado.');
+    await this.ensureValidAccessToken(false);
+
+    // Rota otimizada e exclusiva para "OBs - sigef - Principal" (Google Sheets): lê somente "Página3"
+    if (
+      meta.mimeType === 'application/vnd.google-apps.spreadsheet' &&
+      this.isObsPrincipalName(meta.name)
+    ) {
+      const directPagina3File = await this.downloadObsPrincipalPagina3ViaSheetsApi(meta);
+      if (directPagina3File) {
+        return directPagina3File;
+      }
     }
 
     let downloadUrl: string;
@@ -1111,23 +1286,34 @@ class GoogleDriveService {
 
         let downloadedCount = 0;
         const fileNames: string[] = [];
+        const failedNames: string[] = [];
 
         for (const meta of relevantFiles) {
-          const lastMod = this.state.lastFileModifiedAt
-            ? new Date(this.state.lastFileModifiedAt).getTime()
-            : 0;
-          const shouldDownload = force || new Date(meta.modifiedTime).getTime() > lastMod;
+          const prevModIso = this.fileModifiedMap[meta.id];
+          const prevModMs = prevModIso ? new Date(prevModIso).getTime() : 0;
+          const currentModMs = new Date(meta.modifiedTime).getTime();
+          const shouldDownload = force || !prevModIso || currentModMs > prevModMs;
           if (!shouldDownload) continue;
 
-          // Download file into memory
-          const file = await this.downloadFileAsBrowserFile(meta);
+          try {
+            // Download file into memory
+            const file = await this.downloadFileAsBrowserFile(meta);
 
-          // Deliver to parser callback
-          if (this.onNewFileCallback) {
-            await this.onNewFileCallback(file, false);
-            downloadedCount++;
-            fileNames.push(meta.name);
+            // Deliver to parser callback
+            if (this.onNewFileCallback) {
+              await this.onNewFileCallback(file, false);
+              downloadedCount++;
+              fileNames.push(meta.name);
+              this.fileModifiedMap[meta.id] = meta.modifiedTime;
+            }
+          } catch (fileErr: any) {
+            console.warn(`[GoogleDriveService] Falha ao sincronizar "${meta.name}":`, fileErr);
+            failedNames.push(meta.name);
           }
+        }
+
+        if (downloadedCount > 0) {
+          this.persistFileModifiedMap();
         }
 
         const topFile = relevantFiles[0];
@@ -1135,17 +1321,19 @@ class GoogleDriveService {
         this.setState({
           status: 'connected',
           lastSyncAt: new Date(),
-          lastFileName: fileNames.join(', '),
+          lastFileName: fileNames.join(', ') || this.state.lastFileName,
           lastFileModifiedAt: topFile.modifiedTime,
-          errorMessage: null,
+          errorMessage: failedNames.length > 0 ? `Não foi possível ler: ${failedNames.join(', ')}` : null,
         });
 
         return {
-          success: true,
+          success: downloadedCount > 0 || failedNames.length === 0,
           hasUpdate: downloadedCount > 0,
           fileName: fileNames.join(', '),
           message:
-            downloadedCount === 1
+            downloadedCount === 0 && failedNames.length > 0
+              ? `Falha ao baixar planilhas: ${failedNames.join(', ')}`
+              : downloadedCount === 1
               ? `Planilha "${fileNames[0]}" sincronizada com sucesso!`
               : `Sincronizadas ${downloadedCount} planilhas: ${fileNames.join(', ')}`,
         };
@@ -1179,28 +1367,32 @@ class GoogleDriveService {
         const relevantFiles = await this.fetchRelevantFinancialMetadataList();
         if (relevantFiles.length === 0) return;
 
-        const lastMod = this.state.lastFileModifiedAt
-          ? new Date(this.state.lastFileModifiedAt).getTime()
-          : 0;
-
         let anyUpdated = false;
         const updatedNames: string[] = [];
 
         for (const meta of relevantFiles) {
+          const prevModIso = this.fileModifiedMap[meta.id];
+          const prevModMs = prevModIso ? new Date(prevModIso).getTime() : 0;
           const currentMod = new Date(meta.modifiedTime).getTime();
-          if (currentMod > lastMod) {
-            console.log('[GoogleDriveService] Nova versão detectada no Drive:', meta.name, meta.modifiedTime);
-            const file = await this.downloadFileAsBrowserFile(meta);
+          if (!prevModIso || currentMod > prevModMs) {
+            try {
+              console.log('[GoogleDriveService] Nova versão detectada no Drive:', meta.name, meta.modifiedTime);
+              const file = await this.downloadFileAsBrowserFile(meta);
 
-            if (this.onNewFileCallback) {
-              await this.onNewFileCallback(file, true);
-              anyUpdated = true;
-              updatedNames.push(meta.name);
+              if (this.onNewFileCallback) {
+                await this.onNewFileCallback(file, true);
+                anyUpdated = true;
+                updatedNames.push(meta.name);
+                this.fileModifiedMap[meta.id] = meta.modifiedTime;
+              }
+            } catch (fileErr) {
+              console.warn(`[GoogleDriveService] Erro ao baixar "${meta.name}" em segundo plano:`, fileErr);
             }
           }
         }
 
         if (anyUpdated) {
+          this.persistFileModifiedMap();
           this.setState({
             lastSyncAt: new Date(),
             lastFileName: updatedNames.join(', '),

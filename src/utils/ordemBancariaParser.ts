@@ -294,9 +294,24 @@ export function extractOrdensBancariasFromFileData(file: FileData): OrdemBancari
     lk: k.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''),
   }));
 
-  const obCol =
+  let obCol =
     file.detectedObCol ||
     normalizedHeaders.find(({ lk }) => lk === 'ob' || /\bob\b/.test(lk) || lk.includes('ordem') || lk.includes('documento'))?.key;
+
+  // Fallback por conteúdo real (essencial quando Página3 inicia com dados ou cabeçalhos sintéticos Coluna_1..)
+  if (!obCol) {
+    const sampleLimit = Math.min(file.rows.length, 60);
+    for (const h of headers) {
+      for (let i = 0; i < sampleLimit; i++) {
+        const val = file.rows[i]?.[h];
+        if (val && /\b\d{4}OB\d+\b/i.test(String(val))) {
+          obCol = h;
+          break;
+        }
+      }
+      if (obCol) break;
+    }
+  }
 
   const fonteCol =
     file.detectedFonteCol ||
@@ -360,7 +375,18 @@ export function extractOrdensBancariasFromFileData(file: FileData): OrdemBancari
 
   for (let idx = 0; idx < file.rows.length; idx++) {
     const row = file.rows[idx];
-    const rawOb = obCol ? String(row[obCol] || '').trim() : '';
+    let rawOb = obCol ? String(row[obCol] || '').trim() : '';
+    if (!rawOb) {
+      for (const k in row) {
+        const cellVal = row[k];
+        if (cellVal === null || cellVal === undefined) continue;
+        const m = String(cellVal).trim().match(/\b\d{4}OB\d+\b/i);
+        if (m) {
+          rawOb = m[0].toUpperCase();
+          break;
+        }
+      }
+    }
 
     if (isTotalizadorRow(row, favCol ? row[favCol] : undefined, rawOb)) {
       continue;
@@ -381,7 +407,7 @@ export function extractOrdensBancariasFromFileData(file: FileData): OrdemBancari
       rawVal = 0;
     }
     let valor = typeof rawVal === 'number' ? rawVal : parseCurrencyValue(rawVal);
-    if (valor >= 1e11 || isFonteString(valor) || valor === 600 || valor === 500 || valor === 1500 || valor === 1600 || valor === 0.6 || valor === 0.5) {
+    if (valor <= 0 || valor >= 1e11 || isFonteString(valor) || valor === 600 || valor === 500 || valor === 1500 || valor === 1600 || valor === 0.6 || valor === 0.5) {
       // Re-scan pre-filtered monetary columns if rawVal was a fonte code or empty
       let realVal = 0;
       for (let vcIdx = 0; vcIdx < fallbackValCols.length; vcIdx++) {
@@ -391,6 +417,21 @@ export function extractOrdensBancariasFromFileData(file: FileData): OrdemBancari
         if (pv > 0 && pv < 1e11 && pv !== 600 && pv !== 500 && pv !== 1500 && pv !== 1600 && pv !== 0.6 && pv !== 0.5) {
           realVal = pv;
           break;
+        }
+      }
+      // Fallback para cabeçalhos sintéticos (Coluna_1..N) quando não há coluna nomeada de Valor ou ela veio zerada
+      if (realVal === 0 && (!valCol || /^Coluna_\d+$/i.test(valCol))) {
+        for (const k in row) {
+          if (k === obCol || k === fonteCol || k === cnpjCol || isFonteHeader(k)) continue;
+          const v = row[k];
+          if (v === null || v === undefined || v === '' || isFonteString(v)) continue;
+          const s = String(v).trim();
+          if (/\b\d{4}(?:OB|PP|NL|NE)\d+\b/i.test(s) || /^\d{2}\/\d{2}\/\d{2,4}$/.test(s) || /\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}/.test(s)) continue;
+          const pv = typeof v === 'number' ? v : parseCurrencyValue(s);
+          if (pv > 0 && pv < 1e11 && pv !== 600 && pv !== 500 && pv !== 1500 && pv !== 1600 && pv !== 0.6 && pv !== 0.5) {
+            realVal = pv;
+            break;
+          }
         }
       }
       valor = realVal;
@@ -422,6 +463,30 @@ export function extractOrdensBancariasFromFileData(file: FileData): OrdemBancari
       if (scannedFonte) rawFonte = scannedFonte;
     }
     let rawFav = favCol ? String(row[favCol] || '').trim() : '';
+    if (
+      !rawFav ||
+      /^\d{4}(?:OB|PP|NL|NE)\d+$/i.test(rawFav) ||
+      /^\d{2}\/\d{2}\/\d{2,4}$/.test(rawFav) ||
+      /^\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}$/.test(rawFav)
+    ) {
+      for (const k in row) {
+        if (k === obCol || k === fonteCol || k === cnpjCol || k === valCol || k === sitCol) continue;
+        const v = row[k];
+        if (typeof v !== 'string') continue;
+        const s = v.trim();
+        if (
+          s.length >= 4 &&
+          /[A-Za-zÀ-ÿ]{3,}/.test(s) &&
+          !/\b\d{4}(?:OB|PP|NL|NE)\d+\b/i.test(s) &&
+          !/^R?\$?\s*[\d.,]+$/.test(s) &&
+          !/^(CB|RJ|PPCB|PPNC|PPRJ|AO|PAGA|LIQUIDADA)$/i.test(s) &&
+          !isFonteString(s)
+        ) {
+          rawFav = s;
+          break;
+        }
+      }
+    }
     let finalCnpj = cnpjCol ? String(row[cnpjCol] || '').trim() : '';
     let ppVal = ppCol ? String(row[ppCol] || '').trim() : '';
     if (!ppVal) {

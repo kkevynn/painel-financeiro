@@ -583,14 +583,25 @@ export function App() {
             }
           }
 
-          // Extrai ordensBancariasList EXCLUSIVAMENTE de planilhas de Ordem Bancária (jamais de base_pps)
+          // Extrai ordensBancariasList EXCLUSIVAMENTE de planilhas de Ordem Bancária (jamais de base_pps),
+          // priorizando sempre "OBs - sigef - Principal" (Página3) para nunca ser sobrescrita por planilhas secundárias
           if (
             parsedFileData.stage !== 'base_pps' &&
             (parsedFileData.stage === 'ordem_bancaria' || isObFileName(parsedFileData.fileName))
           ) {
-            const extracted = extractOrdensBancariasFromFileData(parsedFileData);
-            if (extracted.length > 0) {
-              handleUpdateOrdensBancariasList(extracted, parsedFileData.fileName);
+            const isIncomingPrincipal =
+              parsedLower.includes('sigef') && parsedLower.includes('principal');
+            const currentObLower = (ordensBancariasFileNameRef.current || '').toLowerCase();
+            const hasPrincipalAlready =
+              currentObLower.includes('sigef') &&
+              currentObLower.includes('principal') &&
+              (ordensBancariasListRef.current?.length || 0) > 0;
+
+            if (isIncomingPrincipal || !hasPrincipalAlready) {
+              const extracted = extractOrdensBancariasFromFileData(parsedFileData);
+              if (extracted.length > 0) {
+                handleUpdateOrdensBancariasList(extracted, parsedFileData.fileName);
+              }
             }
           }
         }

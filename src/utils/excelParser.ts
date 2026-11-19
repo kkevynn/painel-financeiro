@@ -2299,7 +2299,8 @@ export async function readSpreadsheetSheets(file: File): Promise<RawSheetResult[
       if (isObsSigefPrincipal) {
         const pagina3 =
           allSheetNames.find((sName) => normalizeSheet(sName).replace(/\s+/g, '') === 'pagina3') ||
-          allSheetNames.find((sName) => /\bpagina\s*3\b/.test(normalizeSheet(sName)));
+          allSheetNames.find((sName) => /\bpagina\s*3\b/.test(normalizeSheet(sName))) ||
+          allSheetNames.find((sName) => /\bpag\.?\s*3\b/.test(normalizeSheet(sName)));
         if (pagina3) {
           targetSheetsFilter = [pagina3];
         }
@@ -2362,7 +2363,14 @@ export async function readSpreadsheetSheets(file: File): Promise<RawSheetResult[
     if (isObsSigefPrincipal) {
       const targetSheetName =
         workbook.SheetNames.find((sName) => normalizeSheet(sName).replace(/\s+/g, '') === 'pagina3') ||
-        workbook.SheetNames.find((sName) => /\bpagina\s*3\b/.test(normalizeSheet(sName)));
+        workbook.SheetNames.find((sName) => /\bpagina\s*3\b/.test(normalizeSheet(sName))) ||
+        workbook.SheetNames.find((sName) => /\bpag\.?\s*3\b/.test(normalizeSheet(sName)));
+
+      if (!targetSheetName) {
+        throw new Error(
+          `A aba "Página3" não foi encontrada na planilha "${file.name}". Abas disponíveis: ${workbook.SheetNames.join(', ')}.`
+        );
+      }
 
       if (targetSheetName) {
         const ws = workbook.Sheets[targetSheetName];
