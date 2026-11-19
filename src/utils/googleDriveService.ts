@@ -8,6 +8,12 @@
  */
 
 // Production Client ID configured in Google Cloud Console
+import {
+  scheduleBackgroundInterval,
+  withActiveProcessingLock,
+  onTabReturnToForeground,
+} from './backgroundScheduler';
+
 export const GOOGLE_CLIENT_ID = '866738622063-trtjudvl95g2c3lu0fhga9q79nn4eol6.apps.googleusercontent.com';
 
 export const DRIVE_DATABASE_FOLDER_NAME = 'Painel_Financeiro_SESAP_Dados';
@@ -76,7 +82,10 @@ class GoogleDriveService {
   private tokenExpiresAt: number = 0;
   private tokenClient: TokenClient | null = null;
   private subscribers: Set<Subscriber> = new Set();
-  private pollingTimer: any = null;
+  private stopPollingFn: (() => void) | null = null;
+  private stopForegroundListenerFn: (() => void) | null = null;
+  private lastPollCheckAt: number = 0;
+  private isBackgroundPollRunning: boolean = false;
   private cachedDatabaseFolderId: string | null = null;
   private onNewFileCallback: ((file: File, isAuto: boolean) => Promise<void> | void) | null = null;
 
@@ -808,85 +817,83 @@ class GoogleDriveService {
 
     this.setState({ status: 'syncing', errorMessage: null });
 
-    try {
-      const relevantFiles = await this.fetchRelevantFinancialMetadataList();
-      if (relevantFiles.length === 0) {
+    return withActiveProcessingLock('drive-sync', async () => {
+      try {
+        const relevantFiles = await this.fetchRelevantFinancialMetadataList();
+        if (relevantFiles.length === 0) {
+          this.setState({
+            status: 'connected',
+            errorMessage: 'Nenhuma planilha financeira encontrada no Google Drive.',
+          });
+          return {
+            success: false,
+            hasUpdate: false,
+            message: 'Nenhum relatório ("Processamento de dados", "Publicação" ou SIGEF) foi localizado no Google Drive.',
+          };
+        }
+
+        let downloadedCount = 0;
+        const fileNames: string[] = [];
+
+        for (const meta of relevantFiles) {
+          const lastMod = this.state.lastFileModifiedAt
+            ? new Date(this.state.lastFileModifiedAt).getTime()
+            : 0;
+          const shouldDownload = force || new Date(meta.modifiedTime).getTime() > lastMod;
+          if (!shouldDownload) continue;
+
+          // Download file into memory
+          const file = await this.downloadFileAsBrowserFile(meta);
+
+          // Deliver to parser callback
+          if (this.onNewFileCallback) {
+            await this.onNewFileCallback(file, false);
+            downloadedCount++;
+            fileNames.push(meta.name);
+          }
+        }
+
+        const topFile = relevantFiles[0];
+        this.lastPollCheckAt = Date.now();
         this.setState({
           status: 'connected',
-          errorMessage: 'Nenhuma planilha financeira encontrada no Google Drive.',
+          lastSyncAt: new Date(),
+          lastFileName: fileNames.join(', '),
+          lastFileModifiedAt: topFile.modifiedTime,
+          errorMessage: null,
+        });
+
+        return {
+          success: true,
+          hasUpdate: downloadedCount > 0,
+          fileName: fileNames.join(', '),
+          message:
+            downloadedCount === 1
+              ? `Planilha "${fileNames[0]}" sincronizada com sucesso!`
+              : `Sincronizadas ${downloadedCount} planilhas: ${fileNames.join(', ')}`,
+        };
+      } catch (err: any) {
+        const errorMsg = err?.message || 'Erro durante a sincronização com o Google Drive.';
+        this.setState({
+          status: 'error',
+          errorMessage: errorMsg,
         });
         return {
           success: false,
           hasUpdate: false,
-          message: 'Nenhum relatório ("Processamento de dados", "Publicação" ou SIGEF) foi localizado no Google Drive.',
+          message: errorMsg,
         };
       }
-
-      let downloadedCount = 0;
-      const fileNames: string[] = [];
-
-      for (const meta of relevantFiles) {
-        const lastMod = this.state.lastFileModifiedAt
-          ? new Date(this.state.lastFileModifiedAt).getTime()
-          : 0;
-        const shouldDownload = force || new Date(meta.modifiedTime).getTime() > lastMod;
-        if (!shouldDownload) continue;
-
-        // Download file into memory
-        const file = await this.downloadFileAsBrowserFile(meta);
-
-        // Deliver to parser callback
-        if (this.onNewFileCallback) {
-          await this.onNewFileCallback(file, false);
-          downloadedCount++;
-          fileNames.push(meta.name);
-        }
-      }
-
-      const topFile = relevantFiles[0];
-      this.setState({
-        status: 'connected',
-        lastSyncAt: new Date(),
-        lastFileName: fileNames.join(', '),
-        lastFileModifiedAt: topFile.modifiedTime,
-        errorMessage: null,
-      });
-
-      return {
-        success: true,
-        hasUpdate: downloadedCount > 0,
-        fileName: fileNames.join(', '),
-        message:
-          downloadedCount === 1
-            ? `Planilha "${fileNames[0]}" sincronizada com sucesso!`
-            : `Sincronizadas ${downloadedCount} planilhas: ${fileNames.join(', ')}`,
-      };
-    } catch (err: any) {
-      const errorMsg = err?.message || 'Erro durante a sincronização com o Google Drive.';
-      this.setState({
-        status: 'error',
-        errorMessage: errorMsg,
-      });
-      return {
-        success: false,
-        hasUpdate: false,
-        message: errorMsg,
-      };
-    }
+    });
   }
 
-  /**
-   * Starts the 20-minute background polling loop.
-   * Checks silently if newer versions exist in Drive. If so, fetches and processes them.
-   */
-  public startAutoPolling(): void {
-    this.stopAutoPolling();
-    this.setState({ autoPollingEnabled: true });
+  private async runBackgroundPollCycle(): Promise<void> {
+    if (!this.isConnected() || this.isBackgroundPollRunning) return;
+    this.isBackgroundPollRunning = true;
+    this.lastPollCheckAt = Date.now();
 
-    this.pollingTimer = setInterval(async () => {
-      if (!this.isConnected()) return;
-
-      try {
+    try {
+      await withActiveProcessingLock('drive-auto-poll', async () => {
         const relevantFiles = await this.fetchRelevantFinancialMetadataList();
         if (relevantFiles.length === 0) return;
 
@@ -918,16 +925,44 @@ class GoogleDriveService {
             lastFileModifiedAt: relevantFiles[0].modifiedTime,
           });
         }
-      } catch (pollErr) {
-        console.warn('[GoogleDriveService] Erro durante verificação em segundo plano:', pollErr);
-      }
+      });
+    } catch (pollErr) {
+      console.warn('[GoogleDriveService] Erro durante verificação em segundo plano:', pollErr);
+    } finally {
+      this.isBackgroundPollRunning = false;
+    }
+  }
+
+  /**
+   * Starts the 20-minute background polling loop backed by Web Worker timers
+   * so it continues running reliably even when the user switches browser tabs.
+   */
+  public startAutoPolling(): void {
+    this.stopAutoPolling();
+    this.setState({ autoPollingEnabled: true });
+    this.lastPollCheckAt = Date.now();
+
+    this.stopPollingFn = scheduleBackgroundInterval(() => {
+      this.runBackgroundPollCycle().catch(() => {});
     }, this.POLLING_INTERVAL_MS);
+
+    // Se o sistema operacional suspender o computador, retoma verificação ao voltar à aba
+    this.stopForegroundListenerFn = onTabReturnToForeground(() => {
+      if (!this.isConnected()) return;
+      if (Date.now() - this.lastPollCheckAt >= this.POLLING_INTERVAL_MS) {
+        this.runBackgroundPollCycle().catch(() => {});
+      }
+    });
   }
 
   public stopAutoPolling(): void {
-    if (this.pollingTimer) {
-      clearInterval(this.pollingTimer);
-      this.pollingTimer = null;
+    if (this.stopPollingFn) {
+      this.stopPollingFn();
+      this.stopPollingFn = null;
+    }
+    if (this.stopForegroundListenerFn) {
+      this.stopForegroundListenerFn();
+      this.stopForegroundListenerFn = null;
     }
     this.setState({ autoPollingEnabled: false });
   }

@@ -27,6 +27,13 @@ import { mlInferenceService } from './machineLearningInferenceService';
 import { toastAlertService } from './toastAlertService';
 import { isAdmin } from './authService';
 import { googleDriveService } from './googleDriveService';
+import {
+  scheduleBackgroundInterval,
+  scheduleBackgroundTimeout,
+  backgroundDelay,
+  withActiveProcessingLock,
+  onTabReturnToForeground,
+} from './backgroundScheduler';
 
 export const DRIVE_DATABASE_FOLDER_NAME = 'Painel_Financeiro_SESAP_Dados';
 
@@ -61,7 +68,8 @@ class CloudSyncService {
   };
 
   private listeners = new Set<SyncListener>();
-  private pollingIntervalId: ReturnType<typeof setInterval> | null = null;
+  private stopPollingFn: (() => void) | null = null;
+  private stopForegroundListenerFn: (() => void) | null = null;
   private isProcessingSync = false;
   private pullInFlight: Promise<boolean> | null = null;
   private lastPullHadNetworkError = false;
@@ -90,7 +98,7 @@ class CloudSyncService {
     this.initAuthListener();
     this.initBroadcastChannel();
     this.startAutoPolling();
-    setTimeout(() => {
+    scheduleBackgroundTimeout(() => {
       this.checkAndAutoSync().catch((e) => {
         console.warn('Auto-sync inicial Google Drive:', e);
       });
@@ -144,12 +152,16 @@ class CloudSyncService {
   }
 
   private startAutoPolling() {
-    if (this.pollingIntervalId) {
-      clearInterval(this.pollingIntervalId);
+    if (this.stopPollingFn) {
+      this.stopPollingFn();
+      this.stopPollingFn = null;
     }
-    // Polling automático leve a cada 15 segundos para sincronização quase em tempo real entre dispositivos
-    // Aplica backoff progressivo em caso de falhas de rede para não sobrecarregar a conexão
-    this.pollingIntervalId = setInterval(() => {
+    if (this.stopForegroundListenerFn) {
+      this.stopForegroundListenerFn();
+      this.stopForegroundListenerFn = null;
+    }
+
+    const runPollTick = () => {
       if (this.isProcessingSync || this.pullInFlight) return;
       if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
 
@@ -165,7 +177,15 @@ class CloudSyncService {
       this.pullFromCloud(true).catch((e) => {
         console.warn('Polling automático Google Drive:', e);
       });
-    }, 15000);
+    };
+
+    // Polling automático leve via Web Worker a cada 15 segundos (imune ao throttling de aba inativa)
+    this.stopPollingFn = scheduleBackgroundInterval(runPollTick, 15000);
+    this.stopForegroundListenerFn = onTabReturnToForeground(() => {
+      if (!this.isProcessingSync && !this.pullInFlight) {
+        this.pullFromCloud(true).catch(() => {});
+      }
+    });
   }
 
   public registerDatasetReloadCallback(
@@ -292,21 +312,26 @@ class CloudSyncService {
     // Evita colisões de concorrência: espera até 2s se outra sincronização estiver em curso
     let waitCycles = 0;
     while (this.isProcessingSync && waitCycles < 10) {
-      await new Promise((r) => setTimeout(r, 200));
+      await backgroundDelay(200);
       waitCycles++;
     }
 
-    return Promise.race([
-      this.executePushToCloud(files, obsList, obFileName, consolidatedMetrics),
-      new Promise<boolean>((resolve) => {
-        setTimeout(() => {
-          console.warn('Timeout de segurança ao sincronizar com o Google Drive (90s). Liberando interface.');
-          this.isProcessingSync = false;
-          this.updateState({ isSyncing: false, syncStatus: 'idle' });
-          resolve(false);
-        }, 90000);
-      }),
-    ]);
+    return withActiveProcessingLock('cloud-push', () => {
+      let cancelSafetyTimeout: (() => void) | null = null;
+      return Promise.race([
+        this.executePushToCloud(files, obsList, obFileName, consolidatedMetrics).finally(() => {
+          cancelSafetyTimeout?.();
+        }),
+        new Promise<boolean>((resolve) => {
+          cancelSafetyTimeout = scheduleBackgroundTimeout(() => {
+            console.warn('Timeout de segurança ao sincronizar com o Google Drive (90s). Liberando interface.');
+            this.isProcessingSync = false;
+            this.updateState({ isSyncing: false, syncStatus: 'idle' });
+            resolve(false);
+          }, 90000);
+        }),
+      ]);
+    });
   }
 
   private async executePushToCloud(
@@ -588,7 +613,7 @@ class CloudSyncService {
         String(firstErr?.message || '').toLowerCase().includes('fetch');
 
       if (isAbortOrNetwork && (typeof navigator === 'undefined' || navigator.onLine !== false)) {
-        await new Promise((r) => setTimeout(r, 1200));
+        await backgroundDelay(1200);
         try {
           return await attemptFetch();
         } catch (retryErr) {

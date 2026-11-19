@@ -50,6 +50,11 @@ import { paraPublicarService } from './utils/paraPublicarService';
 import { auth } from './firebase';
 import { authService, getCurrentSession, AuthSession } from './utils/authService';
 import { LoginScreen } from './components/LoginScreen';
+import {
+  backgroundDelay,
+  scheduleBackgroundTimeout,
+  withActiveProcessingLock,
+} from './utils/backgroundScheduler';
 
 const initialMetrics: DashboardMetrics = {
   grandTotalValue: 0,
@@ -463,16 +468,16 @@ export function App() {
     initStorage();
   }, []);
 
-  // Auto-save to local storage (IndexedDB) ONLY when user actually makes changes (debounced to keep UI fluid)
+  // Auto-save to local storage (IndexedDB) ONLY when user actually makes changes (unthrottled in background tabs)
   useEffect(() => {
     if (!isStorageLoaded) return;
     if (!hasUserChangesRef.current) return;
 
-    const timer = setTimeout(() => {
+    const cancelTimer = scheduleBackgroundTimeout(() => {
       saveAppState(files, lastProcessedAt);
       hasUserChangesRef.current = false;
     }, 1000);
-    return () => clearTimeout(timer);
+    return () => cancelTimer();
   }, [files, lastProcessedAt, isStorageLoaded]);
 
   const filesRef = useRef<FileData[]>(files);
@@ -484,12 +489,14 @@ export function App() {
   const isBatchDriveSyncRef = useRef(false);
 
   // Trigger alert and analysis whenever files are uploaded, changed, or processed
-  const alertAnalysisTimeoutRef = useRef<any>(null);
+  const alertAnalysisTimeoutRef = useRef<(() => void) | null>(null);
   const triggerAlertAnalysis = (currentFiles: FileData[], currentOBs?: OrdemBancariaItem[] | null) => {
     if (alertAnalysisTimeoutRef.current) {
-      clearTimeout(alertAnalysisTimeoutRef.current);
+      alertAnalysisTimeoutRef.current();
+      alertAnalysisTimeoutRef.current = null;
     }
-    alertAnalysisTimeoutRef.current = setTimeout(() => {
+    alertAnalysisTimeoutRef.current = scheduleBackgroundTimeout(() => {
+      alertAnalysisTimeoutRef.current = null;
       const targetOBs = currentOBs !== undefined ? currentOBs : ordensBancariasListRef.current;
       toastAlertService.analyzeFileTransitions(currentFiles, targetOBs);
       mlInferenceService.processFilesForInference(currentFiles, targetOBs);
@@ -531,14 +538,15 @@ export function App() {
     queuedUploadsCountRef.current++;
     setIsProcessing(true);
 
-    const task = async () => {
-      setProcessingProgress(20);
-      setProcessingMessage(`Lendo e processando "${file.name}"...`);
+    const task = async () =>
+      withActiveProcessingLock('file-upload', async () => {
+        setProcessingProgress(20);
+        setProcessingMessage(`Lendo e processando "${file.name}"...`);
 
-      try {
-        await new Promise((res) => setTimeout(res, 30));
-        const parsedFiles = await parseWorkbookIntoFileDatas(file, stage);
-        setProcessingProgress(60);
+        try {
+          await backgroundDelay(30);
+          const parsedFiles = await parseWorkbookIntoFileDatas(file, stage);
+          setProcessingProgress(60);
 
         hasUserChangesRef.current = true;
 
@@ -600,16 +608,16 @@ export function App() {
         if (queuedUploadsCountRef.current === 0 && !isBatchDriveSyncRef.current) {
           setProcessingMessage('Consolidando dados...');
           setProcessingProgress(85);
-          await new Promise((res) => setTimeout(res, 30));
+          await backgroundDelay(30);
           finalizeDataConsolidation(true);
           setProcessingProgress(100);
-          setTimeout(() => {
+          scheduleBackgroundTimeout(() => {
             setIsProcessing(false);
             setProcessingProgress(0);
           }, 300);
         }
       }
-    };
+      });
 
     const queuedPromise = uploadQueueRef.current.then(task, task);
     uploadQueueRef.current = queuedPromise;
@@ -748,39 +756,41 @@ export function App() {
     setProcessingMessage('Sincronizando com Google Drive e Nuvem...');
     isBatchDriveSyncRef.current = true;
     try {
-      setProcessingProgress(40);
-      const result = await googleDriveService.syncNow(true);
-      await uploadQueueRef.current;
+      await withActiveProcessingLock('drive-sync-batch', async () => {
+        setProcessingProgress(40);
+        const result = await googleDriveService.syncNow(true);
+        await uploadQueueRef.current;
 
-      if (result.hasUpdate) {
-        setProcessingMessage('Consolidando dados sincronizados...');
-        setProcessingProgress(65);
-        await new Promise((res) => setTimeout(res, 30));
-        finalizeDataConsolidation(true);
-      }
+        if (result.hasUpdate) {
+          setProcessingMessage('Consolidando dados sincronizados...');
+          setProcessingProgress(65);
+          await backgroundDelay(30);
+          finalizeDataConsolidation(true);
+        }
 
-      // Also sync Firestore cloud state across Tablet & PC
-      try {
-        setProcessingProgress(75);
-        await cloudSyncService.checkAndAutoSync();
-      } catch (cloudErr) {
-        console.warn('Sincronização em nuvem:', cloudErr);
-      }
+        // Also sync Firestore cloud state across Tablet & PC
+        try {
+          setProcessingProgress(75);
+          await cloudSyncService.checkAndAutoSync();
+        } catch (cloudErr) {
+          console.warn('Sincronização em nuvem:', cloudErr);
+        }
 
-      setProcessingProgress(90);
-      if (result.success) {
-        toastAlertService.addToast({
-          tipo: 'sucesso',
-          titulo: 'Sincronização Concluída',
-          mensagem: `${result.message} Dados em nuvem atualizados para todos os seus dispositivos.`,
-        });
-      } else {
-        toastAlertService.addToast({
-          tipo: 'sucesso',
-          titulo: 'Nuvem e Dispositivos Atualizados',
-          mensagem: 'Planilhas e dados sincronizados com sucesso entre Tablet e PC.',
-        });
-      }
+        setProcessingProgress(90);
+        if (result.success) {
+          toastAlertService.addToast({
+            tipo: 'sucesso',
+            titulo: 'Sincronização Concluída',
+            mensagem: `${result.message} Dados em nuvem atualizados para todos os seus dispositivos.`,
+          });
+        } else {
+          toastAlertService.addToast({
+            tipo: 'sucesso',
+            titulo: 'Nuvem e Dispositivos Atualizados',
+            mensagem: 'Planilhas e dados sincronizados com sucesso entre Tablet e PC.',
+          });
+        }
+      });
     } catch (err: any) {
       toastAlertService.addToast({
         tipo: 'critico',
@@ -791,7 +801,7 @@ export function App() {
       isBatchDriveSyncRef.current = false;
       setIsDriveSyncing(false);
       setProcessingProgress(100);
-      setTimeout(() => {
+      scheduleBackgroundTimeout(() => {
         setIsProcessing(false);
         setProcessingProgress(0);
       }, 400);
@@ -871,13 +881,13 @@ export function App() {
       }
     }
 
-    // Use non-blocking schedule for consolidation so UI never stutters or freezes
-    setTimeout(() => {
+    // Use non-blocking schedule for consolidation so UI never stutters or freezes (unthrottled in background)
+    scheduleBackgroundTimeout(() => {
       const newMetrics = processUploadedFiles(updated);
       const enriched = applyEnrichment(newMetrics, targetOBs);
       setMetrics(enriched);
       saveAppState(updated, lastProcessedAt);
-      if (session?.role === 'admin') {
+      if (sessionRef.current?.role === 'admin') {
         cloudSyncService.pushToCloud(updated, targetOBs, ordensBancariasFileNameRef.current, enriched).catch((e) => {
           console.warn('Auto-save na nuvem remoção de arquivo:', e);
         });
@@ -889,21 +899,24 @@ export function App() {
   const handleProcessData = () => {
     setIsProcessing(true);
     setProcessingMessage('Consolidando planilhas e métricas gerais...');
-    setTimeout(() => {
+    withActiveProcessingLock('manual-process', async () => {
+      await backgroundDelay(50);
       try {
-        const newMetrics = processUploadedFiles(files);
-        const enriched = applyEnrichment(newMetrics, ordensBancariasList);
+        const currentFiles = filesRef.current;
+        const currentOBs = ordensBancariasListRef.current;
+        const newMetrics = processUploadedFiles(currentFiles);
+        const enriched = applyEnrichment(newMetrics, currentOBs);
         setMetrics(enriched);
         const now = new Date();
         setLastProcessedAt(now);
-        saveAppState(files, now);
-        if (session?.role === 'admin') {
-          cloudSyncService.pushToCloud(files, ordensBancariasList, ordensBancariasFileNameRef.current, enriched).catch((e) => {
+        saveAppState(currentFiles, now);
+        if (sessionRef.current?.role === 'admin') {
+          cloudSyncService.pushToCloud(currentFiles, currentOBs, ordensBancariasFileNameRef.current, enriched).catch((e) => {
             console.warn('Auto-save na nuvem processamento de dados:', e);
           });
         }
-        toastAlertService.analyzeFileTransitions(files, ordensBancariasList);
-        mlInferenceService.processFilesForInference(files, ordensBancariasList);
+        toastAlertService.analyzeFileTransitions(currentFiles, currentOBs);
+        mlInferenceService.processFilesForInference(currentFiles, currentOBs);
       } catch (err: any) {
         toastAlertService.addToast({
           tipo: 'critico',
@@ -913,7 +926,7 @@ export function App() {
       } finally {
         setIsProcessing(false);
       }
-    }, 450);
+    });
   };
 
   // Explicit Save Data handler
@@ -930,43 +943,48 @@ export function App() {
     setIsProcessing(true);
     setProcessingMessage('Salvando alterações e sincronizando com o Google Drive...');
     try {
-      const now = new Date();
-      setLastProcessedAt(now);
-      const newMetrics = processUploadedFiles(files);
-      const enriched = applyEnrichment(newMetrics, ordensBancariasList);
-      setMetrics(enriched);
+      await withActiveProcessingLock('save-data', async () => {
+        const currentFiles = filesRef.current;
+        const currentOBs = ordensBancariasListRef.current;
+        const currentOBFileName = ordensBancariasFileNameRef.current;
+        const now = new Date();
+        setLastProcessedAt(now);
+        const newMetrics = processUploadedFiles(currentFiles);
+        const enriched = applyEnrichment(newMetrics, currentOBs);
+        setMetrics(enriched);
 
-      // 1. Salva no armazenamento local primeiro (garantia imediata)
-      await saveAppState(files, now);
+        // 1. Salva no armazenamento local primeiro (garantia imediata)
+        await saveAppState(currentFiles, now);
 
-      // 2. Analisa transições de alertas e aprendizado de máquina
-      toastAlertService.analyzeFileTransitions(files, ordensBancariasList);
-      mlInferenceService.processFilesForInference(files, ordensBancariasList);
+        // 2. Analisa transições de alertas e aprendizado de máquina
+        toastAlertService.analyzeFileTransitions(currentFiles, currentOBs);
+        mlInferenceService.processFilesForInference(currentFiles, currentOBs);
 
-      // 3. Aguarda sincronização completa no Google Drive antes de notificar sucesso
-      const ok = await cloudSyncService.pushToCloud(
-        files,
-        ordensBancariasList,
-        ordensBancariasFileName,
-        enriched
-      );
+        // 3. Aguarda sincronização completa no Google Drive antes de notificar sucesso
+        const ok = await cloudSyncService.pushToCloud(
+          currentFiles,
+          currentOBs,
+          currentOBFileName,
+          enriched
+        );
 
-      if (ok) {
-        toastAlertService.addToast({
-          tipo: 'sucesso',
-          titulo: 'Salvo e Sincronizado!',
-          mensagem: 'Dados gravados localmente e sincronizados com o Google Drive.',
-        });
-      } else {
-        toastAlertService.addToast({
-          tipo: 'aviso',
-          titulo: 'Salvo localmente',
-          mensagem: 'Dados gravados no navegador, mas não foi possível confirmar o envio ao Google Drive.',
-        });
-      }
+        if (ok) {
+          toastAlertService.addToast({
+            tipo: 'sucesso',
+            titulo: 'Salvo e Sincronizado!',
+            mensagem: 'Dados gravados localmente e sincronizados com o Google Drive.',
+          });
+        } else {
+          toastAlertService.addToast({
+            tipo: 'aviso',
+            titulo: 'Salvo localmente',
+            mensagem: 'Dados gravados no navegador, mas não foi possível confirmar o envio ao Google Drive.',
+          });
+        }
 
-      // Breve pausa para visualização da confirmação
-      await new Promise((res) => setTimeout(res, 200));
+        // Breve pausa para visualização da confirmação (sem travar em aba inativa)
+        await backgroundDelay(150);
+      });
     } finally {
       setIsProcessing(false);
     }
@@ -986,21 +1004,23 @@ export function App() {
     setIsProcessing(true);
     setProcessingMessage('Limpando dados e redefinindo painel...');
     try {
-      filesRef.current = [];
-      setFiles([]);
-      ordensBancariasListRef.current = null;
-      setOrdensBancariasList(null);
-      ordensBancariasFileNameRef.current = '';
-      setOrdensBancariasFileName('');
-      saveOrdensBancariasToStorage(null, '');
-      setMetrics(initialMetrics);
-      setLastProcessedAt(null);
-      await clearAppState();
-      try {
-        localStorage.removeItem('painel_fes_metrics_cache_v1');
-      } catch (_) {}
-      await cloudSyncService.clearCloudWorkspace();
-      await new Promise((res) => setTimeout(res, 350));
+      await withActiveProcessingLock('clear-data', async () => {
+        filesRef.current = [];
+        setFiles([]);
+        ordensBancariasListRef.current = null;
+        setOrdensBancariasList(null);
+        ordensBancariasFileNameRef.current = '';
+        setOrdensBancariasFileName('');
+        saveOrdensBancariasToStorage(null, '');
+        setMetrics(initialMetrics);
+        setLastProcessedAt(null);
+        await clearAppState();
+        try {
+          localStorage.removeItem('painel_fes_metrics_cache_v1');
+        } catch (_) {}
+        await cloudSyncService.clearCloudWorkspace();
+        await backgroundDelay(200);
+      });
     } finally {
       setIsProcessing(false);
     }

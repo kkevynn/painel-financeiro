@@ -1,5 +1,6 @@
 import { parseCurrencyValue, parseFavorecidoField, isSituacaoConclusivaPagamento, readSpreadsheetAsMatrix, isTotalizadorRow, isFonteHeader, isFonteString } from './excelParser';
 import { FileData } from '../types';
+import { yieldWithoutThrottling } from './backgroundScheduler';
 
 /**
  * Checks if a filename indicates an Ordem Bancária (OB) spreadsheet
@@ -772,7 +773,7 @@ export async function parseListarOrdemBancariaMatrixAsync(
   for (let i = 0; i < total; i++) {
     if (i > 0 && i % CHUNK_SIZE === 0) {
       if (onProgress) onProgress(Math.min(99, Math.round((i / total) * 100)));
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await yieldWithoutThrottling();
     }
 
     const row1 = matrix[i];

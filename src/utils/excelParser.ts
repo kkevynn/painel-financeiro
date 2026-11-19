@@ -2,6 +2,7 @@ import * as XLSX from 'xlsx';
 import { FileData, ConsolidatedSupplier, DashboardMetrics, StageKey } from '../types';
 import { toastAlertService } from './toastAlertService';
 import { mlInferenceService } from './machineLearningInferenceService';
+import { backgroundDelay } from './backgroundScheduler';
 
 export function detectStageFromFileName(fileName: string): StageKey {
   if (!fileName) return 'outros';
@@ -2117,8 +2118,8 @@ export async function readSpreadsheetSheets(file: File): Promise<RawSheetResult[
     );
   }
 
-  // Small asynchronous pause to allow the browser to paint the loading spinner
-  await new Promise((resolve) => setTimeout(resolve, 30));
+  // Small asynchronous pause to allow the browser to paint the loading spinner (unthrottled in background tabs)
+  await backgroundDelay(30);
 
   let buffer: ArrayBuffer | null = await file.arrayBuffer();
   if (!buffer || buffer.byteLength === 0) {
