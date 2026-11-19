@@ -628,23 +628,25 @@ class GoogleDriveService {
       addedIds.add(procFile.id);
     }
 
-    // A2. Planilhas individuais de Obedece / Não Obedece (caso não estejam consolidadas em Processamento de dados)
-    const obedeceStandalone = files.find((f) => {
-      const norm = normalize(f.name);
-      return (norm.includes('obedece') || norm.includes('cronolog')) && !norm.includes('nao') && !addedIds.has(f.id);
-    });
-    if (obedeceStandalone && !addedIds.has(obedeceStandalone.id)) {
-      selected.push(obedeceStandalone);
-      addedIds.add(obedeceStandalone.id);
-    }
+    // A2. Planilhas individuais de Obedece / Não Obedece (apenas caso não estejam consolidadas em Processamento de dados)
+    if (!procFile) {
+      const obedeceStandalone = files.find((f) => {
+        const norm = normalize(f.name);
+        return (norm.includes('obedece') || norm.includes('cronolog')) && !norm.includes('nao') && !addedIds.has(f.id);
+      });
+      if (obedeceStandalone && !addedIds.has(obedeceStandalone.id)) {
+        selected.push(obedeceStandalone);
+        addedIds.add(obedeceStandalone.id);
+      }
 
-    const naoObedeceStandalone = files.find((f) => {
-      const norm = normalize(f.name);
-      return (norm.includes('nao obedece') || norm.includes('nao cron')) && !addedIds.has(f.id);
-    });
-    if (naoObedeceStandalone && !addedIds.has(naoObedeceStandalone.id)) {
-      selected.push(naoObedeceStandalone);
-      addedIds.add(naoObedeceStandalone.id);
+      const naoObedeceStandalone = files.find((f) => {
+        const norm = normalize(f.name);
+        return (norm.includes('nao obedece') || norm.includes('nao cron')) && !addedIds.has(f.id);
+      });
+      if (naoObedeceStandalone && !addedIds.has(naoObedeceStandalone.id)) {
+        selected.push(naoObedeceStandalone);
+        addedIds.add(naoObedeceStandalone.id);
+      }
     }
 
     // B. "Publicação - DD/MM" (NLs para publicação - include all recent publication files across days)

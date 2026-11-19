@@ -550,12 +550,29 @@ export function App() {
         let updated = [...filesRef.current];
 
         for (const parsedFileData of parsedFiles) {
-          // If a file with the same name already exists, replace it instead of duplicating
-          const existingIdx = updated.findIndex((f) => f.fileName === parsedFileData.fileName);
-          if (existingIdx >= 0) {
-            updated = updated.map((f, i) => (i === existingIdx ? parsedFileData : f));
-          } else {
+          const parsedLower = (parsedFileData.fileName || '').toLowerCase();
+          const isProcStageTab =
+            parsedLower.includes('processamento') &&
+            parsedLower.includes('dados') &&
+            (parsedFileData.stage === 'obedece' || parsedFileData.stage === 'nao_obedece');
+
+          // Se for uma nova aba datada de "Processamento de dados" (Obedece ou Não Obedece),
+          // substitui a aba anterior da mesma etapa para nunca somar dias antigos com o dia atual
+          if (isProcStageTab) {
+            updated = updated.filter((f) => {
+              const fl = (f.fileName || '').toLowerCase();
+              const sameProc = fl.includes('processamento') && fl.includes('dados');
+              return !(sameProc && f.stage === parsedFileData.stage);
+            });
             updated = [...updated, parsedFileData];
+          } else {
+            // If a file with the same name already exists, replace it instead of duplicating
+            const existingIdx = updated.findIndex((f) => f.fileName === parsedFileData.fileName);
+            if (existingIdx >= 0) {
+              updated = updated.map((f, i) => (i === existingIdx ? parsedFileData : f));
+            } else {
+              updated = [...updated, parsedFileData];
+            }
           }
 
           // Extrai ordensBancariasList EXCLUSIVAMENTE de planilhas de Ordem Bancária (jamais de base_pps)

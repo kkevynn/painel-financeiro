@@ -53,6 +53,8 @@ export function detectStageFromFileName(fileName: string): StageKey {
     normalized.includes('nao obedece') ||
     normalized.includes('naoobedece') ||
     normalized.includes('nao obedec') ||
+    (normalized.includes('nao') && normalized.includes('obedec')) ||
+    /(?:^|\s)n\s+obedec/.test(normalized) ||
     normalized.includes('desobedece') ||
     normalized.includes('desobediencia') ||
     normalized.includes('nao cronologica') ||
@@ -133,12 +135,22 @@ export function parseCurrencyValue(raw: any): number {
   let str = String(raw).trim();
   if (!str) return 0;
 
+  // Reject dates (DD/MM/YYYY), CNPJs/CPFs (00.000.000/0000-00), and SIGEF document codes (2026NL001, 2026PP001, 2026OB001, 2026NE001)
+  if (str.includes('/')) return 0;
+  if (/\b\d{2,4}(?:NL|PP|OB|NE|OP)\d+\b/i.test(str)) return 0;
+  if (/^\d{4}-\d{2}-\d{2}/.test(str)) return 0;
+
   // Remove currency symbol, spaces, non-breaking spaces
-  str = str.replace(/R\$\s?/gi, '').replace(/\s/g, '').trim();
+  str = str.replace(/R\$\s?/gi, '').replace(/BRL\s?/gi, '').replace(/[\s\u00A0]/g, '').trim();
+  if (!str) return 0;
+
+  // If the remaining string contains letters, it is not a pure currency value
+  if (/[a-zA-ZÀ-ÿ]/.test(str)) return 0;
 
   // If in format (1.234,56) meaning negative
   const isNegative = (str.startsWith('(') && str.endsWith(')')) || str.startsWith('-');
-  str = str.replace(/[()\-]/g, '');
+  str = str.replace(/[()\-+]/g, '');
+  if (!str || !/^\d[\d.,]*$/.test(str)) return 0;
 
   if (str.includes(',') && str.includes('.')) {
     const lastComma = str.lastIndexOf(',');
@@ -151,8 +163,14 @@ export function parseCurrencyValue(raw: any): number {
       str = str.replace(/,/g, '');
     }
   } else if (str.includes(',')) {
-    // 1234,56 -> 1234.56
-    str = str.replace(',', '.');
+    const commaParts = str.split(',');
+    if (commaParts.length > 2) {
+      // Multiple commas like 1,234,567 -> US thousands separator
+      str = str.replace(/,/g, '');
+    } else {
+      // Brazilian decimal: 1234,56 -> 1234.56
+      str = str.replace(',', '.');
+    }
   } else if (str.includes('.')) {
     const parts = str.split('.');
     if (parts.length > 2 || (parts.length === 2 && parts[1].length === 3)) {
@@ -381,6 +399,16 @@ export function isBankOrIntermediary(name: string): boolean {
   );
 }
 
+function looksLikeRealCompanyOrDocument(favStr: string, rawNumero?: any): boolean {
+  const numStr = String(rawNumero || '').trim();
+  if (/\b\d{2,4}(?:NL|PP|OB|NE|OP)\d+\b/i.test(numStr)) return true;
+  if (/\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}|\d{3}\.\d{3}\.\d{3}-\d{2}|\b\d{14}\b/.test(favStr)) return true;
+  if (/\b(ltda|s\/a|s\.a\.?|eireli|me|epp|comercio|distribuidora|hospital|clinica|laboratorio|farmacia|medic|servicos|engenharia|construtora|industria|alimentos|seguranca|transportes|saude)\b/i.test(favStr)) {
+    return true;
+  }
+  return false;
+}
+
 /**
  * Checks if a row is a summary, subtotal, grand total or report footer line
  * (which often contain multi-billion budget or aggregated totals that distort metrics)
@@ -396,45 +424,57 @@ export function isTotalizadorRow(
     .trim()
     .toLowerCase();
 
-  if (
-    favStr === 'total' ||
-    favStr === 'subtotal' ||
-    favStr.startsWith('total ') ||
-    favStr.startsWith('total:') ||
-    favStr.startsWith('total -') ||
-    favStr.startsWith('subtotal') ||
-    favStr.startsWith('resumo') ||
-    favStr.includes('total geral') ||
-    favStr.includes('total do orgao') ||
-    favStr.includes('total da unidade') ||
-    favStr.includes('total do credor') ||
-    favStr.includes('total da despesa') ||
-    favStr.includes('total do elemento') ||
-    favStr.includes('total da celula') ||
-    favStr.includes('total do empenho') ||
-    favStr.includes('saldo orcamentario') ||
-    favStr.includes('dotacao orcamentaria') ||
-    favStr.startsWith('celula') ||
-    favStr.startsWith('empenho celula')
-  ) {
-    return true;
+  const isRealEntity = looksLikeRealCompanyOrDocument(favStr, rawNumero);
+
+  if (!isRealEntity) {
+    if (
+      favStr === 'total' ||
+      favStr === 'subtotal' ||
+      favStr === 'soma' ||
+      favStr === 'soma total' ||
+      favStr === 'valor total' ||
+      favStr.startsWith('total ') ||
+      favStr.startsWith('total:') ||
+      favStr.startsWith('total -') ||
+      favStr.startsWith('total r$') ||
+      favStr.startsWith('subtotal') ||
+      favStr.startsWith('resumo') ||
+      favStr.includes('total geral') ||
+      favStr.includes('total do orgao') ||
+      favStr.includes('total da unidade') ||
+      favStr.includes('total do credor') ||
+      favStr.includes('total da despesa') ||
+      favStr.includes('total do elemento') ||
+      favStr.includes('total da celula') ||
+      favStr.includes('total do empenho') ||
+      favStr.includes('total obedece') ||
+      favStr.includes('total nao obedece') ||
+      favStr.includes('total liquidac') ||
+      favStr.includes('total a pagar') ||
+      favStr.includes('saldo orcamentario') ||
+      favStr.includes('dotacao orcamentaria') ||
+      favStr.startsWith('celula') ||
+      favStr.startsWith('empenho celula')
+    ) {
+      return true;
+    }
   }
 
   // Check if any cell in the row explicitly identifies a total or budget summary
-  const cells = Object.values(row);
-  for (const cell of cells) {
-    if (cell === null || cell === undefined) continue;
-    const s = String(cell)
+  for (const k in row) {
+    const cell = row[k];
+    if (cell === null || cell === undefined || typeof cell !== 'string') continue;
+    const trimmed = cell.trim();
+    if (!trimmed) continue;
+    const s = trimmed
       .normalize('NFD')
       .replace(/[\u0300-\u036f]/g, '')
-      .trim()
       .toLowerCase();
 
     if (
       s.startsWith('c - cancelada; ap - a pagar') ||
       s.startsWith('c - cancelada') ||
       s.startsWith('relatorio emitido em') ||
-      s.startsWith('relatório emitido em') ||
       s === 'total geral' ||
       s.startsWith('total geral') ||
       s.startsWith('total do orgao') ||
@@ -442,11 +482,16 @@ export function isTotalizadorRow(
       s.startsWith('total da despesa') ||
       s.startsWith('total da celula') ||
       s.startsWith('total do empenho') ||
+      s.startsWith('total obedece') ||
+      s.startsWith('total nao obedece') ||
+      s.startsWith('total liquidac') ||
+      s.startsWith('total a pagar') ||
       s.startsWith('resumo geral') ||
       s.startsWith('saldo orcamentario') ||
       s.startsWith('dotacao atualizada') ||
       s.startsWith('dotacao orcamentaria') ||
-      s.startsWith('quantidade de registros')
+      s.startsWith('quantidade de registros') ||
+      (!isRealEntity && (s === 'total' || s === 'subtotal' || s === 'soma' || s === 'soma total' || s === 'valor total' || s.startsWith('total:') || s.startsWith('total -')))
     ) {
       return true;
     }
@@ -990,11 +1035,11 @@ export function autoDetectColumns(
     'vlr',
   ];
 
-  // First pass: look for explicit compound payment/value columns
-  for (const h of headers) {
-    const norm = normalize(h);
-    if (isBudgetOrFonteHeader(norm)) continue;
-    for (const kw of valorKeywordsPrioritarias) {
+  // First pass: look for explicit compound payment/value columns IN STRICT KEYWORD PRIORITY ORDER
+  for (const kw of valorKeywordsPrioritarias) {
+    for (const h of headers) {
+      const norm = normalize(h);
+      if (isBudgetOrFonteHeader(norm)) continue;
       if (norm === kw || norm.startsWith(`${kw} `) || norm.endsWith(` ${kw}`) || norm.includes(` ${kw} `)) {
         valorCol = h;
         break;
@@ -1003,12 +1048,12 @@ export function autoDetectColumns(
     if (valorCol) break;
   }
 
-  // Second pass: if not found, look for general value keywords, strictly avoiding budget and fonte columns
+  // Second pass: if not found, look for general value keywords IN STRICT KEYWORD PRIORITY ORDER
   if (!valorCol) {
-    for (const h of headers) {
-      const norm = normalize(h);
-      if (isBudgetOrFonteHeader(norm)) continue;
-      for (const kw of valorKeywordsGerais) {
+    for (const kw of valorKeywordsGerais) {
+      for (const h of headers) {
+        const norm = normalize(h);
+        if (isBudgetOrFonteHeader(norm)) continue;
         if (norm === kw || norm.startsWith(`${kw} `) || norm.endsWith(` ${kw}`) || norm.includes(` ${kw} `)) {
           valorCol = h;
           break;
@@ -1018,12 +1063,12 @@ export function autoDetectColumns(
     }
   }
 
-  // Third pass: contains keyword check as fallback
+  // Third pass: contains keyword check as fallback IN STRICT KEYWORD PRIORITY ORDER
   if (!valorCol) {
-    for (const h of headers) {
-      const norm = normalize(h);
-      if (isBudgetOrFonteHeader(norm)) continue;
-      for (const kw of [...valorKeywordsPrioritarias, ...valorKeywordsGerais]) {
+    for (const kw of [...valorKeywordsPrioritarias, ...valorKeywordsGerais]) {
+      for (const h of headers) {
+        const norm = normalize(h);
+        if (isBudgetOrFonteHeader(norm)) continue;
         if (norm.includes(kw)) {
           valorCol = h;
           break;
@@ -1197,6 +1242,25 @@ export function autoDetectColumns(
       }
     }
 
+    const isSampleMostlyFonte = (col: string): boolean => {
+      let nonEmpty = 0;
+      let fonteHits = 0;
+      let decimalMoneyHits = 0;
+      for (let i = 0; i < sample.length; i++) {
+        const v = sample[i][col];
+        if (v === null || v === undefined || String(v).trim() === '') continue;
+        nonEmpty++;
+        if (typeof v === 'number' && Math.abs(v - Math.round(v)) > 0.001 && v !== 0.6 && v !== 0.5) {
+          decimalMoneyHits++;
+        } else if (typeof v === 'string' && /R\$|\d+\.\d{3},\d{2}|\d+,\d{2}$/.test(v.trim())) {
+          decimalMoneyHits++;
+        }
+        if (isFonteString(v)) fonteHits++;
+      }
+      if (nonEmpty === 0 || decimalMoneyHits >= 2) return false;
+      return fonteHits / nonEmpty >= 0.6;
+    };
+
     // Heuristic for valorCol if missing
     if (!valorCol) {
       let bestValCol = '';
@@ -1204,8 +1268,7 @@ export function autoDetectColumns(
       for (const h of headers) {
         if (isBudgetOrFonteHeader(normalize(h))) continue;
         if (h === fonteCol) continue;
-        const isColFonte = sample.some((row) => isFonteString(row[h]));
-        if (isColFonte) continue;
+        if (isSampleMostlyFonte(h)) continue;
 
         let numCount = 0;
         sample.forEach((row) => {
@@ -1229,13 +1292,12 @@ export function autoDetectColumns(
         if (parseCurrencyValue(row[valorCol]) > 0) positiveCount++;
       });
 
-      if (positiveCount === 0 || isBudgetOrFonteHeader(normalize(valorCol))) {
+      if (positiveCount === 0 || isBudgetOrFonteHeader(normalize(valorCol)) || isSampleMostlyFonte(valorCol)) {
         let altValCol = '';
         let altMatches = 0;
         for (const h of headers) {
           if (h === valorCol || isBudgetOrFonteHeader(normalize(h)) || h === fonteCol) continue;
-          const isColFonte = sample.some((row) => isFonteString(row[h]));
-          if (isColFonte) continue;
+          if (isSampleMostlyFonte(h)) continue;
 
           let count = 0;
           sample.forEach((row) => {
@@ -1569,16 +1631,73 @@ export function analyzeColumnsForStage(
       situacaoCol = situacaoObCol;
     }
   } else if (stage === 'obedece' || stage === 'nao_obedece') {
-    // Liquidação: Prioritize "valor da liquidacao" or "saldo a liquidar"
-    for (const h of headers) {
-      const norm = normalize(h);
-      if (
-        (norm.includes('liquidacao') || norm.includes('liquidac') || norm.includes('liquidar')) &&
-        (norm.includes('valor') || norm.includes('vlr') || norm.includes('saldo'))
-      ) {
-        valorCol = h;
-        break;
+    // Liquidação (Obedece / Não Obedece): seleção estrita por prioridade de cabeçalho com verificação de valores positivos reais
+    const hasPositiveValuesInSample = (col: string): boolean => {
+      if (sample.length === 0) return true;
+      return sample.some((r) => parseCurrencyValue(r[col]) > 0);
+    };
+    const isExcludedLiqValHeader = (norm: string): boolean =>
+      isFonteHeader(norm) ||
+      norm.includes('dotacao') ||
+      norm.includes('orcament') ||
+      norm.includes('retido') ||
+      norm.includes('retencao') ||
+      norm.includes('inss') ||
+      norm.includes('iss') ||
+      norm.includes('irrf') ||
+      norm.includes('desconto') ||
+      norm.includes('glosa');
+
+    const liqValPriorityKeywords = [
+      'valor a pagar',
+      'saldo a pagar',
+      'valor da liquidacao',
+      'valor liquidacao',
+      'valor liquidado',
+      'vlr da liquidacao',
+      'vlr liquidacao',
+      'vlr liquidado',
+      'valor da liq',
+      'valor da nl',
+      'valor nl',
+      'saldo liquidado',
+      'saldo da liquidacao',
+      'total liquidado',
+      'valor liquido',
+      'vlr liquido',
+      'valor liq',
+      'vlr liq',
+      'saldo a liquidar',
+      'valor atual',
+      'valor documento',
+      'valor doc',
+      'valor total',
+      'valor',
+      'vlr',
+    ];
+
+    let matchedLiqValCol = '';
+    for (const kw of liqValPriorityKeywords) {
+      for (const h of headers) {
+        if (h === fonteCol) continue;
+        const norm = normalize(h);
+        if (isExcludedLiqValHeader(norm)) continue;
+        if (
+          norm === kw ||
+          norm.startsWith(`${kw} `) ||
+          norm.endsWith(` ${kw}`) ||
+          norm.includes(` ${kw} `)
+        ) {
+          if (hasPositiveValuesInSample(h)) {
+            matchedLiqValCol = h;
+            break;
+          }
+        }
       }
+      if (matchedLiqValCol) break;
+    }
+    if (matchedLiqValCol) {
+      valorCol = matchedLiqValCol;
     }
     // Número da liquidação (NL): priorizar padrão \d{4}NL\d+ nas linhas ou cabeçalhos explícitos de documento/NL (nunca Valor/Data/Situação)
     let matchedNlDataCol = '';
@@ -2081,6 +2200,95 @@ export async function readSpreadsheetSheets(file: File): Promise<RawSheetResult[
       .replace(/[\u0300-\u036f]/g, '')
       .trim();
 
+  const isNaoObedeceSheet = (sName: string): boolean => {
+    const sn = normalizeSheet(sName).replace(/[^a-z0-9]/g, ' ').replace(/\s+/g, ' ').trim();
+    return (
+      sn.includes('nao obedece') ||
+      sn.includes('naoobedece') ||
+      (sn.includes('nao') && sn.includes('obedec')) ||
+      /(?:^|\s)n\s+obedec/.test(sn) ||
+      sn.includes('desobedece') ||
+      sn.includes('nao cron') ||
+      sn.includes('fora da ordem') ||
+      sn.includes('fora de ordem') ||
+      sn.includes('sem ordem')
+    );
+  };
+
+  const isObedeceSheet = (sName: string): boolean => {
+    if (isNaoObedeceSheet(sName)) return false;
+    const sn = normalizeSheet(sName).replace(/[^a-z0-9]/g, ' ').replace(/\s+/g, ' ').trim();
+    return sn.includes('obedece') || sn.includes('cronolog');
+  };
+
+  const isAuxiliarySheetName = (sName: string): boolean => {
+    const sn = normalizeSheet(sName);
+    return (
+      sn.includes('resumo') ||
+      sn.includes('modelo') ||
+      sn.includes('template') ||
+      sn.includes('backup') ||
+      sn.includes('bkp') ||
+      sn.includes('grafico') ||
+      sn.includes('dashboard') ||
+      sn.includes('capa')
+    );
+  };
+
+  // Extrai pontuação cronológica da data no nome da aba (ex: "Obedece - 19/11", "Obedece 19.11.2026", "Não Obedece - 19-11")
+  const extractDateScoreFromSheetName = (sName: string): number | null => {
+    const s = String(sName || '');
+    // YYYY-MM-DD ou YYYY/MM/DD
+    const isoMatch = s.match(/\b(20\d{2})[\/\-\._](\d{1,2})[\/\-\._](\d{1,2})\b/);
+    if (isoMatch) {
+      const y = parseInt(isoMatch[1], 10);
+      const m = parseInt(isoMatch[2], 10);
+      const d = parseInt(isoMatch[3], 10);
+      if (m >= 1 && m <= 12 && d >= 1 && d <= 31) return y * 10000 + m * 100 + d;
+    }
+    // DD/MM/YYYY ou DD-MM-YY ou DD.MM.YYYY
+    const fullBr = s.match(/\b(\d{1,2})[\/\-\._](\d{1,2})[\/\-\._](20\d{2}|\d{2})\b/);
+    if (fullBr) {
+      const d = parseInt(fullBr[1], 10);
+      const m = parseInt(fullBr[2], 10);
+      let y = parseInt(fullBr[3], 10);
+      if (y < 100) y += 2000;
+      if (m >= 1 && m <= 12 && d >= 1 && d <= 31) return y * 10000 + m * 100 + d;
+    }
+    // DD/MM ou DD-MM ou DD.MM ou DD_MM
+    const shortBr = s.match(/(?:^|[^0-9])(\d{1,2})[\/\-\._](\d{1,2})(?:$|[^0-9])/);
+    if (shortBr) {
+      const d = parseInt(shortBr[1], 10);
+      const m = parseInt(shortBr[2], 10);
+      if (m >= 1 && m <= 12 && d >= 1 && d <= 31) {
+        const currentYear = new Date().getFullYear();
+        return currentYear * 10000 + m * 100 + d;
+      }
+    }
+    return null;
+  };
+
+  const sortSheetsMostRecentLast = (names: string[]): string[] => {
+    const nonAux = names.filter((n) => !isAuxiliarySheetName(n));
+    const list = nonAux.length > 0 ? nonAux : names;
+    const indexed = list.map((name, idx) => ({
+      name,
+      idx,
+      dateScore: extractDateScoreFromSheetName(name),
+    }));
+    const hasAnyDate = indexed.some((x) => x.dateScore !== null);
+    if (!hasAnyDate) return list;
+    // Se houver mistura de abas com data e sem data, abas datadas têm prioridade sobre genéricas;
+    // ordenação ascendente por data (e índice original em empate) garante que a mais recente fique por último
+    indexed.sort((a, b) => {
+      const aScore = a.dateScore ?? -1;
+      const bScore = b.dateScore ?? -1;
+      if (aScore !== bScore) return aScore - bScore;
+      return a.idx - b.idx;
+    });
+    return indexed.map((x) => x.name);
+  };
+
   // Pass 1 (Metadata only): Discover SheetNames without inflating dense cells for irrelevant tabs
   let targetSheetsFilter: string[] | undefined;
   if (isObsSigefPrincipal || isProcessamentoDeDados) {
@@ -2095,15 +2303,9 @@ export async function readSpreadsheetSheets(file: File): Promise<RawSheetResult[
           targetSheetsFilter = [pagina3];
         }
       } else if (isProcessamentoDeDados && allSheetNames.length > 0) {
-        const obedeceNames = allSheetNames.filter((sName) => {
-          const sn = normalizeSheet(sName);
-          return sn.includes('obedece') && !sn.includes('nao');
-        });
-        const naoObedeceNames = allSheetNames.filter((sName) => {
-          const sn = normalizeSheet(sName);
-          return sn.includes('nao obedece') || (sn.includes('nao') && sn.includes('obedec'));
-        });
-        // Keep last 2 candidates of each type so only the latest valid tabs are unzipped into memory
+        const obedeceNames = sortSheetsMostRecentLast(allSheetNames.filter(isObedeceSheet));
+        const naoObedeceNames = sortSheetsMostRecentLast(allSheetNames.filter(isNaoObedeceSheet));
+        // Mantém as 2 abas cronologicamente mais recentes de cada tipo (independente de estarem à esquerda ou à direita)
         const picked = [
           ...obedeceNames.slice(-2),
           ...naoObedeceNames.slice(-2),
@@ -2277,11 +2479,35 @@ export async function readSpreadsheetSheets(file: File): Promise<RawSheetResult[
         continue;
       }
       try {
+        const sheetRange = XLSX.utils.decode_range(ws['!ref']);
+        const merges = ws['!merges'] as Array<{ s: { r: number; c: number }; e: { r: number; c: number } }> | undefined;
         const sheetRows: any[][] = XLSX.utils.sheet_to_json(ws, {
           header: 1,
           defval: '',
-          blankrows: false,
+          blankrows: Boolean(merges && merges.length > 0),
         });
+        // Propaga células mescladas verticalmente (apenas identificadores textuais como Favorecido/CNPJ/Processo — nunca valores monetários)
+        if (merges && merges.length > 0 && sheetRows.length > 0) {
+          for (let mIdx = 0; mIdx < merges.length; mIdx++) {
+            const m = merges[mIdx];
+            if (m.s.c !== m.e.c || m.e.r <= m.s.r) continue;
+            const startR = m.s.r - sheetRange.s.r;
+            const endR = Math.min(m.e.r - sheetRange.s.r, sheetRows.length - 1);
+            const colIdx = m.s.c - sheetRange.s.c;
+            if (startR < 0 || colIdx < 0 || startR >= sheetRows.length) continue;
+            const topVal = sheetRows[startR]?.[colIdx];
+            if (typeof topVal !== 'string') continue;
+            const trimmedTop = topVal.trim();
+            if (!trimmedTop || /^R?\$?\s*[\d.,]+$/.test(trimmedTop)) continue;
+            for (let r = startR + 1; r <= endR; r++) {
+              if (!sheetRows[r]) continue;
+              const cur = sheetRows[r][colIdx];
+              if (cur === undefined || cur === null || String(cur).trim() === '') {
+                sheetRows[r][colIdx] = topVal;
+              }
+            }
+          }
+        }
         // Release each SheetJS dense worksheet immediately after conversion
         delete workbook.Sheets[sName];
         if (!sheetRows || sheetRows.length === 0) continue;
@@ -2305,67 +2531,72 @@ export async function readSpreadsheetSheets(file: File): Promise<RawSheetResult[
 
     // Check for distinct functional stages across sheets
     // (e.g. "Processamento de dados" having "Obedece - DD/MM" and "Não Obedece - DD/MM")
+    const hasDistinctStages =
+      sheetItems.length > 1 &&
+      (sheetItems.some((s) => s.stage === 'obedece') || sheetItems.some((s) => isObedeceSheet(s.name))) &&
+      (sheetItems.some((s) => s.stage === 'nao_obedece') || sheetItems.some((s) => isNaoObedeceSheet(s.name)));
 
-          const hasDistinctStages =
-            sheetItems.length > 1 &&
-            (sheetItems.some((s) => s.stage === 'obedece') || sheetItems.some((s) => s.name.toLowerCase().includes('obedece'))) &&
-            (sheetItems.some((s) => s.stage === 'nao_obedece') || sheetItems.some((s) => s.name.toLowerCase().includes('nao') || s.name.toLowerCase().includes('não')));
+    const hasMultipleKnownStages =
+      sheetItems.length > 1 &&
+      sheetItems.some((s) => s.stage !== 'outros');
 
-          const hasMultipleKnownStages =
-            sheetItems.length > 1 &&
-            sheetItems.some((s) => s.stage !== 'outros');
+    if (isProcessamentoDeDados) {
+      // STRICT FILTER FOR "Processamento de dados":
+      // Keeps only the chronologically latest valid liquidation sheets for "Obedece" and "Não Obedece"
+      const sortItemsMostRecentLast = (items: typeof sheetItems) => {
+        const order = sortSheetsMostRecentLast(items.map((x) => x.name));
+        const byName = new Map(items.map((x) => [x.name, x]));
+        return order.map((n) => byName.get(n)!).filter(Boolean);
+      };
 
-          if (isProcessamentoDeDados) {
-            // STRICT FILTER FOR "Processamento de dados":
-            // Keeps only the latest valid liquidation sheets for "Obedece" and "Não Obedece"
-            const obedeceCandidates = sheetItems.filter((s) => {
-              if (s.stage === 'obedece') return true;
-              const sn = s.name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-              return sn.includes('obedece') && !sn.includes('nao');
-            });
+      const obedeceCandidates = sortItemsMostRecentLast(
+        sheetItems.filter(
+          (s) =>
+            !isNaoObedeceSheet(s.name) &&
+            s.stage !== 'nao_obedece' &&
+            (s.stage === 'obedece' || isObedeceSheet(s.name))
+        )
+      );
+      const naoObedeceCandidates = sortItemsMostRecentLast(
+        sheetItems.filter((s) => s.stage === 'nao_obedece' || isNaoObedeceSheet(s.name))
+      );
 
-            const naoObedeceCandidates = sheetItems.filter((s) => {
-              if (s.stage === 'nao_obedece') return true;
-              const sn = s.name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-              return sn.includes('nao obedece') || (sn.includes('nao') && sn.includes('obedec'));
-            });
+      const pickLastValidMatrix = (candidates: typeof sheetItems) => {
+        for (let i = candidates.length - 1; i >= 0; i--) {
+          const cleanMatrix = cleanAndFilterMatrix(candidates[i].rows);
+          if (cleanMatrix.length >= 2) {
+            return { item: candidates[i], matrix: cleanMatrix };
+          }
+        }
+        if (candidates.length > 0) {
+          const last = candidates[candidates.length - 1];
+          const cleanMatrix = cleanAndFilterMatrix(last.rows);
+          if (cleanMatrix.length > 0) {
+            return { item: last, matrix: cleanMatrix };
+          }
+        }
+        return null;
+      };
 
-            const pickLastValidMatrix = (candidates: typeof sheetItems) => {
-              for (let i = candidates.length - 1; i >= 0; i--) {
-                const cleanMatrix = cleanAndFilterMatrix(candidates[i].rows);
-                if (cleanMatrix.length >= 2) {
-                  return { item: candidates[i], matrix: cleanMatrix };
-                }
-              }
-              if (candidates.length > 0) {
-                const last = candidates[candidates.length - 1];
-                const cleanMatrix = cleanAndFilterMatrix(last.rows);
-                if (cleanMatrix.length > 0) {
-                  return { item: last, matrix: cleanMatrix };
-                }
-              }
-              return null;
-            };
+      const pickedObedece = pickLastValidMatrix(obedeceCandidates);
+      const pickedNaoObedece = pickLastValidMatrix(naoObedeceCandidates);
 
-            const pickedObedece = pickLastValidMatrix(obedeceCandidates);
-            const pickedNaoObedece = pickLastValidMatrix(naoObedeceCandidates);
+      const results: RawSheetResult[] = [];
+      if (pickedObedece) {
+        results.push({
+          sheetName: pickedObedece.item.name,
+          matrix: pickedObedece.matrix,
+          stage: 'obedece',
+        });
+      }
 
-            const results: RawSheetResult[] = [];
-            if (pickedObedece) {
-              results.push({
-                sheetName: pickedObedece.item.name,
-                matrix: pickedObedece.matrix,
-                stage: 'obedece',
-              });
-            }
-
-            if (pickedNaoObedece) {
-              results.push({
-                sheetName: pickedNaoObedece.item.name,
-                matrix: pickedNaoObedece.matrix,
-                stage: 'nao_obedece',
-              });
-            }
+      if (pickedNaoObedece) {
+        results.push({
+          sheetName: pickedNaoObedece.item.name,
+          matrix: pickedNaoObedece.matrix,
+          stage: 'nao_obedece',
+        });
+      }
 
       if (results.length > 0) {
         return results;
@@ -2695,11 +2926,15 @@ export function parseMatrixToFileData(
 
       if (nonEmptyCells.length < 2) continue;
 
-      const hasDataCodeInRow = cleanCells.some(
-        (c) =>
-          /\b\d{4}(?:OB|PP|NL|NE|OP)\d+\b/i.test(c) ||
-          /\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}/.test(c)
-      );
+      const hasDataCodeInRow =
+        row.some((c) => typeof c === 'number' && Math.abs(c) >= 10) ||
+        cleanCells.some(
+          (c) =>
+            /\b\d{4}(?:OB|PP|NL|NE|OP)\d+\b/i.test(c) ||
+            /\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}/.test(c) ||
+            /\b\d{2}\/\d{2}\/\d{4}\b/.test(c) ||
+            /R\$\s*\d|\d{1,3}(?:\.\d{3})*,\d{2}/.test(c)
+        );
       if (hasDataCodeInRow) continue;
 
       let score = 0;
@@ -2817,14 +3052,15 @@ export function parseMatrixToFileData(
       const trimmed = cell.trim();
       if (!trimmed) continue;
       const c0 = trimmed.charCodeAt(0);
-      // Fast filter: summary prefixes only begin with C/c, R/r, T/t, S/s, D/d, Q/q
+      // Fast filter: summary prefixes only begin with C/c, R/r, T/t, S/s, D/d, Q/q, V/v
       if (
-        c0 === 67 || c0 === 99 || // C / c
+        c0 === 67 || c0 === 99 ||  // C / c
         c0 === 82 || c0 === 114 || // R / r
         c0 === 84 || c0 === 116 || // T / t
         c0 === 83 || c0 === 115 || // S / s
         c0 === 68 || c0 === 100 || // D / d
-        c0 === 81 || c0 === 113    // Q / q
+        c0 === 81 || c0 === 113 || // Q / q
+        c0 === 86 || c0 === 118    // V / v
       ) {
         const s = trimmed.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
         if (
@@ -2832,8 +3068,18 @@ export function parseMatrixToFileData(
           s.startsWith('relatorio emitido em') ||
           s === 'total' ||
           s === 'subtotal' ||
+          s === 'soma' ||
+          s === 'soma total' ||
+          s === 'valor total' ||
           s === 'total geral' ||
+          s.startsWith('total:') ||
+          s.startsWith('total -') ||
+          s.startsWith('total r$') ||
           s.startsWith('total geral') ||
+          s.startsWith('total obedece') ||
+          s.startsWith('total nao obedece') ||
+          s.startsWith('total liquidac') ||
+          s.startsWith('total a pagar') ||
           s.startsWith('total do orgao') ||
           s.startsWith('total da unidade') ||
           s.startsWith('total da despesa') ||
@@ -3122,6 +3368,7 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
     }
 
     const isBasePpsStage = stage === 'base_pps' || stage === 'pp_prontas';
+    const fileTxOccurrences = new Map<string, number>();
 
     file.rows.forEach((row, rowIdx) => {
       let rawFav = row[favCol];
@@ -3228,8 +3475,10 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
         name !== '-' &&
         name !== '0' &&
         name !== 'N/I' &&
+        !/^\d+(?:[.,]\d+)?$/.test(name.trim()) &&
         !name.startsWith('FORNECEDOR_REG') &&
-        !/^(TOTAL|SUBTOTAL|RESUMO|QUANTIDADE|EMITIDO|SALDO|DOTAÇÃO|DOTACAO|ORGAO|UNIDADE|FONTE|ELEMENTO|CELULA|CÉLULA)/i.test(name.trim())
+        (looksLikeRealCompanyOrDocument(name.trim().toLowerCase(), rawNumero) ||
+          !/^(TOTAL|SUBTOTAL|SOMA|RESUMO|QUANTIDADE|EMITIDO|SALDO|DOTAÇÃO|DOTACAO|ORGAO|UNIDADE|FONTE|ELEMENTO|CELULA|CÉLULA)(\s|$|:|-)/i.test(name.trim()))
       ) {
         groupKey = 'NAME_' + name.trim().toUpperCase();
       } else {
@@ -3358,17 +3607,15 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
 
       let txKey = '';
       if (stage === 'obedece' || stage === 'nao_obedece') {
-        const uniquenessSuffix =
-          !numDoc && !neDoc
-            ? `_${groupKey}_${file.id}_${rowIdx}`
-            : !numDoc
-            ? `_${groupKey}`
-            : '';
-        txKey =
+        const baseLiqKey =
           `LIQ_${stage}_${numDoc || 'S_N'}` +
           (neDoc ? `_NE_${neDoc}` : '') +
-          (valCents > 0 ? `_${valCents}` : '') +
-          uniquenessSuffix;
+          `_${groupKey}_${valCents}`;
+        // Conta ocorrências dentro do MESMO arquivo para nunca descartar linhas legítimas de mesmo fornecedor/NE/valor,
+        // mantendo a deduplicação entre arquivos repetidos (#1 casa com #1, #2 casa com #2)
+        const occ = (fileTxOccurrences.get(baseLiqKey) || 0) + 1;
+        fileTxOccurrences.set(baseLiqKey, occ);
+        txKey = occ > 1 ? `${baseLiqKey}_#${occ}` : baseLiqKey;
       } else if (numDoc && (/\b\d{4}PP\d+\b/i.test(numDoc) || stage === 'base_pps' || stage === 'pp_prontas')) {
         // Cada proposta de pagamento é única no SIGEF. Se houver desdobramento por NE, inclui a NE
         txKey = `PP_${numDoc}` + (neDoc ? `_NE_${neDoc}` : '') + (valCents > 0 ? `_${valCents}` : '');
@@ -3806,6 +4053,7 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
   // Filtrar favorecidos válidos (removendo qualquer registro fantasma, totalizador ou cabeçalho)
   const consolidatedSuppliers: ConsolidatedSupplier[] = Object.values(supplierMap).filter((s) => {
     const cleanName = (s.name || '').trim().toUpperCase();
+    const hasValidCnpj = cleanDigits(s.cnpj).length >= 11;
     if (
       !cleanName ||
       cleanName === 'NÃO INFORMADO' ||
@@ -3813,7 +4061,9 @@ export function processUploadedFiles(files: FileData[]): DashboardMetrics {
       cleanName.startsWith('FORNECEDOR_REG') ||
       cleanName.startsWith('CNPJ_RAW_') ||
       cleanName.startsWith('NAME_') ||
-      /^(TOTAL|SUBTOTAL|RESUMO|QUANTIDADE|EMITIDO|SALDO|DOTAÇÃO|DOTACAO|ORGAO|UNIDADE|FONTE|ELEMENTO|CELULA|CÉLULA)/i.test(cleanName)
+      (!hasValidCnpj &&
+        !looksLikeRealCompanyOrDocument(cleanName.toLowerCase()) &&
+        /^(TOTAL|SUBTOTAL|SOMA|RESUMO|QUANTIDADE|EMITIDO|SALDO|DOTAÇÃO|DOTACAO|ORGAO|UNIDADE|FONTE|ELEMENTO|CELULA|CÉLULA)(\s|$|:|-)/i.test(cleanName))
     ) {
       return false;
     }
