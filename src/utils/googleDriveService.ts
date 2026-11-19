@@ -10,6 +10,7 @@
 // Production Client ID configured in Google Cloud Console
 import {
   scheduleBackgroundInterval,
+  scheduleBackgroundTimeout,
   withActiveProcessingLock,
   onTabReturnToForeground,
 } from './backgroundScheduler';
@@ -17,6 +18,8 @@ import {
 export const GOOGLE_CLIENT_ID = '866738622063-trtjudvl95g2c3lu0fhga9q79nn4eol6.apps.googleusercontent.com';
 
 export const DRIVE_DATABASE_FOLDER_NAME = 'Painel_Financeiro_SESAP_Dados';
+const DRIVE_SESSION_STORAGE_KEY = 'sesap_drive_session_v1';
+const TOKEN_REFRESH_LEAD_MS = 4 * 60 * 1000; // Renova silenciosamente 4 min antes de expirar
 
 // Scopes supporting spreadsheet reading and dedicated app database folder storage
 export const GOOGLE_DRIVE_SCOPES = [
@@ -49,7 +52,7 @@ export interface GoogleDriveState {
 type Subscriber = (state: GoogleDriveState) => void;
 
 interface TokenClient {
-  requestAccessToken: (options?: { prompt?: string }) => void;
+  requestAccessToken: (options?: { prompt?: string; hint?: string }) => void;
 }
 
 interface TokenResponse {
@@ -57,6 +60,14 @@ interface TokenResponse {
   error?: string;
   error_description?: string;
   expires_in?: number;
+}
+
+interface PersistedDriveSession {
+  accessToken: string;
+  tokenExpiresAt: number;
+  userEmail: string | null;
+  wasConnected: boolean;
+  cachedDatabaseFolderId?: string | null;
 }
 
 declare global {
@@ -67,6 +78,7 @@ declare global {
           initTokenClient: (config: {
             client_id: string;
             scope: string;
+            hint?: string;
             callback: (response: TokenResponse) => void;
             error_callback?: (err: any) => void;
           }) => TokenClient;
@@ -80,10 +92,13 @@ declare global {
 class GoogleDriveService {
   private accessToken: string | null = null;
   private tokenExpiresAt: number = 0;
+  private wasConnected: boolean = false;
   private tokenClient: TokenClient | null = null;
   private subscribers: Set<Subscriber> = new Set();
   private stopPollingFn: (() => void) | null = null;
   private stopForegroundListenerFn: (() => void) | null = null;
+  private cancelTokenRefreshFn: (() => void) | null = null;
+  private silentReconnectInFlight: Promise<boolean> | null = null;
   private lastPollCheckAt: number = 0;
   private isBackgroundPollRunning: boolean = false;
   private cachedDatabaseFolderId: string | null = null;
@@ -105,6 +120,8 @@ class GoogleDriveService {
 
   constructor() {
     this.loadPersistedMetadata();
+    this.restorePersistedSession();
+    this.initCrossTabSync();
   }
 
   private loadPersistedMetadata() {
@@ -123,6 +140,135 @@ class GoogleDriveService {
     } catch (e) {
       // Ignore localStorage errors
     }
+  }
+
+  private persistSession() {
+    try {
+      if (!this.wasConnected && !this.accessToken) {
+        localStorage.removeItem(DRIVE_SESSION_STORAGE_KEY);
+        return;
+      }
+      const payload: PersistedDriveSession = {
+        accessToken: this.accessToken || '',
+        tokenExpiresAt: this.tokenExpiresAt || 0,
+        userEmail: this.state.userEmail,
+        wasConnected: this.wasConnected,
+        cachedDatabaseFolderId: this.cachedDatabaseFolderId,
+      };
+      localStorage.setItem(DRIVE_SESSION_STORAGE_KEY, JSON.stringify(payload));
+    } catch {
+      // Ignore localStorage quota/privacy errors
+    }
+  }
+
+  private clearPersistedSession() {
+    try {
+      localStorage.removeItem(DRIVE_SESSION_STORAGE_KEY);
+    } catch {
+      // Ignore localStorage errors
+    }
+  }
+
+  private restorePersistedSession() {
+    try {
+      const raw = localStorage.getItem(DRIVE_SESSION_STORAGE_KEY);
+      if (!raw) return;
+      const saved = JSON.parse(raw) as PersistedDriveSession;
+      if (!saved || !saved.wasConnected) return;
+
+      this.wasConnected = true;
+      if (saved.cachedDatabaseFolderId) {
+        this.cachedDatabaseFolderId = saved.cachedDatabaseFolderId;
+      }
+      if (saved.userEmail && !this.state.userEmail) {
+        this.state.userEmail = saved.userEmail;
+      }
+
+      if (saved.accessToken && saved.tokenExpiresAt && Date.now() < saved.tokenExpiresAt) {
+        // Token ainda válido: restaura conexão imediatamente após F5 / recarregamento
+        this.accessToken = saved.accessToken;
+        this.tokenExpiresAt = saved.tokenExpiresAt;
+        this.state = {
+          ...this.state,
+          isConnected: true,
+          status: 'connected',
+          userEmail: saved.userEmail || this.state.userEmail || 'Google Drive Conectado',
+          errorMessage: null,
+        };
+        this.scheduleProactiveTokenRefresh();
+      } else {
+        // Token expirou enquanto a página estava fechada: tenta renovação silenciosa em segundo plano
+        scheduleBackgroundTimeout(() => {
+          this.trySilentReconnect().catch(() => {});
+        }, 400);
+      }
+    } catch {
+      // Ignore malformed session data
+    }
+  }
+
+  private initCrossTabSync() {
+    if (typeof window === 'undefined') return;
+    window.addEventListener('storage', (ev: StorageEvent) => {
+      if (ev.key !== DRIVE_SESSION_STORAGE_KEY) return;
+      if (!ev.newValue) {
+        // Outra aba desconectou a conta Google
+        this.stopAutoPolling();
+        this.cancelProactiveTokenRefresh();
+        this.accessToken = null;
+        this.tokenExpiresAt = 0;
+        this.wasConnected = false;
+        this.cachedDatabaseFolderId = null;
+        this.setState({
+          isConnected: false,
+          status: 'idle',
+          errorMessage: null,
+          autoPollingEnabled: false,
+        });
+        return;
+      }
+      try {
+        const updated = JSON.parse(ev.newValue) as PersistedDriveSession;
+        if (updated?.wasConnected && updated.accessToken && Date.now() < updated.tokenExpiresAt) {
+          this.wasConnected = true;
+          this.accessToken = updated.accessToken;
+          this.tokenExpiresAt = updated.tokenExpiresAt;
+          if (updated.cachedDatabaseFolderId) {
+            this.cachedDatabaseFolderId = updated.cachedDatabaseFolderId;
+          }
+          this.setState({
+            isConnected: true,
+            status: 'connected',
+            userEmail: updated.userEmail || this.state.userEmail || 'Google Drive Conectado',
+            errorMessage: null,
+          });
+          this.scheduleProactiveTokenRefresh();
+          if (this.onNewFileCallback && !this.stopPollingFn) {
+            this.startAutoPolling();
+          }
+        }
+      } catch {
+        // Ignore malformed storage payload
+      }
+    });
+  }
+
+  private cancelProactiveTokenRefresh() {
+    if (this.cancelTokenRefreshFn) {
+      this.cancelTokenRefreshFn();
+      this.cancelTokenRefreshFn = null;
+    }
+  }
+
+  private scheduleProactiveTokenRefresh() {
+    this.cancelProactiveTokenRefresh();
+    if (!this.wasConnected || !this.tokenExpiresAt) return;
+    const msUntilRefresh = Math.max(15000, this.tokenExpiresAt - Date.now() - TOKEN_REFRESH_LEAD_MS);
+    this.cancelTokenRefreshFn = scheduleBackgroundTimeout(() => {
+      if (this.wasConnected) {
+        this.trySilentReconnect().catch(() => {});
+      }
+    }, msUntilRefresh);
   }
 
   private persistMetadata() {
@@ -219,6 +365,153 @@ class GoogleDriveService {
   }
 
   /**
+   * Tenta renovar o token OAuth silenciosamente (sem abrir popup) usando o e-mail salvo.
+   */
+  public async trySilentReconnect(): Promise<boolean> {
+    if (!this.wasConnected) return false;
+    if (this.accessToken && Date.now() < this.tokenExpiresAt - TOKEN_REFRESH_LEAD_MS) {
+      return true;
+    }
+    if (this.silentReconnectInFlight) {
+      return this.silentReconnectInFlight;
+    }
+
+    this.silentReconnectInFlight = (async () => {
+      try {
+        await this.loadGisScript();
+        if (!window.google?.accounts?.oauth2) return false;
+
+        const hintEmail =
+          this.state.userEmail && this.state.userEmail.includes('@')
+            ? this.state.userEmail
+            : undefined;
+
+        return await new Promise<boolean>((resolve) => {
+          let settled = false;
+          const finish = (ok: boolean) => {
+            if (settled) return;
+            settled = true;
+            cancelTimeout();
+            resolve(ok);
+          };
+
+          const cancelTimeout = scheduleBackgroundTimeout(() => {
+            finish(false);
+          }, 8000);
+
+          try {
+            const client = window.google!.accounts!.oauth2!.initTokenClient({
+              client_id: GOOGLE_CLIENT_ID,
+              scope: GOOGLE_DRIVE_SCOPES,
+              ...(hintEmail ? { hint: hintEmail } : {}),
+              callback: async (tokenResponse: TokenResponse) => {
+                if (tokenResponse.error || !tokenResponse.access_token) {
+                  finish(false);
+                  return;
+                }
+                this.accessToken = tokenResponse.access_token;
+                const expiresInSec = tokenResponse.expires_in || 3600;
+                this.tokenExpiresAt = Date.now() + (expiresInSec - 60) * 1000;
+                this.wasConnected = true;
+
+                this.setState({
+                  isConnected: true,
+                  status: 'connected',
+                  userEmail: this.state.userEmail || 'Google Drive Conectado',
+                  errorMessage: null,
+                });
+                this.persistSession();
+                this.scheduleProactiveTokenRefresh();
+
+                if (this.onNewFileCallback && !this.stopPollingFn) {
+                  this.startAutoPolling();
+                }
+                finish(true);
+              },
+              error_callback: () => {
+                finish(false);
+              },
+            });
+
+            client.requestAccessToken({
+              prompt: 'none',
+              ...(hintEmail ? { hint: hintEmail } : {}),
+            });
+          } catch {
+            finish(false);
+          }
+        });
+      } catch {
+        return false;
+      } finally {
+        this.silentReconnectInFlight = null;
+      }
+    })();
+
+    return this.silentReconnectInFlight;
+  }
+
+  /**
+   * Garante um accessToken válido, tentando renovação silenciosa antes de recorrer ao popup.
+   */
+  private async ensureValidAccessToken(allowInteractive: boolean = false): Promise<string> {
+    if (this.accessToken && Date.now() < this.tokenExpiresAt) {
+      return this.accessToken;
+    }
+
+    if (this.wasConnected) {
+      const renewed = await this.trySilentReconnect();
+      if (renewed && this.accessToken && Date.now() < this.tokenExpiresAt) {
+        return this.accessToken;
+      }
+    }
+
+    if (allowInteractive) {
+      const ok = await this.connectGoogleDrive();
+      if (ok && this.accessToken) {
+        return this.accessToken;
+      }
+    }
+
+    throw new Error('Sessão do Google Drive expirada. Clique em "Conectar Conta Google" para reconectar.');
+  }
+
+  /**
+   * Executa fetch autenticado na API do Google Drive com recuperação automática em caso de HTTP 401.
+   */
+  private async authorizedFetch(
+    input: string,
+    init: RequestInit = {},
+    allowInteractive: boolean = false
+  ): Promise<Response> {
+    const token = await this.ensureValidAccessToken(allowInteractive);
+    const headers = new Headers(init.headers || {});
+    headers.set('Authorization', `Bearer ${token}`);
+
+    let res = await fetch(input, { ...init, headers });
+
+    if (res.status === 401) {
+      // Token foi revogado ou expirou antecipadamente no servidor do Google: renova e tenta uma vez
+      this.accessToken = null;
+      this.tokenExpiresAt = 0;
+      const renewed = await this.trySilentReconnect();
+      if (renewed && this.accessToken) {
+        const retryHeaders = new Headers(init.headers || {});
+        retryHeaders.set('Authorization', `Bearer ${this.accessToken}`);
+        res = await fetch(input, { ...init, headers: retryHeaders });
+      } else {
+        this.setState({
+          isConnected: false,
+          status: 'idle',
+          errorMessage: null,
+        });
+      }
+    }
+
+    return res;
+  }
+
+  /**
    * Connect to Google Drive using OAuth2 (Popup Flow via Google Identity Services)
    */
   public async connectGoogleDrive(): Promise<boolean> {
@@ -231,11 +524,17 @@ class GoogleDriveService {
         throw new Error('Google Identity Services não inicializado.');
       }
 
+      const hintEmail =
+        this.state.userEmail && this.state.userEmail.includes('@')
+          ? this.state.userEmail
+          : undefined;
+
       return new Promise<boolean>((resolve, reject) => {
         try {
           this.tokenClient = window.google!.accounts!.oauth2!.initTokenClient({
             client_id: GOOGLE_CLIENT_ID,
             scope: GOOGLE_DRIVE_SCOPES,
+            ...(hintEmail ? { hint: hintEmail } : {}),
             callback: async (tokenResponse: TokenResponse) => {
               if (tokenResponse.error) {
                 this.setState({
@@ -251,6 +550,7 @@ class GoogleDriveService {
                 this.accessToken = tokenResponse.access_token;
                 const expiresInSec = tokenResponse.expires_in || 3600;
                 this.tokenExpiresAt = Date.now() + (expiresInSec - 60) * 1000;
+                this.wasConnected = true;
 
                 // Attempt to fetch user identity (email) silently
                 let userEmail: string | null = null;
@@ -272,8 +572,10 @@ class GoogleDriveService {
                   userEmail: userEmail || this.state.userEmail || 'Google Drive Conectado',
                   errorMessage: null,
                 });
+                this.persistSession();
+                this.scheduleProactiveTokenRefresh();
 
-                // Start background 15-minute polling if callback is registered
+                // Start background polling if callback is registered
                 if (this.onNewFileCallback) {
                   this.startAutoPolling();
                 }
@@ -299,8 +601,11 @@ class GoogleDriveService {
             },
           });
 
-          // Open Google OAuth consent popup
-          this.tokenClient.requestAccessToken({ prompt: '' });
+          // Open Google OAuth consent popup (usa hint se houver conta salva)
+          this.tokenClient.requestAccessToken({
+            prompt: '',
+            ...(hintEmail ? { hint: hintEmail } : {}),
+          });
         } catch (err: any) {
           this.setState({
             status: 'error',
@@ -321,7 +626,7 @@ class GoogleDriveService {
   }
 
   /**
-   * Disconnect from Google Drive & clear in-memory tokens
+   * Disconnect from Google Drive & clear both in-memory and persisted tokens
    */
   public disconnectGoogleDrive(): void {
     if (this.accessToken && window.google?.accounts?.oauth2?.revoke) {
@@ -333,9 +638,12 @@ class GoogleDriveService {
     }
 
     this.stopAutoPolling();
+    this.cancelProactiveTokenRefresh();
     this.accessToken = null;
     this.tokenExpiresAt = 0;
+    this.wasConnected = false;
     this.cachedDatabaseFolderId = null;
+    this.clearPersistedSession();
     this.setState({
       isConnected: false,
       status: 'idle',
@@ -353,16 +661,7 @@ class GoogleDriveService {
    * creating it automatically if not found, and returns its folder ID.
    */
   public async ensureDatabaseFolder(): Promise<string> {
-    if (!this.accessToken) {
-      throw new Error('Usuário não autenticado no Google Drive.');
-    }
-
-    if (Date.now() >= this.tokenExpiresAt) {
-      await this.connectGoogleDrive();
-      if (!this.accessToken) {
-        throw new Error('Sessão do Google Drive expirada.');
-      }
-    }
+    await this.ensureValidAccessToken(false);
 
     if (this.cachedDatabaseFolderId) {
       return this.cachedDatabaseFolderId;
@@ -376,9 +675,7 @@ class GoogleDriveService {
     searchUrl.searchParams.set('spaces', 'drive');
     searchUrl.searchParams.set('fields', 'files(id, name)');
 
-    const searchRes = await fetch(searchUrl.toString(), {
-      headers: { Authorization: `Bearer ${this.accessToken}` },
-    });
+    const searchRes = await this.authorizedFetch(searchUrl.toString());
 
     if (!searchRes.ok) {
       const errJson = await searchRes.json().catch(() => ({}));
@@ -388,14 +685,14 @@ class GoogleDriveService {
     const searchData = await searchRes.json();
     if (Array.isArray(searchData.files) && searchData.files.length > 0) {
       this.cachedDatabaseFolderId = searchData.files[0].id;
+      this.persistSession();
       return this.cachedDatabaseFolderId!;
     }
 
     // Create dedicated database folder
-    const createRes = await fetch('https://www.googleapis.com/drive/v3/files?fields=id,name', {
+    const createRes = await this.authorizedFetch('https://www.googleapis.com/drive/v3/files?fields=id,name', {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${this.accessToken}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -411,6 +708,7 @@ class GoogleDriveService {
 
     const folderData = await createRes.json();
     this.cachedDatabaseFolderId = folderData.id;
+    this.persistSession();
     return this.cachedDatabaseFolderId!;
   }
 
@@ -426,9 +724,7 @@ class GoogleDriveService {
       findUrl.searchParams.set('q', `name='${escapedName}' and '${folderId}' in parents and trashed=false`);
       findUrl.searchParams.set('fields', 'files(id, name)');
 
-      const findRes = await fetch(findUrl.toString(), {
-        headers: { Authorization: `Bearer ${this.accessToken}` },
-      });
+      const findRes = await this.authorizedFetch(findUrl.toString());
 
       if (!findRes.ok) {
         throw new Error(`Erro ao verificar arquivo "${fileName}" na pasta (${findRes.status})`);
@@ -439,12 +735,11 @@ class GoogleDriveService {
 
       if (existingFile?.id) {
         // Update existing file content inside dedicated folder
-        const patchRes = await fetch(
+        const patchRes = await this.authorizedFetch(
           `https://www.googleapis.com/upload/drive/v3/files/${existingFile.id}?uploadType=media`,
           {
             method: 'PATCH',
             headers: {
-              Authorization: `Bearer ${this.accessToken}`,
               'Content-Type': 'application/json',
             },
             body: jsonContent,
@@ -473,12 +768,11 @@ class GoogleDriveService {
         `${jsonContent}\r\n` +
         `--${boundary}--`;
 
-      const createRes = await fetch(
+      const createRes = await this.authorizedFetch(
         'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name',
         {
           method: 'POST',
           headers: {
-            Authorization: `Bearer ${this.accessToken}`,
             'Content-Type': `multipart/related; boundary="${boundary}"`,
           },
           body: multipartBody,
@@ -509,18 +803,14 @@ class GoogleDriveService {
       findUrl.searchParams.set('orderBy', 'modifiedTime desc');
       findUrl.searchParams.set('fields', 'files(id, name, modifiedTime)');
 
-      const findRes = await fetch(findUrl.toString(), {
-        headers: { Authorization: `Bearer ${this.accessToken}` },
-      });
+      const findRes = await this.authorizedFetch(findUrl.toString());
 
       if (!findRes.ok) return null;
       const findData = await findRes.json();
       const targetFile = Array.isArray(findData.files) && findData.files.length > 0 ? findData.files[0] : null;
       if (!targetFile?.id) return null;
 
-      const mediaRes = await fetch(`https://www.googleapis.com/drive/v3/files/${targetFile.id}?alt=media`, {
-        headers: { Authorization: `Bearer ${this.accessToken}` },
-      });
+      const mediaRes = await this.authorizedFetch(`https://www.googleapis.com/drive/v3/files/${targetFile.id}?alt=media`);
       if (!mediaRes.ok) return null;
 
       return await mediaRes.json();
@@ -543,17 +833,7 @@ class GoogleDriveService {
    * 3. Latest SIGEF / PP / OB report
    */
   public async fetchRelevantFinancialMetadataList(): Promise<DriveFileMetadata[]> {
-    if (!this.accessToken) {
-      throw new Error('Usuário não autenticado no Google Drive.');
-    }
-
-    // Check token expiration
-    if (Date.now() >= this.tokenExpiresAt) {
-      await this.connectGoogleDrive();
-      if (!this.accessToken) {
-        throw new Error('Sessão expirada. Por favor, reconecte ao Google Drive.');
-      }
-    }
+    await this.ensureValidAccessToken(false);
 
     // Search query: Spreadsheets, Excel files, and CSVs grouped cleanly with financial keywords
     const query =
@@ -586,11 +866,7 @@ class GoogleDriveService {
     url.searchParams.set('includeItemsFromAllDrives', 'true');
     url.searchParams.set('fields', 'files(id, name, mimeType, modifiedTime, size)');
 
-    const res = await fetch(url.toString(), {
-      headers: {
-        Authorization: `Bearer ${this.accessToken}`,
-      },
-    });
+    const res = await this.authorizedFetch(url.toString());
 
     if (!res.ok) {
       const errJson = await res.json().catch(() => ({}));
@@ -608,9 +884,7 @@ class GoogleDriveService {
       fallbackUrl.searchParams.set('pageSize', '10');
       fallbackUrl.searchParams.set('fields', 'files(id, name, mimeType, modifiedTime, size)');
 
-      const fallbackRes = await fetch(fallbackUrl.toString(), {
-        headers: { Authorization: `Bearer ${this.accessToken}` },
-      });
+      const fallbackRes = await this.authorizedFetch(fallbackUrl.toString());
       if (fallbackRes.ok) {
         const fallbackData = await fallbackRes.json();
         if (fallbackData.files && fallbackData.files.length > 0) {
@@ -751,11 +1025,7 @@ class GoogleDriveService {
       downloadUrl = `https://www.googleapis.com/drive/v3/files/${meta.id}?alt=media`;
     }
 
-    const res = await fetch(downloadUrl, {
-      headers: {
-        Authorization: `Bearer ${this.accessToken}`,
-      },
-    });
+    const res = await this.authorizedFetch(downloadUrl);
 
     if (!res.ok) {
       throw new Error(`Falha ao baixar arquivo "${meta.name}" do Google Drive (${res.status})`);
@@ -788,10 +1058,14 @@ class GoogleDriveService {
   }
 
   /**
-   * Registers callback to deliver new/updated files to the application parser
+   * Registers callback to deliver new/updated files to the application parser.
+   * Automatically resumes background auto-polling if the Google session was restored across F5.
    */
   public registerNewFileCallback(callback: (file: File, isAuto: boolean) => Promise<void> | void) {
     this.onNewFileCallback = callback;
+    if (this.isConnected() && !this.stopPollingFn) {
+      this.startAutoPolling();
+    }
   }
 
   /**
@@ -805,13 +1079,16 @@ class GoogleDriveService {
     message: string;
   }> {
     if (!this.isConnected()) {
-      const connected = await this.connectGoogleDrive();
-      if (!connected) {
-        return {
-          success: false,
-          hasUpdate: false,
-          message: 'Não conectado ao Google Drive.',
-        };
+      const silentlyRenewed = this.wasConnected ? await this.trySilentReconnect() : false;
+      if (!silentlyRenewed) {
+        const connected = await this.connectGoogleDrive();
+        if (!connected) {
+          return {
+            success: false,
+            hasUpdate: false,
+            message: 'Não conectado ao Google Drive.',
+          };
+        }
       }
     }
 
@@ -888,7 +1165,12 @@ class GoogleDriveService {
   }
 
   private async runBackgroundPollCycle(): Promise<void> {
-    if (!this.isConnected() || this.isBackgroundPollRunning) return;
+    if (this.isBackgroundPollRunning) return;
+    if (!this.isConnected()) {
+      if (!this.wasConnected) return;
+      const renewed = await this.trySilentReconnect();
+      if (!renewed) return;
+    }
     this.isBackgroundPollRunning = true;
     this.lastPollCheckAt = Date.now();
 
@@ -946,8 +1228,18 @@ class GoogleDriveService {
       this.runBackgroundPollCycle().catch(() => {});
     }, this.POLLING_INTERVAL_MS);
 
-    // Se o sistema operacional suspender o computador, retoma verificação ao voltar à aba
+    // Se o sistema operacional suspender o computador, retoma renovação/verificação ao voltar à aba
     this.stopForegroundListenerFn = onTabReturnToForeground(() => {
+      if (!this.isConnected() && this.wasConnected) {
+        this.trySilentReconnect()
+          .then((ok) => {
+            if (ok && Date.now() - this.lastPollCheckAt >= this.POLLING_INTERVAL_MS) {
+              this.runBackgroundPollCycle().catch(() => {});
+            }
+          })
+          .catch(() => {});
+        return;
+      }
       if (!this.isConnected()) return;
       if (Date.now() - this.lastPollCheckAt >= this.POLLING_INTERVAL_MS) {
         this.runBackgroundPollCycle().catch(() => {});
