@@ -717,13 +717,9 @@ export function App() {
     try {
       const ok = await googleDriveService.connectGoogleDrive();
       if (ok) {
-        // Automatically link Cloud Sync (Firestore) with Google account as well
+        // Sincroniza estado em nuvem sem abrir uma segunda janela de login do Google
         try {
-          if (!cloudSyncService.getState().isAuthenticated) {
-            await cloudSyncService.loginWithGoogle();
-          } else {
-            await cloudSyncService.checkAndAutoSync();
-          }
+          await cloudSyncService.checkAndAutoSync();
         } catch (cloudErr) {
           console.warn('Sincronização em nuvem automática:', cloudErr);
         }

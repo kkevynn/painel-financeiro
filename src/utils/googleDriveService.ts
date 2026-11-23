@@ -21,7 +21,6 @@ export const GOOGLE_CLIENT_ID = '866738622063-trtjudvl95g2c3lu0fhga9q79nn4eol6.a
 export const DRIVE_DATABASE_FOLDER_NAME = 'Painel_Financeiro_SESAP_Dados';
 const DRIVE_SESSION_STORAGE_KEY = 'sesap_drive_session_v1';
 const DRIVE_FILE_MOD_MAP_KEY = 'sesap_drive_file_mod_map_v1';
-const TOKEN_REFRESH_LEAD_MS = 4 * 60 * 1000; // Renova silenciosamente 4 min antes de expirar
 
 // Scopes supporting spreadsheet reading and dedicated app database folder storage
 export const GOOGLE_DRIVE_SCOPES = [
@@ -99,8 +98,7 @@ class GoogleDriveService {
   private subscribers: Set<Subscriber> = new Set();
   private stopPollingFn: (() => void) | null = null;
   private stopForegroundListenerFn: (() => void) | null = null;
-  private cancelTokenRefreshFn: (() => void) | null = null;
-  private silentReconnectInFlight: Promise<boolean> | null = null;
+  private cancelTokenExpiryFn: (() => void) | null = null;
   private lastPollCheckAt: number = 0;
   private isBackgroundPollRunning: boolean = false;
   private cachedDatabaseFolderId: string | null = null;
@@ -226,7 +224,7 @@ class GoogleDriveService {
       }
 
       if (saved.accessToken && saved.tokenExpiresAt && Date.now() < saved.tokenExpiresAt) {
-        // Token ainda válido: restaura conexão imediatamente após F5 / recarregamento
+        // Token ainda válido: restaura conexão imediatamente após F5 / recarregamento (sem abrir popup)
         this.accessToken = saved.accessToken;
         this.tokenExpiresAt = saved.tokenExpiresAt;
         this.state = {
@@ -236,12 +234,18 @@ class GoogleDriveService {
           userEmail: saved.userEmail || this.state.userEmail || 'Google Drive Conectado',
           errorMessage: null,
         };
-        this.scheduleProactiveTokenRefresh();
+        this.scheduleTokenExpiryWatcher();
       } else {
-        // Token expirou enquanto a página estava fechada: tenta renovação silenciosa em segundo plano
-        scheduleBackgroundTimeout(() => {
-          this.trySilentReconnect().catch(() => {});
-        }, 400);
+        // Token expirado: NÃO abre popup automático em segundo plano (GIS sempre abre janela popup).
+        // Mantém userEmail salvo como hint para reconexão rápida quando o usuário clicar em conectar.
+        this.accessToken = null;
+        this.tokenExpiresAt = 0;
+        this.state = {
+          ...this.state,
+          isConnected: false,
+          status: 'idle',
+          errorMessage: null,
+        };
       }
     } catch {
       // Ignore malformed session data
@@ -255,7 +259,7 @@ class GoogleDriveService {
       if (!ev.newValue) {
         // Outra aba desconectou a conta Google
         this.stopAutoPolling();
-        this.cancelProactiveTokenRefresh();
+        this.cancelTokenExpiryWatcher();
         this.accessToken = null;
         this.tokenExpiresAt = 0;
         this.wasConnected = false;
@@ -283,7 +287,7 @@ class GoogleDriveService {
             userEmail: updated.userEmail || this.state.userEmail || 'Google Drive Conectado',
             errorMessage: null,
           });
-          this.scheduleProactiveTokenRefresh();
+          this.scheduleTokenExpiryWatcher();
           if (this.onNewFileCallback && !this.stopPollingFn) {
             this.startAutoPolling();
           }
@@ -294,22 +298,34 @@ class GoogleDriveService {
     });
   }
 
-  private cancelProactiveTokenRefresh() {
-    if (this.cancelTokenRefreshFn) {
-      this.cancelTokenRefreshFn();
-      this.cancelTokenRefreshFn = null;
+  private cancelTokenExpiryWatcher() {
+    if (this.cancelTokenExpiryFn) {
+      this.cancelTokenExpiryFn();
+      this.cancelTokenExpiryFn = null;
     }
   }
 
-  private scheduleProactiveTokenRefresh() {
-    this.cancelProactiveTokenRefresh();
-    if (!this.wasConnected || !this.tokenExpiresAt) return;
-    const msUntilRefresh = Math.max(15000, this.tokenExpiresAt - Date.now() - TOKEN_REFRESH_LEAD_MS);
-    this.cancelTokenRefreshFn = scheduleBackgroundTimeout(() => {
-      if (this.wasConnected) {
-        this.trySilentReconnect().catch(() => {});
+  /**
+   * Atualiza o status da interface quando o token OAuth expirar naturalmente,
+   * sem jamais disparar janelas de login do Google em segundo plano.
+   */
+  private scheduleTokenExpiryWatcher() {
+    this.cancelTokenExpiryWatcher();
+    if (!this.tokenExpiresAt) return;
+    const msUntilExpiry = Math.max(5000, this.tokenExpiresAt - Date.now());
+    this.cancelTokenExpiryFn = scheduleBackgroundTimeout(() => {
+      if (this.accessToken && Date.now() >= this.tokenExpiresAt) {
+        this.accessToken = null;
+        this.tokenExpiresAt = 0;
+        this.stopAutoPolling();
+        this.persistSession();
+        this.setState({
+          isConnected: false,
+          status: 'idle',
+          errorMessage: null,
+        });
       }
-    }, msUntilRefresh);
+    }, msUntilExpiry);
   }
 
   private persistMetadata() {
@@ -406,105 +422,12 @@ class GoogleDriveService {
   }
 
   /**
-   * Tenta renovar o token OAuth silenciosamente (sem abrir popup) usando o e-mail salvo.
-   */
-  public async trySilentReconnect(): Promise<boolean> {
-    if (!this.wasConnected) return false;
-    if (this.accessToken && Date.now() < this.tokenExpiresAt - TOKEN_REFRESH_LEAD_MS) {
-      return true;
-    }
-    if (this.silentReconnectInFlight) {
-      return this.silentReconnectInFlight;
-    }
-
-    this.silentReconnectInFlight = (async () => {
-      try {
-        await this.loadGisScript();
-        if (!window.google?.accounts?.oauth2) return false;
-
-        const hintEmail =
-          this.state.userEmail && this.state.userEmail.includes('@')
-            ? this.state.userEmail
-            : undefined;
-
-        return await new Promise<boolean>((resolve) => {
-          let settled = false;
-          const finish = (ok: boolean) => {
-            if (settled) return;
-            settled = true;
-            cancelTimeout();
-            resolve(ok);
-          };
-
-          const cancelTimeout = scheduleBackgroundTimeout(() => {
-            finish(false);
-          }, 8000);
-
-          try {
-            const client = window.google!.accounts!.oauth2!.initTokenClient({
-              client_id: GOOGLE_CLIENT_ID,
-              scope: GOOGLE_DRIVE_SCOPES,
-              ...(hintEmail ? { hint: hintEmail } : {}),
-              callback: async (tokenResponse: TokenResponse) => {
-                if (tokenResponse.error || !tokenResponse.access_token) {
-                  finish(false);
-                  return;
-                }
-                this.accessToken = tokenResponse.access_token;
-                const expiresInSec = tokenResponse.expires_in || 3600;
-                this.tokenExpiresAt = Date.now() + (expiresInSec - 60) * 1000;
-                this.wasConnected = true;
-
-                this.setState({
-                  isConnected: true,
-                  status: 'connected',
-                  userEmail: this.state.userEmail || 'Google Drive Conectado',
-                  errorMessage: null,
-                });
-                this.persistSession();
-                this.scheduleProactiveTokenRefresh();
-
-                if (this.onNewFileCallback && !this.stopPollingFn) {
-                  this.startAutoPolling();
-                }
-                finish(true);
-              },
-              error_callback: () => {
-                finish(false);
-              },
-            });
-
-            client.requestAccessToken({
-              prompt: 'none',
-              ...(hintEmail ? { hint: hintEmail } : {}),
-            });
-          } catch {
-            finish(false);
-          }
-        });
-      } catch {
-        return false;
-      } finally {
-        this.silentReconnectInFlight = null;
-      }
-    })();
-
-    return this.silentReconnectInFlight;
-  }
-
-  /**
-   * Garante um accessToken válido, tentando renovação silenciosa antes de recorrer ao popup.
+   * Garante um accessToken válido. Jamais abre popup em segundo plano —
+   * somente abre login interativo se allowInteractive === true (ação explícita do usuário).
    */
   private async ensureValidAccessToken(allowInteractive: boolean = false): Promise<string> {
     if (this.accessToken && Date.now() < this.tokenExpiresAt) {
       return this.accessToken;
-    }
-
-    if (this.wasConnected) {
-      const renewed = await this.trySilentReconnect();
-      if (renewed && this.accessToken && Date.now() < this.tokenExpiresAt) {
-        return this.accessToken;
-      }
     }
 
     if (allowInteractive) {
@@ -514,11 +437,22 @@ class GoogleDriveService {
       }
     }
 
+    if (this.state.isConnected) {
+      this.accessToken = null;
+      this.tokenExpiresAt = 0;
+      this.stopAutoPolling();
+      this.setState({
+        isConnected: false,
+        status: 'idle',
+        errorMessage: null,
+      });
+    }
+
     throw new Error('Sessão do Google Drive expirada. Clique em "Conectar Conta Google" para reconectar.');
   }
 
   /**
-   * Executa fetch autenticado na API do Google Drive com recuperação automática em caso de HTTP 401.
+   * Executa fetch autenticado na API do Google Drive sem abrir popups inesperados em segundo plano.
    */
   private async authorizedFetch(
     input: string,
@@ -529,33 +463,33 @@ class GoogleDriveService {
     const headers = new Headers(init.headers || {});
     headers.set('Authorization', `Bearer ${token}`);
 
-    let res = await fetch(input, { ...init, headers });
+    const res = await fetch(input, { ...init, headers });
 
     if (res.status === 401) {
-      // Token foi revogado ou expirou antecipadamente no servidor do Google: renova e tenta uma vez
+      // Token foi revogado ou expirou no Google: atualiza estado sem abrir popup inesperado
       this.accessToken = null;
       this.tokenExpiresAt = 0;
-      const renewed = await this.trySilentReconnect();
-      if (renewed && this.accessToken) {
-        const retryHeaders = new Headers(init.headers || {});
-        retryHeaders.set('Authorization', `Bearer ${this.accessToken}`);
-        res = await fetch(input, { ...init, headers: retryHeaders });
-      } else {
-        this.setState({
-          isConnected: false,
-          status: 'idle',
-          errorMessage: null,
-        });
-      }
+      this.cancelTokenExpiryWatcher();
+      this.stopAutoPolling();
+      this.persistSession();
+      this.setState({
+        isConnected: false,
+        status: 'idle',
+        errorMessage: null,
+      });
     }
 
     return res;
   }
 
   /**
-   * Connect to Google Drive using OAuth2 (Popup Flow via Google Identity Services)
+   * Connect to Google Drive using OAuth2 (Popup Flow via Google Identity Services).
+   * Deve ser chamado exclusivamente por ação explícita do usuário.
    */
   public async connectGoogleDrive(): Promise<boolean> {
+    if (this.state.status === 'connecting') {
+      return false;
+    }
     this.setState({ status: 'connecting', errorMessage: null });
 
     try {
@@ -614,7 +548,7 @@ class GoogleDriveService {
                   errorMessage: null,
                 });
                 this.persistSession();
-                this.scheduleProactiveTokenRefresh();
+                this.scheduleTokenExpiryWatcher();
 
                 // Start background polling if callback is registered
                 if (this.onNewFileCallback) {
@@ -632,6 +566,16 @@ class GoogleDriveService {
               }
             },
             error_callback: (err: any) => {
+              // Se o usuário apenas fechou a janela de login, volta silenciosamente para idle sem exibir erro
+              if (err?.type === 'popup_closed') {
+                this.setState({
+                  status: 'idle',
+                  errorMessage: null,
+                  isConnected: false,
+                });
+                resolve(false);
+                return;
+              }
               const msg = err?.message || 'Falha na autenticação do Google';
               this.setState({
                 status: 'error',
@@ -679,7 +623,7 @@ class GoogleDriveService {
     }
 
     this.stopAutoPolling();
-    this.cancelProactiveTokenRefresh();
+    this.cancelTokenExpiryWatcher();
     this.accessToken = null;
     this.tokenExpiresAt = 0;
     this.wasConnected = false;
@@ -1254,16 +1198,13 @@ class GoogleDriveService {
     message: string;
   }> {
     if (!this.isConnected()) {
-      const silentlyRenewed = this.wasConnected ? await this.trySilentReconnect() : false;
-      if (!silentlyRenewed) {
-        const connected = await this.connectGoogleDrive();
-        if (!connected) {
-          return {
-            success: false,
-            hasUpdate: false,
-            message: 'Não conectado ao Google Drive.',
-          };
-        }
+      const connected = await this.connectGoogleDrive();
+      if (!connected) {
+        return {
+          success: false,
+          hasUpdate: false,
+          message: 'Não conectado ao Google Drive.',
+        };
       }
     }
 
@@ -1319,7 +1260,7 @@ class GoogleDriveService {
         const topFile = relevantFiles[0];
         this.lastPollCheckAt = Date.now();
         this.setState({
-          status: 'connected',
+          status: this.isConnected() ? 'connected' : 'idle',
           lastSyncAt: new Date(),
           lastFileName: fileNames.join(', ') || this.state.lastFileName,
           lastFileModifiedAt: topFile.modifiedTime,
@@ -1333,6 +1274,8 @@ class GoogleDriveService {
           message:
             downloadedCount === 0 && failedNames.length > 0
               ? `Falha ao baixar planilhas: ${failedNames.join(', ')}`
+              : downloadedCount === 0
+              ? 'Todas as planilhas já estão atualizadas.'
               : downloadedCount === 1
               ? `Planilha "${fileNames[0]}" sincronizada com sucesso!`
               : `Sincronizadas ${downloadedCount} planilhas: ${fileNames.join(', ')}`,
@@ -1355,9 +1298,14 @@ class GoogleDriveService {
   private async runBackgroundPollCycle(): Promise<void> {
     if (this.isBackgroundPollRunning) return;
     if (!this.isConnected()) {
-      if (!this.wasConnected) return;
-      const renewed = await this.trySilentReconnect();
-      if (!renewed) return;
+      // Se o token expirou, apenas atualiza status para desconectado sem abrir popup em segundo plano
+      if (this.state.isConnected) {
+        this.accessToken = null;
+        this.tokenExpiresAt = 0;
+        this.stopAutoPolling();
+        this.setState({ isConnected: false, status: 'idle', errorMessage: null });
+      }
+      return;
     }
     this.isBackgroundPollRunning = true;
     this.lastPollCheckAt = Date.now();
@@ -1420,19 +1368,17 @@ class GoogleDriveService {
       this.runBackgroundPollCycle().catch(() => {});
     }, this.POLLING_INTERVAL_MS);
 
-    // Se o sistema operacional suspender o computador, retoma renovação/verificação ao voltar à aba
+    // Se o sistema operacional suspender o computador, retoma verificação ao voltar à aba (sem abrir popup)
     this.stopForegroundListenerFn = onTabReturnToForeground(() => {
-      if (!this.isConnected() && this.wasConnected) {
-        this.trySilentReconnect()
-          .then((ok) => {
-            if (ok && Date.now() - this.lastPollCheckAt >= this.POLLING_INTERVAL_MS) {
-              this.runBackgroundPollCycle().catch(() => {});
-            }
-          })
-          .catch(() => {});
+      if (!this.isConnected()) {
+        if (this.state.isConnected) {
+          this.accessToken = null;
+          this.tokenExpiresAt = 0;
+          this.stopAutoPolling();
+          this.setState({ isConnected: false, status: 'idle', errorMessage: null });
+        }
         return;
       }
-      if (!this.isConnected()) return;
       if (Date.now() - this.lastPollCheckAt >= this.POLLING_INTERVAL_MS) {
         this.runBackgroundPollCycle().catch(() => {});
       }
