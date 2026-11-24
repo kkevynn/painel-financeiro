@@ -15,10 +15,13 @@ import {
   findFonteRecursoInRow,
 } from './ordemBancariaParser';
 import { mlInferenceService } from './machineLearningInferenceService';
+import { saveKVToDB, loadKVFromDB, deleteKVFromDB } from './storageService';
 
 const TOAST_STORAGE_KEY = 'painel_pp_status_history';
 const ALERTS_HISTORY_KEY = 'painel_all_alerts_history';
 const BASELINE_SNAPSHOT_KEY = 'painel_base_files_snapshot';
+const ALERTS_HISTORY_IDB_KEY = 'alerts_history_v1';
+const BASELINE_SNAPSHOT_IDB_KEY = 'baseline_snapshot_v1';
 const ACTIVE_TOASTS_MAX = 5;
 
 export function getAlertUniqueKey(a: {
@@ -28,6 +31,7 @@ export function getAlertUniqueKey(a: {
   nl?: string;
   cnpj?: string;
   fornecedor?: string;
+  situacaoAnterior?: string;
   situacaoNova?: string;
   tipo?: string;
   valor?: number;
@@ -40,6 +44,7 @@ export function getAlertUniqueKey(a: {
   const valKey = a.valor !== undefined && a.valor > 0 ? `_${a.valor.toFixed(0)}` : '';
 
   const doc = ppClean || obClean || nlClean || neClean || (cnpjClean ? `${cnpjClean}${valKey}` : 'DOC');
+  const rawPrevSit = (a.situacaoAnterior || '').trim().toUpperCase();
   const rawSit = (a.situacaoNova || '').trim().toUpperCase();
 
   // Agrupa CB, PPCB, CM e PAGO sob a mesma chave lógica para nunca duplicar alerta entre planilhas diferentes
@@ -49,7 +54,15 @@ export function getAlertUniqueKey(a: {
     ? 'REJ_BANCO'
     : rawSit;
 
-  return `${doc}__${sitGroup}`;
+  const prevGroup = rawPrevSit
+    ? isSituacaoConfirmadaBanco(rawPrevSit).isMatch
+      ? 'CONF_BANCO'
+      : isSituacaoRejeitadaBanco(rawPrevSit).isMatch
+      ? 'REJ_BANCO'
+      : rawPrevSit
+    : '';
+
+  return prevGroup ? `${doc}__FROM_${prevGroup}__${sitGroup}` : `${doc}__${sitGroup}`;
 }
 
 function isValidOBString(s?: string): boolean {
@@ -333,11 +346,117 @@ type ToastListener = (toasts: ToastAlert[]) => void;
 class ToastAlertManager {
   private activeToasts: ToastAlert[] = [];
   private alertsHistory: ToastAlert[] = [];
+  private baselineCache: Record<string, any> | null = null;
   private listeners: Set<ToastListener> = new Set();
 
   constructor() {
     this.activeToasts = [];
     this.loadAlertsHistory();
+    void this.hydrateFromIndexedDB();
+  }
+
+  private normalizeLoadedAlerts(parsed: any[]): ToastAlert[] {
+    const seen = new Set<string>();
+    const unique: ToastAlert[] = [];
+
+    for (const item of parsed) {
+      if (!item || typeof item !== 'object') continue;
+      // Filter out legacy "Virou OB" alerts from previous versions
+      if (
+        item.situacaoNova === 'Virou OB' ||
+        (item.titulo && item.titulo.toLowerCase().includes('virou ob')) ||
+        (item.titulo && item.titulo.toLowerCase().includes('ordem bancária gerada')) ||
+        (item.titulo && item.titulo.toLowerCase().includes('ordem bancaria gerada'))
+      ) {
+        continue;
+      }
+
+      const key = getAlertUniqueKey(item);
+      if (!seen.has(key)) {
+        seen.add(key);
+        const d = item.dataHora ? new Date(item.dataHora) : new Date();
+
+        // Sanitize item.valor and item.mensagem if it was corrupted by a Fonte code (e.g. 600, 500, 0.60, etc.)
+        let itemVal = typeof item.valor === 'number' ? item.valor : 0;
+        if (
+          isFonteString(itemVal) ||
+          itemVal === 600 ||
+          itemVal === 500 ||
+          itemVal === 1500 ||
+          itemVal === 1600 ||
+          itemVal === 0.6 ||
+          itemVal === 0.5
+        ) {
+          itemVal = 0;
+        }
+        let itemMsg = item.mensagem || '';
+        if (itemVal === 0 && itemMsg) {
+          // Strip corrupted (R$ 600,00), (R$ 500,00), (R$ 0,60), etc. from alert message text
+          itemMsg = itemMsg
+            .replace(/\s*\(\s*R\$\s*600(?:,00)?\s*\)/gi, '')
+            .replace(/\s*\(\s*R\$\s*500(?:,00)?\s*\)/gi, '')
+            .replace(/\s*\(\s*R\$\s*1\.?500(?:,00)?\s*\)/gi, '')
+            .replace(/\s*\(\s*R\$\s*1\.?600(?:,00)?\s*\)/gi, '')
+            .replace(/\s*\(\s*R\$\s*0,[56]0?\s*\)/gi, '');
+        }
+
+        // Alertas carregados de sessões passadas iniciam como já lidos (resolvido: true)
+        unique.push({
+          ...item,
+          valor: itemVal,
+          mensagem: itemMsg,
+          resolvido: true,
+          dataHora: !isNaN(d.getTime()) ? d : new Date(),
+        });
+      }
+    }
+
+    unique.sort((a, b) => new Date(b.dataHora).getTime() - new Date(a.dataHora).getTime());
+    return unique;
+  }
+
+  private async hydrateFromIndexedDB() {
+    try {
+      const storedAlerts = await loadKVFromDB<any[]>(ALERTS_HISTORY_IDB_KEY);
+      if (Array.isArray(storedAlerts) && storedAlerts.length > 0) {
+        const normalized = this.normalizeLoadedAlerts(storedAlerts);
+        if (normalized.length > 0) {
+          const existingKeys = new Set(this.alertsHistory.map((t) => getAlertUniqueKey(t)));
+          const missing = normalized.filter((item) => !existingKeys.has(getAlertUniqueKey(item)));
+          if (missing.length > 0) {
+            this.alertsHistory = [...this.alertsHistory, ...missing].sort(
+              (a, b) => new Date(b.dataHora).getTime() - new Date(a.dataHora).getTime()
+            );
+            this.notify();
+          }
+        }
+      }
+    } catch {
+      // safe IndexedDB fallback
+    }
+
+    try {
+      if (!this.baselineCache) {
+        const storedBaseline = await loadKVFromDB<Record<string, any>>(BASELINE_SNAPSHOT_IDB_KEY);
+        if (storedBaseline && typeof storedBaseline === 'object' && !Array.isArray(storedBaseline)) {
+          const parsed: Record<string, any> = {};
+          for (const [k, v] of Object.entries(storedBaseline)) {
+            if (!v || typeof v !== 'object') continue;
+            parsed[k] = {
+              situacao: v.s || v.situacao || '',
+              ob: v.ob || '',
+              isConclusivo: v.c !== undefined ? v.c : !!v.isConclusivo,
+              isRejected: v.r !== undefined ? v.r : !!v.isRejected,
+            };
+          }
+          if (Object.keys(parsed).length > 0) {
+            this.baselineCache = parsed;
+          }
+        }
+      }
+    } catch {
+      // safe IndexedDB fallback
+    }
   }
 
   private loadAlertsHistory() {
@@ -346,82 +465,8 @@ class ToastAlertManager {
       if (raw) {
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed)) {
-          const seen = new Set<string>();
-          const unique: ToastAlert[] = [];
-          const nowMs = Date.now();
-          const MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // Últimos 30 dias
-
-          for (const item of parsed) {
-            if (!item || typeof item !== 'object') continue;
-            // Filter out legacy "Virou OB" alerts from previous versions
-            if (
-              item.situacaoNova === 'Virou OB' ||
-              (item.titulo && item.titulo.toLowerCase().includes('virou ob')) ||
-              (item.titulo && item.titulo.toLowerCase().includes('ordem bancária gerada')) ||
-              (item.titulo && item.titulo.toLowerCase().includes('ordem bancaria gerada'))
-            ) {
-              continue;
-            }
-
-            // Descarta eventos com mais de 30 dias
-            if (item.dataReferencia) {
-              const dInfo = parseDateToMonthInfo(item.dataReferencia);
-              if (dInfo.dateIso) {
-                const itemTime = new Date(dInfo.dateIso + 'T12:00:00').getTime();
-                if (!isNaN(itemTime) && nowMs - itemTime > MAX_AGE_MS) {
-                  continue;
-                }
-              }
-            } else if (item.dataHora) {
-              const dt = new Date(item.dataHora).getTime();
-              if (!isNaN(dt) && nowMs - dt > MAX_AGE_MS) {
-                continue;
-              }
-            }
-
-            const key = getAlertUniqueKey(item);
-            if (!seen.has(key)) {
-              seen.add(key);
-              const d = item.dataHora ? new Date(item.dataHora) : new Date();
-
-              // Sanitize item.valor and item.mensagem if it was corrupted by a Fonte code (e.g. 600, 500, 0.60, etc.)
-              let itemVal = typeof item.valor === 'number' ? item.valor : 0;
-              if (
-                isFonteString(itemVal) ||
-                itemVal === 600 ||
-                itemVal === 500 ||
-                itemVal === 1500 ||
-                itemVal === 1600 ||
-                itemVal === 0.6 ||
-                itemVal === 0.5
-              ) {
-                itemVal = 0;
-              }
-              let itemMsg = item.mensagem || '';
-              if (itemVal === 0 && itemMsg) {
-                // Strip corrupted (R$ 600,00), (R$ 500,00), (R$ 0,60), etc. from alert message text
-                itemMsg = itemMsg
-                  .replace(/\s*\(\s*R\$\s*600(?:,00)?\s*\)/gi, '')
-                  .replace(/\s*\(\s*R\$\s*500(?:,00)?\s*\)/gi, '')
-                  .replace(/\s*\(\s*R\$\s*1\.?500(?:,00)?\s*\)/gi, '')
-                  .replace(/\s*\(\s*R\$\s*1\.?600(?:,00)?\s*\)/gi, '')
-                  .replace(/\s*\(\s*R\$\s*0,[56]0?\s*\)/gi, '');
-              }
-
-              // Alertas carregados de sessões passadas iniciam como já lidos (resolvido: true)
-              unique.push({
-                ...item,
-                valor: itemVal,
-                mensagem: itemMsg,
-                resolvido: true,
-                dataHora: !isNaN(d.getTime()) ? d : new Date(),
-              });
-            }
-          }
-          unique.sort((a, b) => new Date(b.dataHora).getTime() - new Date(a.dataHora).getTime());
-          // Limita histórico recente a no máximo 100 alertas
-          this.alertsHistory = unique.slice(0, 100);
-          this.saveAlertsHistory();
+          // Sem limite de 100 alertas e sem descarte por idade
+          this.alertsHistory = this.normalizeLoadedAlerts(parsed);
         }
       }
     } catch (e) {
@@ -430,10 +475,12 @@ class ToastAlertManager {
   }
 
   private saveAlertsHistory() {
+    // Persiste histórico completo sem limite no IndexedDB
+    void saveKVToDB(ALERTS_HISTORY_IDB_KEY, this.alertsHistory);
     try {
-      localStorage.setItem(ALERTS_HISTORY_KEY, JSON.stringify(this.alertsHistory.slice(0, 100)));
+      localStorage.setItem(ALERTS_HISTORY_KEY, JSON.stringify(this.alertsHistory));
     } catch (e) {
-      // safe quota catch
+      // Caso ultrapasse o limite do localStorage (~5MB), o IndexedDB mantém o histórico completo
     }
   }
 
@@ -475,9 +522,17 @@ class ToastAlertManager {
     };
 
     if (existingIndex !== -1) {
-      // Update existing item with fresh timestamp
+      const existing = this.alertsHistory[existingIndex];
+      const isDocumentAlert = Boolean(
+        existing.pp || existing.ob || existing.ne || existing.nl || existing.situacaoNova
+      );
+      if (isDocumentAlert) {
+        // Nunca altera nem sobrescreve a data/hora de uma notificação de situação já exibida
+        return;
+      }
+      // Apenas toasts genéricos de sistema (sem PP/OB/situação) atualizam no histórico
       this.alertsHistory[existingIndex] = {
-        ...this.alertsHistory[existingIndex],
+        ...existing,
         ...fullToast,
         dataHora: fullToast.dataHora,
       };
@@ -487,9 +542,6 @@ class ToastAlertManager {
     }
 
     this.alertsHistory.unshift(fullToast);
-    if (this.alertsHistory.length > 100) {
-      this.alertsHistory = this.alertsHistory.slice(0, 100);
-    }
     this.saveAlertsHistory();
 
     const showInToastPopup = toast.showPopup ?? (toast.tipo === 'critico');
@@ -537,7 +589,8 @@ class ToastAlertManager {
     }
 
     if (newItems.length > 0) {
-      this.alertsHistory = [...newItems, ...this.alertsHistory].slice(0, 100);
+      // Sem limite máximo de alertas: preserva todas as alterações detectadas
+      this.alertsHistory = [...newItems, ...this.alertsHistory];
       const toPopup = newItems.filter((t) => (t as any).showPopup).slice(0, ACTIVE_TOASTS_MAX);
       if (toPopup.length > 0) {
         this.activeToasts = [...toPopup, ...this.activeToasts].slice(0, ACTIVE_TOASTS_MAX);
@@ -563,6 +616,7 @@ class ToastAlertManager {
   public clearAlertsHistory() {
     this.alertsHistory = [];
     this.activeToasts = [];
+    void deleteKVFromDB(ALERTS_HISTORY_IDB_KEY);
     this.saveAlertsHistory();
     this.notify();
   }
@@ -597,23 +651,11 @@ class ToastAlertManager {
 
   public restoreAlertsHistory(alerts: ToastAlert[]) {
     if (!Array.isArray(alerts) || alerts.length === 0) return;
-    const nowMs = Date.now();
-    const MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
     const existingKeys = new Set(this.alertsHistory.map((t) => getAlertUniqueKey(t)));
     const newItems: ToastAlert[] = [];
 
     for (const a of alerts) {
       if (!a || typeof a !== 'object') continue;
-      if (a.dataReferencia) {
-        const dInfo = parseDateToMonthInfo(a.dataReferencia);
-        if (dInfo.dateIso) {
-          const itemTime = new Date(dInfo.dateIso + 'T12:00:00').getTime();
-          if (!isNaN(itemTime) && nowMs - itemTime > MAX_AGE_MS) continue;
-        }
-      } else if (a.dataHora) {
-        const dt = new Date(a.dataHora).getTime();
-        if (!isNaN(dt) && nowMs - dt > MAX_AGE_MS) continue;
-      }
 
       const key = getAlertUniqueKey(a);
       if (!existingKeys.has(key)) {
@@ -626,9 +668,11 @@ class ToastAlertManager {
       }
     }
 
-    this.alertsHistory = [...this.alertsHistory, ...newItems]
-      .sort((a, b) => new Date(b.dataHora).getTime() - new Date(a.dataHora).getTime())
-      .slice(0, 100);
+    if (newItems.length === 0) return;
+
+    this.alertsHistory = [...this.alertsHistory, ...newItems].sort(
+      (a, b) => new Date(b.dataHora).getTime() - new Date(a.dataHora).getTime()
+    );
     this.saveAlertsHistory();
     this.notify();
   }
@@ -688,7 +732,10 @@ class ToastAlertManager {
    */
   public resetBaseline() {
     try {
+      this.baselineCache = null;
       localStorage.removeItem(BASELINE_SNAPSHOT_KEY);
+      void deleteKVFromDB(BASELINE_SNAPSHOT_IDB_KEY);
+      void deleteKVFromDB(ALERTS_HISTORY_IDB_KEY);
       this.alertsHistory = [];
       this.activeToasts = [];
       this.saveAlertsHistory();
@@ -699,6 +746,9 @@ class ToastAlertManager {
   }
 
   public hasBaseline(): boolean {
+    if (this.baselineCache && Object.keys(this.baselineCache).length > 0) {
+      return true;
+    }
     try {
       return !!localStorage.getItem(BASELINE_SNAPSHOT_KEY);
     } catch (e) {
@@ -707,7 +757,10 @@ class ToastAlertManager {
   }
 
   public ensureBaseline(files: FileData[], ordensBancariasList?: OrdemBancariaItem[] | null) {
-    if (!this.hasBaseline() && files && files.length > 0) {
+    if (
+      !this.hasBaseline() &&
+      ((files && files.length > 0) || (ordensBancariasList && ordensBancariasList.length > 0))
+    ) {
       const records = this.extractAllCurrentRecords(files, ordensBancariasList);
       this.saveBaselineSnapshot(records);
     }
@@ -726,6 +779,9 @@ class ToastAlertManager {
   }
 
   private loadBaselineSnapshot(): Record<string, any> | null {
+    if (this.baselineCache && Object.keys(this.baselineCache).length > 0) {
+      return this.baselineCache;
+    }
     try {
       const raw = localStorage.getItem(BASELINE_SNAPSHOT_KEY);
       if (!raw) return null;
@@ -741,6 +797,7 @@ class ToastAlertManager {
           isRejected: v.r !== undefined ? v.r : !!v.isRejected,
         };
       }
+      this.baselineCache = res;
       return res;
     } catch (e) {
       return null;
@@ -749,21 +806,36 @@ class ToastAlertManager {
 
   private saveBaselineSnapshot(records: Record<string, any>) {
     try {
-      // Save compact representation of up to 50000 keys to avoid quota/memory issues
+      // Sem limite artificial de registros: armazena todas as chaves em memória + IndexedDB + espelho no localStorage
       const compact: Record<string, { s: string; ob?: string; c: boolean; r: boolean }> = {};
-      const keys = Object.keys(records).slice(0, 50000);
-      for (const k of keys) {
-        const item = records[k];
+      const cache: Record<string, { situacao: string; ob: string; isConclusivo: boolean; isRejected: boolean }> = {};
+      for (const [k, item] of Object.entries(records)) {
+        const sit = item.situacao || '';
+        const ob = item.ob || '';
+        const isConclusivo = !!item.isConclusivo;
+        const isRejected = !!item.isRejected;
         compact[k] = {
-          s: item.situacao || '',
-          ob: item.ob || '',
-          c: !!item.isConclusivo,
-          r: !!item.isRejected,
+          s: sit,
+          ob,
+          c: isConclusivo,
+          r: isRejected,
+        };
+        cache[k] = {
+          situacao: sit,
+          ob,
+          isConclusivo,
+          isRejected,
         };
       }
-      localStorage.setItem(BASELINE_SNAPSHOT_KEY, JSON.stringify(compact));
+      this.baselineCache = cache;
+      void saveKVToDB(BASELINE_SNAPSHOT_IDB_KEY, compact);
+      try {
+        localStorage.setItem(BASELINE_SNAPSHOT_KEY, JSON.stringify(compact));
+      } catch {
+        // Caso ultrapasse a cota do localStorage, o IndexedDB e a memória preservam a base completa
+      }
     } catch (e) {
-      // safe quota catch
+      // safe catch
     }
   }
 
@@ -1165,27 +1237,27 @@ class ToastAlertManager {
   }
 
   /**
-   * Refreshes confirmations from current files and ordensBancariasList.
+   * Analisa transições reais entre a última importação e a nova importação,
+   * sem jamais alterar notificações já exibidas nem sobrescrever suas datas.
    */
   public syncConfirmations(
     files: FileData[],
-    ordensBancariasList?: OrdemBancariaItem[] | null,
-    forceRefresh: boolean = false
+    ordensBancariasList?: OrdemBancariaItem[] | null
   ): number {
-    this.analyzeFileTransitions(files, ordensBancariasList, forceRefresh);
+    this.analyzeFileTransitions(files, ordensBancariasList);
     return this.alertsHistory.filter((a) => a.tipo === 'sucesso').length;
   }
 
   /**
-   * Monitora estritamente a resolução bancária de Ordens Bancárias / PPs preexistentes:
-   * 1. Alerta verde (Sucesso): transição de situação pendente (AO ou vazia) para Confirmada (PPCB, CB, PAGO).
-   * 2. Alerta vermelho (Crítico): transição de situação pendente (AO ou vazia) para Rejeitada (PPRJ, RJ, C).
-   * Transições heurísticas de NL -> PP/OB (dedução de impostos) pertencem exclusivamente à Conciliação NL/PP e NÃO disparam Toasts.
+   * Monitora TODAS as mudanças reais de situação ocorridas entre a última importação (baseline)
+   * e a nova importação, sem limite de quantidade de alertas e sem descarte por data antiga do documento:
+   * 1. Alerta verde (Sucesso): transição para Confirmada no Banco (PPCB, CB, CM, PAGO).
+   * 2. Alerta vermelho (Crítico): transição para Rejeitada / Cancelada (PPRJ, RJ, C).
+   * 3. Alerta azul (Info): qualquer outra mudança de situação (ex: AO → EN, AO → LI, AP → AO, etc.).
    */
   public analyzeFileTransitions(
     files: FileData[],
-    ordensBancariasList?: OrdemBancariaItem[] | null,
-    forceRefresh: boolean = false
+    ordensBancariasList?: OrdemBancariaItem[] | null
   ) {
     if ((!files || files.length === 0) && (!ordensBancariasList || ordensBancariasList.length === 0)) {
       return;
@@ -1195,8 +1267,8 @@ class ToastAlertManager {
     const previousSnapshot = this.loadBaselineSnapshot();
 
     // Se ainda não existia um snapshot prévio gravado, salva o estado atual como ponto de partida
-    // e não dispara notificações retroativas/em massa no primeiro carregamento
-    if (!previousSnapshot && !forceRefresh) {
+    // e não dispara notificações retroativas no primeiro carregamento
+    if (!previousSnapshot) {
       this.saveBaselineSnapshot(currentRecords);
       return;
     }
@@ -1210,9 +1282,10 @@ class ToastAlertManager {
       }
     > = [];
     const batchNotifiedKeys = new Set<string>();
+    const batchTimestamp = new Date();
     let countUpdates = 0;
 
-    // Ordenar as chaves para que os registros com data mais recente (ex: Março/Fevereiro) sejam processados e alertados primeiro
+    // Ordenar as chaves para que os registros com data mais recente apareçam primeiro
     const currentKeys = Object.keys(currentRecords);
     currentKeys.sort((kA, kB) => {
       const rA = currentRecords[kA];
@@ -1227,57 +1300,29 @@ class ToastAlertManager {
       return 0;
     });
 
-    // O(1) Pre-index of alerted history documents to eliminate quadratic overhead on large imports
-    const historyConfDocs = new Set<string>();
-    const historyRejDocs = new Set<string>();
-    const historyDocSituations = new Set<string>();
-
-    for (const hist of this.alertsHistory) {
-      const hPP = cleanDocStr(hist.pp);
-      const hOB = cleanDocStr(hist.ob);
-      const hSit = (hist.situacaoNova || '').trim().toUpperCase();
-      const isConf = hist.tipo === 'sucesso' || isSituacaoConfirmadaBanco(hSit).isMatch;
-      const isRej = hist.tipo === 'critico' || isSituacaoRejeitadaBanco(hSit).isMatch;
-
-      if (hOB) {
-        if (hSit) historyDocSituations.add(`OB_${hOB}_${hSit}`);
-        if (isConf) historyConfDocs.add(`OB_${hOB}`);
-        if (isRej) historyRejDocs.add(`OB_${hOB}`);
-      }
-      if (hPP) {
-        if (hSit) historyDocSituations.add(`PP_${hPP}_${hSit}`);
-        if (isConf) historyConfDocs.add(`PP_${hPP}`);
-        if (isRej) historyRejDocs.add(`PP_${hPP}`);
-      }
-    }
+    // Pré-indexação O(1) das transições exatas já existentes no histórico (evita duplicidade sem bloquear novas mudanças reais)
+    const existingTransitionKeys = new Set<string>(
+      this.alertsHistory.map((h) => getAlertUniqueKey(h))
+    );
 
     for (const key of currentKeys) {
-      if (toastsToBatch.length >= 100) break;
       const curr = currentRecords[key];
       if (!curr || typeof curr !== 'object') continue;
-
-      // Ignora eventos históricos ocorridos há mais de 30 dias
-      if (curr.dataReferencia) {
-        const dInfo = parseDateToMonthInfo(curr.dataReferencia);
-        if (dInfo.dateIso) {
-          const itemTime = new Date(dInfo.dateIso + 'T12:00:00').getTime();
-          if (!isNaN(itemTime) && Date.now() - itemTime > 30 * 24 * 60 * 60 * 1000) {
-            continue;
-          }
-        }
-      }
 
       const currPP = cleanDocStr(curr.pp);
       const currOB = cleanDocStr(curr.ob);
 
-      // É necessário ter ao menos identificação de OB ou PP para monitorar a resolução bancária
+      // É necessário ter ao menos identificação de OB ou PP para monitorar a mudança de situação
       if (!currOB && !currPP) continue;
 
-      let prev = previousSnapshot ? previousSnapshot[key] : undefined;
-      if (!prev && previousSnapshot && currPP) prev = previousSnapshot[`PP_${currPP}`];
-      if (!prev && previousSnapshot && currOB) prev = previousSnapshot[`OB_${currOB}`];
+      let prev = previousSnapshot[key];
+      if (!prev && currPP) prev = previousSnapshot[`PP_${currPP}`];
+      if (!prev && currOB) prev = previousSnapshot[`OB_${currOB}`];
 
-      const prevSituacao = prev ? (prev.situacao || '').trim().toUpperCase() : '';
+      // Somente detecta mudanças reais em relação à importação anterior
+      if (!prev) continue;
+
+      const prevSituacao = (prev.situacao || '').trim().toUpperCase();
       const currSit = (curr.situacao || '').trim().toUpperCase();
       if (!currSit) continue;
 
@@ -1287,12 +1332,11 @@ class ToastAlertManager {
       const prevRej = isSituacaoRejeitadaBanco(prevSituacao);
 
       // Se já estava confirmada no banco antes e continua confirmada (ex: CB -> PPCB), não alertar novamente
-      if (prev && prevConf.isMatch && confInfo.isMatch) continue;
-      if (prev && prevRej.isMatch && rejInfo.isMatch) continue;
+      if (prevConf.isMatch && confInfo.isMatch) continue;
+      if (prevRej.isMatch && rejInfo.isMatch) continue;
 
-      const hasSituationChanged = prev ? prevSituacao !== currSit : false;
-      if (prev && !hasSituationChanged && !forceRefresh) continue;
-      if (!prev && !forceRefresh) continue;
+      // Exige mudança real da situação entre a importação anterior e a nova importação
+      if (prevSituacao === currSit) continue;
 
       const situacaoNova = confInfo.isMatch
         ? currSit || confInfo.normalized
@@ -1300,24 +1344,23 @@ class ToastAlertManager {
         ? currSit || rejInfo.normalized
         : currSit;
       const situacaoNovaNorm = situacaoNova.trim().toUpperCase();
+      const sitAnteriorLabel = prevSituacao || 'AO';
 
-      // Bloqueio estrito de duplicidade no histórico (mesmo em forceRefresh)
-      let isAlreadyInHistory = false;
-      if (currOB) {
-        if (historyDocSituations.has(`OB_${currOB}_${situacaoNovaNorm}`)) isAlreadyInHistory = true;
-        if (confInfo.isMatch && historyConfDocs.has(`OB_${currOB}`)) isAlreadyInHistory = true;
-        if (rejInfo.isMatch && historyRejDocs.has(`OB_${currOB}`)) isAlreadyInHistory = true;
-      }
-      if (!isAlreadyInHistory && currPP) {
-        if (historyDocSituations.has(`PP_${currPP}_${situacaoNovaNorm}`)) isAlreadyInHistory = true;
-        if (confInfo.isMatch && historyConfDocs.has(`PP_${currPP}`)) isAlreadyInHistory = true;
-        if (rejInfo.isMatch && historyRejDocs.has(`PP_${currPP}`)) isAlreadyInHistory = true;
-      }
-      if (isAlreadyInHistory) continue;
+      const candidateKey = getAlertUniqueKey({
+        pp: curr.pp,
+        ob: curr.ob,
+        ne: curr.ne,
+        cnpj: curr.cnpj,
+        fornecedor: curr.fornecedor,
+        situacaoAnterior: sitAnteriorLabel,
+        situacaoNova,
+        valor: curr.valor,
+      });
+      if (existingTransitionKeys.has(candidateKey)) continue;
 
       const batchGroup = confInfo.isMatch ? 'CONF_BANCO' : rejInfo.isMatch ? 'REJ_BANCO' : situacaoNovaNorm;
-      const bKeyOB = currOB ? `${currOB}__${batchGroup}` : '';
-      const bKeyPP = currPP ? `${currPP}__${batchGroup}` : '';
+      const bKeyOB = currOB ? `${currOB}__${sitAnteriorLabel}__${batchGroup}` : '';
+      const bKeyPP = currPP ? `${currPP}__${sitAnteriorLabel}__${batchGroup}` : '';
 
       if ((bKeyOB && batchNotifiedKeys.has(bKeyOB)) || (bKeyPP && batchNotifiedKeys.has(bKeyPP))) continue;
       if (bKeyOB) batchNotifiedKeys.add(bKeyOB);
@@ -1333,11 +1376,11 @@ class ToastAlertManager {
 
       const valorFormatado = isValidExpenseVal ? ` (${formatBRL(curr.valor)})` : '';
       const finalValor = isValidExpenseVal ? curr.valor : 0;
-      const sitAnteriorLabel = prevSituacao || 'AO';
+      const alertId = `toast_${batchTimestamp.getTime()}_${countUpdates}_${Math.random().toString(36).substr(2, 6)}`;
 
       if (confInfo.isMatch) {
         toastsToBatch.push({
-          id: `toast_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+          id: alertId,
           tipo: 'sucesso' as const,
           titulo: 'Pagamento Confirmado no Banco',
           mensagem: `${docDesc} de ${curr.fornecedor || 'Credor'}${valorFormatado} mudou de ${sitAnteriorLabel} para ${situacaoNova}.`,
@@ -1353,7 +1396,7 @@ class ToastAlertManager {
           situacaoAnterior: sitAnteriorLabel,
           situacaoNova,
           dataReferencia: curr.dataReferencia,
-          dataHora: new Date(),
+          dataHora: batchTimestamp,
           showPopup: countUpdates < 5,
         });
         countUpdates++;
@@ -1362,7 +1405,7 @@ class ToastAlertManager {
 
       if (rejInfo.isMatch) {
         toastsToBatch.push({
-          id: `toast_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+          id: alertId,
           tipo: 'critico' as const,
           titulo: 'Pagamento Rejeitado / Cancelado',
           mensagem: `Atenção: ${docDesc} de ${curr.fornecedor || 'Credor'}${valorFormatado} mudou de ${sitAnteriorLabel} para ${situacaoNova}.`,
@@ -1378,7 +1421,7 @@ class ToastAlertManager {
           situacaoAnterior: sitAnteriorLabel,
           situacaoNova,
           dataReferencia: curr.dataReferencia,
-          dataHora: new Date(),
+          dataHora: batchTimestamp,
           showPopup: countUpdates < 5,
         });
         countUpdates++;
@@ -1387,7 +1430,7 @@ class ToastAlertManager {
 
       // Qualquer outra alteração de situação (AO -> LI, EI, LD, EN, II, SD, SI, PPNC, AP -> AO, REPP, RENE, etc.)
       toastsToBatch.push({
-        id: `toast_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+        id: alertId,
         tipo: 'info' as const,
         titulo: 'Alteração de Situação da PP / OB',
         mensagem: `${docDesc} de ${curr.fornecedor || 'Credor'}${valorFormatado} mudou de situação: ${sitAnteriorLabel} → ${situacaoNova}.`,
@@ -1403,7 +1446,7 @@ class ToastAlertManager {
         situacaoAnterior: sitAnteriorLabel,
         situacaoNova,
         dataReferencia: curr.dataReferencia,
-        dataHora: new Date(),
+        dataHora: batchTimestamp,
         showPopup: countUpdates < 5,
       });
       countUpdates++;

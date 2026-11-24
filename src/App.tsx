@@ -160,6 +160,13 @@ export function App() {
       return;
     }
 
+    if (
+      filesRef.current.length > 0 ||
+      (ordensBancariasListRef.current && ordensBancariasListRef.current.length > 0)
+    ) {
+      toastAlertService.ensureBaseline(filesRef.current, ordensBancariasListRef.current);
+    }
+
     ordensBancariasListRef.current = list;
     setOrdensBancariasList(list);
     if (fileName !== undefined) {
@@ -173,7 +180,9 @@ export function App() {
       const cloned = { ...prev, consolidatedSuppliers: [...prev.consolidatedSuppliers] };
       return applyEnrichment(cloned, list);
     });
-    triggerAlertAnalysis(filesRef.current, list);
+    if (queuedUploadsCountRef.current === 0 && !isBatchDriveSyncRef.current) {
+      triggerAlertAnalysis(filesRef.current, list);
+    }
   };
 
   // State for Extrato Geral de Auditoria da Empresa
@@ -515,7 +524,12 @@ export function App() {
     try {
       indexAppKnowledge(finalFiles, finalOBs);
     } catch (_) {}
-    triggerAlertAnalysis(finalFiles, finalOBs);
+    if (alertAnalysisTimeoutRef.current) {
+      alertAnalysisTimeoutRef.current();
+      alertAnalysisTimeoutRef.current = null;
+    }
+    toastAlertService.analyzeFileTransitions(finalFiles, finalOBs);
+    mlInferenceService.processFilesForInference(finalFiles, finalOBs);
     saveAppState(finalFiles, now);
     if (syncToCloud && sessionRef.current?.role === 'admin') {
       cloudSyncService.pushToCloud(finalFiles, finalOBs, ordensBancariasFileNameRef.current, finalEnriched).catch((e) => {
@@ -551,7 +565,10 @@ export function App() {
         hasUserChangesRef.current = true;
 
         // Ensure baseline captures current state before updating/replacing files
-        if (filesRef.current.length > 0) {
+        if (
+          filesRef.current.length > 0 ||
+          (ordensBancariasListRef.current && ordensBancariasListRef.current.length > 0)
+        ) {
           toastAlertService.ensureBaseline(filesRef.current, ordensBancariasListRef.current);
         }
 
@@ -1359,9 +1376,6 @@ export function App() {
           onSelectToast={(t) => setSelectedToastForVerification(t)}
           files={files}
           ordensBancariasList={ordensBancariasList}
-          onSyncAlerts={() => {
-            toastAlertService.syncConfirmations(files, ordensBancariasList, true);
-          }}
         />
       )}
 

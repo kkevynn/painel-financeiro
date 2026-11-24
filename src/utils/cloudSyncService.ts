@@ -501,7 +501,7 @@ class CloudSyncService {
         metrics: metricsPayload,
         filesSummary,
         compactOBs,
-        alerts: toastAlertService.getAlertsHistory().slice(0, 100),
+        alerts: toastAlertService.getAlertsHistory(),
         paraPublicar: paraPublicarService.getItems(),
         mlPatterns,
         mlExactMappings,

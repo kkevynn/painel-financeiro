@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { X, Search, RotateCw, CheckCircle2, AlertCircle, Clock, ExternalLink, Check } from 'lucide-react';
+import { X, Search, CheckCircle2, AlertCircle, Check } from 'lucide-react';
 import { ToastAlert, FileData } from '../types';
 import { toastAlertService } from '../utils/toastAlertService';
 import { formatBRL } from '../utils/excelParser';
@@ -12,22 +12,20 @@ interface ModalHistoricoNotificacoesProps {
   onSelectToast: (toast: ToastAlert) => void;
   files?: FileData[];
   ordensBancariasList?: OrdemBancariaItem[] | null;
-  onSyncAlerts?: () => void;
 }
+
+const INITIAL_RENDER_CHUNK = 150;
 
 export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProps> = ({
   isOpen,
   onClose,
   onSelectToast,
-  files = [],
-  ordensBancariasList,
-  onSyncAlerts,
 }) => {
   const [filter, setFilter] = useState<'all' | 'sucesso' | 'outras_alteracoes' | 'critico'>('all');
   const [searchTerm, setSearchTerm] = useState('');
-  const [isSyncing, setIsSyncing] = useState(false);
   const [syncFeedback, setSyncFeedback] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [visibleCount, setVisibleCount] = useState(INITIAL_RENDER_CHUNK);
   const [allAlerts, setAllAlerts] = useState<ToastAlert[]>(() => toastAlertService.getAlertsHistory());
 
   // Subscribe to toastAlertService changes
@@ -53,10 +51,16 @@ export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProp
   // Load alerts and mark all as read when modal opens
   useEffect(() => {
     if (isOpen) {
+      setVisibleCount(INITIAL_RENDER_CHUNK);
       toastAlertService.markAllAsRead();
       setAllAlerts([...toastAlertService.getAlertsHistory()]);
     }
   }, [isOpen]);
+
+  // Reset progressive render window when filter or search changes
+  useEffect(() => {
+    setVisibleCount(INITIAL_RENDER_CHUNK);
+  }, [filter, searchTerm]);
 
   if (!isOpen) return null;
 
@@ -67,24 +71,6 @@ export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProp
   const countOutrasAlteracoes = allAlerts.filter(
     (a) => a.tipo === 'info' || a.tipo === 'aviso' || a.situacaoNova === 'Virou OB' || a.titulo.toLowerCase().includes('virou ob')
   ).length;
-
-  const handleSync = () => {
-    setIsSyncing(true);
-    setTimeout(() => {
-      try {
-        if (onSyncAlerts) {
-          onSyncAlerts();
-        } else {
-          toastAlertService.syncConfirmations(files, ordensBancariasList, true);
-        }
-        setAllAlerts([...toastAlertService.getAlertsHistory()]);
-        setSyncFeedback('Confirmações sincronizadas com sucesso com os arquivos atuais!');
-        setTimeout(() => setSyncFeedback(null), 3500);
-      } finally {
-        setIsSyncing(false);
-      }
-    }, 200);
-  };
 
   const handleResetBaseline = () => {
     toastAlertService.resetBaseline();
@@ -161,16 +147,6 @@ export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProp
           </div>
 
           <div className="flex items-center gap-2">
-            <button
-              onClick={handleSync}
-              disabled={isSyncing}
-              className="text-xs text-emerald-300 hover:text-white bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg transition flex items-center gap-1.5 cursor-pointer disabled:opacity-50 border border-slate-700 hover:border-emerald-500/50"
-              title="Sincronizar e atualizar confirmações dos arquivos atuais"
-            >
-              <RotateCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin text-emerald-400' : ''}`} />
-              <span>{isSyncing ? 'Sincronizando...' : 'Atualizar Confirmações'}</span>
-            </button>
-
             <button
               onClick={onClose}
               className="p-1 rounded-lg text-slate-400 hover:text-white transition cursor-pointer"
@@ -301,22 +277,29 @@ export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProp
         </div>
 
         {/* List of alerts */}
-        <div className="p-3 overflow-y-auto space-y-1.5 flex-1 divide-y divide-slate-100">
+        <div
+          className="p-3 overflow-y-auto space-y-1.5 flex-1 divide-y divide-slate-100"
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            if (
+              visibleCount < filtered.length &&
+              el.scrollHeight - el.scrollTop - el.clientHeight < 300
+            ) {
+              setVisibleCount((prev) => Math.min(filtered.length, prev + INITIAL_RENDER_CHUNK));
+            }
+          }}
+        >
           {filtered.length === 0 ? (
             <div className="text-center py-12 space-y-2 text-slate-400 text-xs">
               <AlertCircle className="w-8 h-8 text-slate-300 mx-auto" />
               <p>Nenhuma notificação localizada com os filtros selecionados.</p>
-              <button
-                type="button"
-                onClick={handleSync}
-                className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-50 text-emerald-800 border border-emerald-200 rounded-lg font-bold text-xs hover:bg-emerald-100 transition cursor-pointer"
-              >
-                <RotateCw className="w-3.5 h-3.5 text-emerald-600" />
-                <span>Sincronizar com base nos arquivos atuais</span>
-              </button>
+              <p className="text-[11px] text-slate-400">
+                Todas as mudanças de situação entre a última importação e a nova importação aparecerão aqui automaticamente.
+              </p>
             </div>
           ) : (
-            filtered.map((item) => {
+            <>
+            {filtered.slice(0, visibleCount).map((item) => {
               const isCritico = item.tipo === 'critico';
               const isOutras =
                 item.tipo === 'info' ||
@@ -419,7 +402,26 @@ export const ModalHistoricoNotificacoes: React.FC<ModalHistoricoNotificacoesProp
                   </div>
                 </div>
               );
-            })
+            })}
+            {visibleCount < filtered.length && (
+              <div className="pt-3 pb-1 flex items-center justify-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setVisibleCount((prev) => Math.min(filtered.length, prev + INITIAL_RENDER_CHUNK))}
+                  className="px-3 py-1.5 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition cursor-pointer"
+                >
+                  Mostrar mais ({filtered.length - visibleCount} restantes)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setVisibleCount(filtered.length)}
+                  className="px-3 py-1.5 text-xs font-semibold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 rounded-lg transition cursor-pointer"
+                >
+                  Mostrar todas ({filtered.length})
+                </button>
+              </div>
+            )}
+            </>
           )}
         </div>
 

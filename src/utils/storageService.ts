@@ -184,3 +184,55 @@ export async function clearAppState(): Promise<boolean> {
 
   return true;
 }
+
+export async function saveKVToDB(key: string, value: any): Promise<boolean> {
+  try {
+    const db = await openDB(DB_NAME_PRIMARY);
+    const transaction = db.transaction(STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    return await new Promise<boolean>((resolve, reject) => {
+      const request = store.put(value, key);
+      request.onsuccess = () => resolve(true);
+      request.onerror = () => reject(request.error);
+    });
+  } catch {
+    return false;
+  }
+}
+
+export async function loadKVFromDB<T = any>(key: string): Promise<T | null> {
+  try {
+    const db = await openDB(DB_NAME_PRIMARY);
+    if (!db.objectStoreNames.contains(STORE_NAME)) {
+      return null;
+    }
+    const transaction = db.transaction(STORE_NAME, 'readonly');
+    const store = transaction.objectStore(STORE_NAME);
+    return await new Promise<T | null>((resolve, reject) => {
+      const request = store.get(key);
+      request.onsuccess = () => resolve((request.result as T) ?? null);
+      request.onerror = () => reject(request.error);
+    });
+  } catch {
+    return null;
+  }
+}
+
+export async function deleteKVFromDB(key: string): Promise<boolean> {
+  try {
+    const db = await openDB(DB_NAME_PRIMARY);
+    if (!db.objectStoreNames.contains(STORE_NAME)) {
+      return true;
+    }
+    const transaction = db.transaction(STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    return await new Promise<boolean>((resolve) => {
+      const request = store.delete(key);
+      request.onsuccess = () => resolve(true);
+      request.onerror = () => resolve(false);
+    });
+  } catch {
+    return false;
+  }
+}
+
