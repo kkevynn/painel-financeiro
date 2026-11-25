@@ -41,6 +41,171 @@ const GOOGLE_DRIVE_SYNC_URL =
   'https://script.google.com/macros/s/AKfycbyIKBVLRR2hSLt2Ci--84mvBkf8tpvL3QI6GtTkgsWijEOFQiZXInvoE9w303GDCvVA/exec';
 const METRICS_CACHE_STORAGE_KEY = 'painel_fes_metrics_cache_v1';
 const LAST_PUSHED_VERSION_KEY = 'painel_fes_last_pushed_version_v1';
+const MAX_SAFE_PAYLOAD_BYTES = 28 * 1024 * 1024; // Margem segura abaixo do limite de ~50MB do Google Apps Script
+
+/**
+ * Extrai chave ordenável YYYYMMDDHHMMSS de relatórios datados do SIGEF (ex: Relatorio_13112026163419.xls).
+ */
+function extractRelatorioTimestampKey(fileName: string): string | null {
+  const norm = (fileName || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim();
+  const m = norm.match(/^relatorio[_\-\s]*(\d{2})(\d{2})(\d{4})(\d{6})?/i);
+  if (!m) return null;
+  const dd = m[1];
+  const mm = m[2];
+  const yyyy = m[3];
+  const hhmmss = m[4] || '000000';
+  return `${yyyy}${mm}${dd}${hhmmss}`;
+}
+
+/**
+ * Remove cópias antigas/acumuladas de relatórios datados do SIGEF (Relatorio_DDMMYYYYHHMMSS.xls)
+ * em base_pps / pp_prontas, mantendo apenas o relatório mais recente e completo.
+ * Evita explosão de memória e estouro do limite de 50MB no Google Apps Script, sem tocar em
+ * Publicação, Obedece, Não Obedece, Natureza de Despesa ou outras planilhas.
+ */
+export function pruneSupersededRelatorioFiles(files: FileData[]): FileData[] {
+  if (!Array.isArray(files) || files.length <= 1) return files || [];
+
+  const relatorioIndices: Array<{ idx: number; tsKey: string; rowsLen: number }> = [];
+  files.forEach((f, idx) => {
+    if (!f) return;
+    if (f.stage !== 'base_pps' && f.stage !== 'pp_prontas') return;
+    const tsKey = extractRelatorioTimestampKey(f.fileName || '');
+    if (tsKey) {
+      relatorioIndices.push({ idx, tsKey, rowsLen: f.rows?.length || 0 });
+    }
+  });
+
+  if (relatorioIndices.length <= 1) return files;
+
+  const fullExports = relatorioIndices.filter((r) => r.rowsLen >= 2000);
+  const candidates = fullExports.length > 0 ? fullExports : relatorioIndices;
+  candidates.sort((a, b) => {
+    const cmp = b.tsKey.localeCompare(a.tsKey);
+    if (cmp !== 0) return cmp;
+    if (b.rowsLen !== a.rowsLen) return b.rowsLen - a.rowsLen;
+    return b.idx - a.idx;
+  });
+
+  const keepIdxSet = new Set<number>([candidates[0].idx]);
+  // Se houver um relatório parcial estritamente mais recente que o completo, mantém ambos
+  if (fullExports.length > 0) {
+    const newestFull = candidates[0];
+    const newerPartials = relatorioIndices.filter(
+      (r) => r.rowsLen < 2000 && r.tsKey.localeCompare(newestFull.tsKey) > 0
+    );
+    if (newerPartials.length > 0) {
+      newerPartials.sort((a, b) => b.tsKey.localeCompare(a.tsKey) || b.idx - a.idx);
+      keepIdxSet.add(newerPartials[0].idx);
+    }
+  }
+
+  const allRelatorioSet = new Set<number>(relatorioIndices.map((r) => r.idx));
+  return files.filter((_, idx) => !allRelatorioSet.has(idx) || keepIdxSet.has(idx));
+}
+
+function encodeFileForCloud(f: FileData, maxRows?: number) {
+  const allRows = f.rows || [];
+  const isRawObLarge = f.stage === 'ordem_bancaria' && allRows.length > 5000;
+  const effectiveLimit = maxRows !== undefined ? maxRows : isRawObLarge ? 200 : allRows.length;
+  const sourceRows = effectiveLimit < allRows.length ? allRows.slice(0, effectiveLimit) : allRows;
+
+  // Monta cabeçalho compacto com todas as chaves realmente presentes (100% sem perda de colunas)
+  const headerSet = new Set<string>();
+  const compactHeaders: string[] = [];
+  for (const h of f.headers || []) {
+    if (h && !headerSet.has(h)) {
+      headerSet.add(h);
+      compactHeaders.push(h);
+    }
+  }
+  for (let i = 0; i < sourceRows.length; i++) {
+    const r = sourceRows[i];
+    if (!r || typeof r !== 'object') continue;
+    for (const k of Object.keys(r)) {
+      const v = r[k];
+      if (v !== '' && v !== null && v !== undefined && v !== '-' && !headerSet.has(k)) {
+        headerSet.add(k);
+        compactHeaders.push(k);
+      }
+    }
+  }
+
+  const rowsCompact: any[][] = new Array(sourceRows.length);
+  for (let i = 0; i < sourceRows.length; i++) {
+    const r = sourceRows[i] || {};
+    const arr: any[] = [];
+    let lastNonEmpty = -1;
+    for (let c = 0; c < compactHeaders.length; c++) {
+      const v = r[compactHeaders[c]];
+      if (v !== '' && v !== null && v !== undefined && v !== '-') {
+        arr.push(v);
+        lastNonEmpty = c;
+      } else {
+        arr.push(null);
+      }
+    }
+    rowsCompact[i] = lastNonEmpty >= 0 ? arr.slice(0, lastNonEmpty + 1) : [];
+  }
+
+  return {
+    id: f.id || '',
+    fileName: f.fileName || '',
+    stage: f.stage || 'outros',
+    headers: f.headers || compactHeaders,
+    compactHeaders,
+    rowsCompact,
+    detectedFavorecidoCol: f.detectedFavorecidoCol || '',
+    detectedValorCol: f.detectedValorCol || '',
+    detectedNumeroCol: f.detectedNumeroCol || '',
+    detectedPpCol: f.detectedPpCol || '',
+    detectedObCol: f.detectedObCol || '',
+    detectedCnpjCol: f.detectedCnpjCol || '',
+    detectedSituacaoCol: f.detectedSituacaoCol || '',
+    detectedSituacaoObCol: f.detectedSituacaoObCol || '',
+    detectedNotaEmpenhoCol: f.detectedNotaEmpenhoCol || '',
+    detectedFavorecidoNECol: f.detectedFavorecidoNECol || '',
+    detectedProcessoCol: f.detectedProcessoCol || '',
+    detectedFonteCol: f.detectedFonteCol || '',
+    detectedNaturezaCol: f.detectedNaturezaCol || '',
+    detectedDataCol: f.detectedDataCol || '',
+    rowCount: allRows.length,
+    totalCount: f.totalCount || allRows.length,
+    isSummaryOnly: isRawObLarge || effectiveLimit < allRows.length,
+    rows: [],
+  };
+}
+
+function decodeFileFromCloud(rawFile: any): FileData {
+  if (!rawFile || typeof rawFile !== 'object') return rawFile;
+  if (Array.isArray(rawFile.rowsCompact) && Array.isArray(rawFile.compactHeaders)) {
+    const headers: string[] = rawFile.compactHeaders;
+    const rowsCompact: any[][] = rawFile.rowsCompact;
+    const restoredRows: Record<string, any>[] = new Array(rowsCompact.length);
+    for (let i = 0; i < rowsCompact.length; i++) {
+      const arr = rowsCompact[i];
+      const obj: Record<string, any> = {};
+      if (Array.isArray(arr)) {
+        for (let c = 0; c < arr.length && c < headers.length; c++) {
+          const v = arr[c];
+          if (v !== null && v !== undefined && v !== '') {
+            obj[headers[c]] = v;
+          }
+        }
+      }
+      restoredRows[i] = obj;
+    }
+    const { rowsCompact: _rc, compactHeaders: _ch, ...rest } = rawFile;
+    return {
+      ...rest,
+      rows: restoredRows,
+    } as FileData;
+  }
+  return rawFile as FileData;
+}
 
 export interface CloudSyncState {
   isAuthenticated: boolean;
@@ -71,7 +236,17 @@ class CloudSyncService {
   private stopPollingFn: (() => void) | null = null;
   private stopForegroundListenerFn: (() => void) | null = null;
   private isProcessingSync = false;
+  private isPushInFlight = false;
+  private isApplyingCloudPull = false;
+  private pushEpoch = 0;
+  private pendingPushArgs: {
+    files: FileData[];
+    obsList?: OrdemBancariaItem[] | null;
+    obFileName?: string;
+    consolidatedMetrics?: DashboardMetrics | null;
+  } | null = null;
   private pullInFlight: Promise<boolean> | null = null;
+  private pullInFlightOnlyIfNewer = false;
   private lastPullHadNetworkError = false;
   private consecutivePollFailures = 0;
   private pollTickCounter = 0;
@@ -211,6 +386,10 @@ class CloudSyncService {
     return { ...this.state };
   }
 
+  public isRestoringFromCloud(): boolean {
+    return this.isApplyingCloudPull;
+  }
+
   public subscribe(listener: SyncListener): () => void {
     this.listeners.add(listener);
     listener(this.getState());
@@ -296,7 +475,8 @@ class CloudSyncService {
   }
 
   /**
-   * Envia o estado completo do painel para o endpoint oficial no Google Drive (SESAP_PAINEL_STATE_V1.json)
+   * Envia o estado completo do painel para o endpoint oficial no Google Drive (SESAP_PAINEL_STATE_V1.json).
+   * Coalesce atualizações consecutivas para nunca perder edições rápidas nem colidir com polling.
    */
   public async pushToCloud(
     files: FileData[],
@@ -309,29 +489,114 @@ class CloudSyncService {
       return false;
     }
 
-    // Evita colisões de concorrência: espera até 2s se outra sincronização estiver em curso
-    let waitCycles = 0;
-    while (this.isProcessingSync && waitCycles < 10) {
-      await backgroundDelay(200);
-      waitCycles++;
+    // Invalida qualquer pullFromCloud que já estivesse em voo para nunca sobrescrever esta atualização
+    this.pushEpoch++;
+
+    if (this.isPushInFlight) {
+      // Guarda a versão mais recente para enviar imediatamente ao término do envio atual
+      this.pendingPushArgs = { files, obsList, obFileName, consolidatedMetrics };
+      return true;
     }
 
-    return withActiveProcessingLock('cloud-push', () => {
-      let cancelSafetyTimeout: (() => void) | null = null;
-      return Promise.race([
-        this.executePushToCloud(files, obsList, obFileName, consolidatedMetrics).finally(() => {
-          cancelSafetyTimeout?.();
-        }),
-        new Promise<boolean>((resolve) => {
-          cancelSafetyTimeout = scheduleBackgroundTimeout(() => {
-            console.warn('Timeout de segurança ao sincronizar com o Google Drive (90s). Liberando interface.');
-            this.isProcessingSync = false;
-            this.updateState({ isSyncing: false, syncStatus: 'idle' });
-            resolve(false);
-          }, 90000);
-        }),
-      ]);
-    });
+    this.isPushInFlight = true;
+    let lastResult = false;
+    let currentArgs: {
+      files: FileData[];
+      obsList?: OrdemBancariaItem[] | null;
+      obFileName?: string;
+      consolidatedMetrics?: DashboardMetrics | null;
+    } | null = { files, obsList, obFileName, consolidatedMetrics };
+
+    try {
+      while (currentArgs) {
+        const { files: f, obsList: obs, obFileName: obName, consolidatedMetrics: met } = currentArgs;
+        this.pendingPushArgs = null;
+        this.pushEpoch++;
+
+        lastResult = await withActiveProcessingLock('cloud-push', () => {
+          let cancelSafetyTimeout: (() => void) | null = null;
+          return Promise.race([
+            this.executePushToCloud(f, obs, obName, met).finally(() => {
+              cancelSafetyTimeout?.();
+            }),
+            new Promise<boolean>((resolve) => {
+              cancelSafetyTimeout = scheduleBackgroundTimeout(() => {
+                console.warn('Timeout de segurança ao sincronizar com o Google Drive (100s). Liberando interface.');
+                this.isProcessingSync = false;
+                this.updateState({
+                  isSyncing: false,
+                  syncStatus: 'error',
+                  errorMessage: 'Tempo limite excedido ao enviar dados para a nuvem.',
+                });
+                resolve(false);
+              }, 100000);
+            }),
+          ]);
+        });
+
+        currentArgs = this.pendingPushArgs;
+      }
+      return lastResult;
+    } finally {
+      this.isPushInFlight = false;
+      this.pushEpoch++;
+    }
+  }
+
+  private async postJsonToAppsScript(serializedPayload: string): Promise<any> {
+    const attemptPost = async (): Promise<any> => {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 85000);
+      try {
+        const response = await fetch(GOOGLE_DRIVE_SYNC_URL, {
+          method: 'POST',
+          redirect: 'follow',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: serializedPayload,
+          signal: controller.signal,
+        });
+
+        const rawText = await response.text();
+        if (!response.ok) {
+          throw new Error(`Falha HTTP ${response.status} ao salvar no Google Drive.`);
+        }
+
+        let resData: any = null;
+        try {
+          resData = rawText ? JSON.parse(rawText) : { success: true };
+        } catch {
+          const snippet = rawText.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 180);
+          throw new Error(
+            snippet
+              ? `Resposta inesperada do Google Drive: ${snippet}`
+              : 'Resposta inválida retornada pelo endpoint do Google Drive.'
+          );
+        }
+
+        if (resData && resData.success === false) {
+          throw new Error(resData.error || 'Erro retornado pelo endpoint do Google Drive.');
+        }
+
+        return resData;
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    };
+
+    try {
+      return await attemptPost();
+    } catch (firstErr: any) {
+      const isRetryable =
+        firstErr?.name === 'AbortError' ||
+        firstErr instanceof TypeError ||
+        String(firstErr?.message || '').toLowerCase().includes('fetch') ||
+        String(firstErr?.message || '').includes('HTTP 5');
+      if (isRetryable && (typeof navigator === 'undefined' || navigator.onLine !== false)) {
+        await backgroundDelay(1500);
+        return await attemptPost();
+      }
+      throw firstErr;
+    }
   }
 
   private async executePushToCloud(
@@ -343,6 +608,9 @@ class CloudSyncService {
     try {
       this.isProcessingSync = true;
       this.updateState({ isSyncing: true, syncStatus: 'syncing', errorMessage: null });
+
+      // Remove cópias datadas antigas de Relatorio_*.xls (base_pps) para evitar explosão de tamanho (>50MB)
+      const cleanedFiles = pruneSupersededRelatorioFiles(files);
 
       const device = this.getDeviceName();
       const nowDate = new Date();
@@ -392,50 +660,8 @@ class CloudSyncService {
         })
       );
 
-      // 3. Resumo completo dos arquivos carregados:
-      // Nunca trunca planilhas financeiras (base_pps, pp_prontas, obedece, nao_obedece, natureza_despesa, publicacao, outros),
-      // apenas remove propriedades vazias para manter o JSON enxuto sem perder nenhum registro.
-      const compactRow = (r: Record<string, any>) => {
-        const out: Record<string, any> = {};
-        for (const [k, v] of Object.entries(r)) {
-          if (v !== '' && v !== null && v !== undefined && v !== '-') {
-            out[k] = v;
-          }
-        }
-        return out;
-      };
-
-      const filesSummary = files.map((f) => {
-        const allRows = f.rows || [];
-        const isRawObLarge = f.stage === 'ordem_bancaria' && allRows.length > 5000;
-        const keptRows = isRawObLarge
-          ? allRows.slice(0, 200).map(compactRow)
-          : allRows.map(compactRow);
-        return {
-          id: f.id || '',
-          fileName: f.fileName || '',
-          stage: f.stage || 'outros',
-          headers: f.headers || [],
-          detectedFavorecidoCol: f.detectedFavorecidoCol || '',
-          detectedValorCol: f.detectedValorCol || '',
-          detectedNumeroCol: f.detectedNumeroCol || '',
-          detectedPpCol: f.detectedPpCol || '',
-          detectedObCol: f.detectedObCol || '',
-          detectedCnpjCol: f.detectedCnpjCol || '',
-          detectedSituacaoCol: f.detectedSituacaoCol || '',
-          detectedSituacaoObCol: f.detectedSituacaoObCol || '',
-          detectedNotaEmpenhoCol: f.detectedNotaEmpenhoCol || '',
-          detectedFavorecidoNECol: f.detectedFavorecidoNECol || '',
-          detectedProcessoCol: f.detectedProcessoCol || '',
-          detectedFonteCol: f.detectedFonteCol || '',
-          detectedNaturezaCol: f.detectedNaturezaCol || '',
-          detectedDataCol: f.detectedDataCol || '',
-          rowCount: allRows.length,
-          totalCount: f.totalCount || allRows.length,
-          isSummaryOnly: isRawObLarge,
-          rows: keptRows,
-        };
-      });
+      // 3. Codificação colunar compacta sem perdas (reduz o JSON em ~70% preservando 100% das linhas e colunas)
+      let filesSummary = cleanedFiles.map((f) => encodeFileForCloud(f));
 
       // 4. Lista compacta das Ordens Bancárias agrupadas por favorecidoCnpj + fonteRecurso + mesAnoKey
       const compactOBsMap = new Map<string, OrdemBancariaItem>();
@@ -495,7 +721,7 @@ class CloudSyncService {
         fileName: 'SESAP_PAINEL_STATE_V1.json',
         lastSyncAt: nowIso,
         deviceType: device,
-        totalFiles: files.length,
+        totalFiles: cleanedFiles.length,
         version,
         obFileName: effectiveOBFileName,
         metrics: metricsPayload,
@@ -515,23 +741,23 @@ class CloudSyncService {
         },
       };
 
-      const serializedPayload = JSON.stringify(drivePayload);
+      let serializedPayload = JSON.stringify(drivePayload);
 
-      // 6. Envia em uma única requisição HTTP POST para o Google Drive (sem CORS preflight)
-      const response = await fetch(GOOGLE_DRIVE_SYNC_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: serializedPayload,
-      });
-
-      if (!response.ok) {
-        throw new Error(`Falha HTTP ${response.status} ao salvar no Google Drive.`);
+      // Guarda de segurança caso o conjunto de dados ultrapasse 28MB mesmo após compactação colunar
+      if (serializedPayload.length > MAX_SAFE_PAYLOAD_BYTES) {
+        console.warn(
+          `[CloudSync] Payload de ${(serializedPayload.length / (1024 * 1024)).toFixed(1)}MB acima do limite seguro; compactando planilhas extensas preservando 100% das métricas e OBs.`
+        );
+        filesSummary = cleanedFiles.map((f) => {
+          const isHuge = (f.rows?.length || 0) > 15000;
+          return encodeFileForCloud(f, isHuge ? 15000 : undefined);
+        });
+        drivePayload.filesSummary = filesSummary;
+        serializedPayload = JSON.stringify(drivePayload);
       }
 
-      const resData = await response.json();
-      if (resData && resData.success === false) {
-        throw new Error(resData.error || 'Erro retornado pelo endpoint do Google Drive.');
-      }
+      // 6. Envia em uma única requisição HTTP POST para o Google Drive (com timeout + retry automático)
+      await this.postJsonToAppsScript(serializedPayload);
 
       // Espelho direto na pasta dedicada Painel_Financeiro_SESAP_Dados se o OAuth do Drive estiver conectado
       if (googleDriveService.getState().isConnected && googleDriveService.isConnected()) {
@@ -551,7 +777,7 @@ class CloudSyncService {
         syncStatus: 'synced',
         lastSyncAt: nowDate,
         lastSyncDevice: device,
-        remoteFilesCount: files.length,
+        remoteFilesCount: cleanedFiles.length,
         errorMessage: null,
       });
 
@@ -638,18 +864,29 @@ class CloudSyncService {
    * Leitura direta do estado completo no Google Drive (SESAP_PAINEL_STATE_V1.json)
    */
   public async pullFromCloud(onlyIfNewer: boolean = false): Promise<boolean> {
+    if (this.isPushInFlight) {
+      return false;
+    }
     if (this.pullInFlight) {
-      return this.pullInFlight;
+      const existingResult = await this.pullInFlight;
+      // Se um login ou ação manual pediu força total (onlyIfNewer = false) enquanto um polling leve rodava, faz uma leitura completa em seguida
+      if (!onlyIfNewer && this.pullInFlightOnlyIfNewer && !this.isPushInFlight) {
+        return this.pullFromCloud(false);
+      }
+      return existingResult;
     }
 
+    this.pullInFlightOnlyIfNewer = onlyIfNewer;
     this.pullInFlight = this.executePullFromCloud(onlyIfNewer).finally(() => {
       this.pullInFlight = null;
+      this.pullInFlightOnlyIfNewer = false;
     });
 
     return this.pullInFlight;
   }
 
   private async executePullFromCloud(onlyIfNewer: boolean = false): Promise<boolean> {
+    const pullStartEpoch = this.pushEpoch;
     try {
       if (typeof navigator !== 'undefined' && navigator.onLine === false) {
         this.lastPullHadNetworkError = true;
@@ -670,6 +907,11 @@ class CloudSyncService {
       const data = await this.fetchDriveStateJson();
       this.consecutivePollFailures = 0;
       this.pollTickCounter = 0;
+
+      // Se o Administrador iniciou ou concluiu um pushToCloud enquanto este GET estava em voo, descarta dados obsoletos
+      if (this.isPushInFlight || this.pushEpoch !== pullStartEpoch) {
+        return false;
+      }
 
       if (!data) {
         if (!onlyIfNewer) {
@@ -746,17 +988,21 @@ class CloudSyncService {
         parsedMetrics = data.metrics as DashboardMetrics;
       }
 
-      // 2. Restaurar filesSummary
+      // 2. Restaurar filesSummary (decodifica formato colunar rowsCompact ou legado rows)
       let parsedFilesSummary: FileData[] = [];
       if (Array.isArray(data.filesSummary)) {
-        parsedFilesSummary = data.filesSummary;
+        parsedFilesSummary = data.filesSummary.map(decodeFileFromCloud);
       } else if (typeof data.filesSummary === 'string') {
         try {
-          parsedFilesSummary = JSON.parse(data.filesSummary);
+          const parsedRaw = JSON.parse(data.filesSummary);
+          if (Array.isArray(parsedRaw)) {
+            parsedFilesSummary = parsedRaw.map(decodeFileFromCloud);
+          }
         } catch (e) {
           console.warn('Erro ao processar filesSummary:', e);
         }
       }
+      parsedFilesSummary = pruneSupersededRelatorioFiles(parsedFilesSummary);
 
       // 3. Restaurar compactOBs
       let parsedCompactOBs: OrdemBancariaItem[] = [];
@@ -771,75 +1017,80 @@ class CloudSyncService {
       }
       const obFileName = data.obFileName || 'OBs - sigef - Principal';
 
-      // 4. Restaurar paraPublicar
-      if (Array.isArray(data.paraPublicar) && data.paraPublicar.length > 0) {
-        try {
-          paraPublicarService.restoreItems(data.paraPublicar);
-        } catch (e) {
-          console.warn('Erro ao restaurar paraPublicar:', e);
+      this.isApplyingCloudPull = true;
+      try {
+        // 4. Restaurar paraPublicar (inclusive lista vazia caso o Admin tenha limpo)
+        if (Array.isArray(data.paraPublicar)) {
+          try {
+            paraPublicarService.restoreItems(data.paraPublicar);
+          } catch (e) {
+            console.warn('Erro ao restaurar paraPublicar:', e);
+          }
         }
-      }
 
-      // 5. Restaurar alerts
-      if (Array.isArray(data.alerts) && data.alerts.length > 0) {
-        try {
-          const normalizedAlerts = data.alerts.map((a: any) => ({
-            ...a,
-            dataHora: a.dataHora ? new Date(a.dataHora) : new Date(),
-          }));
-          toastAlertService.restoreAlertsHistory(normalizedAlerts);
-        } catch (e) {
-          console.warn('Erro ao restaurar alerts:', e);
+        // 5. Restaurar alerts
+        if (Array.isArray(data.alerts) && data.alerts.length > 0) {
+          try {
+            const normalizedAlerts = data.alerts.map((a: any) => ({
+              ...a,
+              dataHora: a.dataHora ? new Date(a.dataHora) : new Date(),
+            }));
+            toastAlertService.restoreAlertsHistory(normalizedAlerts);
+          } catch (e) {
+            console.warn('Erro ao restaurar alerts:', e);
+          }
         }
-      }
 
-      // 6. Restaurar padrões de aprendizado de máquina
-      if (data.mlPatterns || data.mlExactMappings) {
-        try {
-          const patterns =
-            typeof data.mlPatterns === 'string' ? JSON.parse(data.mlPatterns) : data.mlPatterns || {};
-          const mappings =
-            typeof data.mlExactMappings === 'string'
-              ? JSON.parse(data.mlExactMappings)
-              : data.mlExactMappings || {};
-          mlInferenceService.restoreLearnedPatterns(patterns, mappings);
-        } catch (_) {}
-      }
-
-      // 7. Restaurar preferências locais (Recorrentes, Atendimentos no Mês, Categorias e Overrides)
-      if (data.localPreferences && typeof data.localPreferences === 'object') {
-        try {
-          const prefs = data.localPreferences;
-          if (typeof prefs.recurring === 'string') {
-            localStorage.setItem('finance_manual_recurring_suppliers', prefs.recurring);
-          }
-          if (typeof prefs.atendimentos === 'string') {
-            localStorage.setItem('finance_fornecedores_atendimento_mensal_v1', prefs.atendimentos);
-          }
-          if (typeof prefs.categories === 'string') {
-            localStorage.setItem('sigecon_categories_config', prefs.categories);
-            localStorage.setItem('sigecon_categories_v1', prefs.categories);
-          }
-          if (typeof prefs.categoryOverrides === 'string') {
-            localStorage.setItem('sigecon_supplier_category_overrides', prefs.categoryOverrides);
-          }
-          if (typeof window !== 'undefined') {
-            window.dispatchEvent(new Event('finance_atendimento_mensal_changed'));
-            window.dispatchEvent(new Event('sigecon_categories_changed'));
-            window.dispatchEvent(new Event('sigecon_category_sync_event'));
-            window.dispatchEvent(new Event('finance_recurring_changed'));
-          }
-        } catch (e) {
-          console.warn('Erro ao restaurar localPreferences:', e);
+        // 6. Restaurar padrões de aprendizado de máquina
+        if (data.mlPatterns || data.mlExactMappings) {
+          try {
+            const patterns =
+              typeof data.mlPatterns === 'string' ? JSON.parse(data.mlPatterns) : data.mlPatterns || {};
+            const mappings =
+              typeof data.mlExactMappings === 'string'
+                ? JSON.parse(data.mlExactMappings)
+                : data.mlExactMappings || {};
+            mlInferenceService.restoreLearnedPatterns(patterns, mappings);
+          } catch (_) {}
         }
+
+        // 7. Restaurar preferências locais (Recorrentes, Atendimentos no Mês, Categorias e Overrides)
+        if (data.localPreferences && typeof data.localPreferences === 'object') {
+          try {
+            const prefs = data.localPreferences;
+            if (typeof prefs.recurring === 'string') {
+              localStorage.setItem('finance_manual_recurring_suppliers', prefs.recurring);
+            }
+            if (typeof prefs.atendimentos === 'string') {
+              localStorage.setItem('finance_fornecedores_atendimento_mensal_v1', prefs.atendimentos);
+            }
+            if (typeof prefs.categories === 'string') {
+              localStorage.setItem('sigecon_categories_config', prefs.categories);
+              localStorage.setItem('sigecon_categories_v1', prefs.categories);
+            }
+            if (typeof prefs.categoryOverrides === 'string') {
+              localStorage.setItem('sigecon_supplier_category_overrides', prefs.categoryOverrides);
+            }
+            if (typeof window !== 'undefined') {
+              window.dispatchEvent(new Event('finance_atendimento_mensal_changed'));
+              window.dispatchEvent(new Event('sigecon_categories_changed'));
+              window.dispatchEvent(new Event('sigecon_category_sync_event'));
+              window.dispatchEvent(new Event('finance_recurring_changed'));
+            }
+          } catch (e) {
+            console.warn('Erro ao restaurar localPreferences:', e);
+          }
+        }
+      } finally {
+        this.isApplyingCloudPull = false;
       }
 
-      // Preserva arquivos e OBs locais completos do Administrador quando o snapshot remoto corresponde à mesma versão enviada localmente (evita downgrade de 36k linhas para resumo de 200 linhas no F5)
+      // Preserva arquivos e OBs locais completos SOMENTE no navegador do Administrador que acabou de enviar esta exata versão.
+      // Para qualquer outro login/dispositivo ou versão remota diferente, aplica sempre os dados atualizados da nuvem.
       const localState = await loadAppState();
       const localFiles = localState?.files || [];
       const localTotalRows = localFiles.reduce((acc, f) => acc + (f.rows?.length || 0), 0);
       const remoteTotalRows = parsedFilesSummary.reduce((acc, f) => acc + (f.rows?.length || 0), 0);
-      const localSavedTime = localState?.savedAt ? new Date(localState.savedAt).getTime() : 0;
 
       let lastPushedVersion: string | null = null;
       try {
@@ -849,18 +1100,18 @@ class CloudSyncService {
         Boolean(remoteVersion && lastPushedVersion && String(remoteVersion) === lastPushedVersion);
 
       const preserveLocalFiles =
+        isSameLocalPushedVersion &&
         localFiles.length > 0 &&
-        localTotalRows > remoteTotalRows &&
-        (isSameLocalPushedVersion || (onlyIfNewer && localSavedTime >= validSyncDate.getTime()));
+        localTotalRows > remoteTotalRows;
 
       const effectiveFiles = preserveLocalFiles ? localFiles : parsedFilesSummary;
 
       const localOBState = await loadOrdensBancariasAsync();
       const localOBs = localOBState?.items || [];
       const preserveLocalOBs =
+        isSameLocalPushedVersion &&
         localOBs.length > 0 &&
-        localOBs.length > parsedCompactOBs.length &&
-        (isSameLocalPushedVersion || (onlyIfNewer && localSavedTime >= validSyncDate.getTime()));
+        localOBs.length > parsedCompactOBs.length;
 
       const effectiveOBs = preserveLocalOBs
         ? localOBs

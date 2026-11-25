@@ -44,7 +44,11 @@ import {
   isValidFonteRecursoCode,
 } from './utils/ordemBancariaParser';
 import { googleDriveService, GoogleDriveState } from './utils/googleDriveService';
-import { cloudSyncService, CloudSyncState } from './utils/cloudSyncService';
+import {
+  cloudSyncService,
+  CloudSyncState,
+  pruneSupersededRelatorioFiles,
+} from './utils/cloudSyncService';
 import { indexAppKnowledge } from './utils/appKnowledgeDirectory';
 import { paraPublicarService } from './utils/paraPublicarService';
 import { auth } from './firebase';
@@ -182,6 +186,12 @@ export function App() {
     });
     if (queuedUploadsCountRef.current === 0 && !isBatchDriveSyncRef.current) {
       triggerAlertAnalysis(filesRef.current, list);
+      if (sessionRef.current?.role === 'admin' && filesRef.current.length > 0) {
+        const latestMetrics = applyEnrichment(processUploadedFiles(filesRef.current), list);
+        cloudSyncService
+          .pushToCloud(filesRef.current, list, fileName ?? ordensBancariasFileNameRef.current, latestMetrics)
+          .catch((e) => console.warn('Auto-save na nuvem pós-OB:', e));
+      }
     }
   };
 
@@ -277,10 +287,16 @@ export function App() {
     });
 
     hasUserChangesRef.current = true;
+    filesRef.current = updatedFiles;
     setFiles(updatedFiles);
-    const newMetrics = processUploadedFiles(updatedFiles);
+    const newMetrics = applyEnrichment(processUploadedFiles(updatedFiles), ordensBancariasListRef.current);
     setMetrics(newMetrics);
     saveAppState(updatedFiles, lastProcessedAt || new Date());
+    if (sessionRef.current?.role === 'admin') {
+      cloudSyncService
+        .pushToCloud(updatedFiles, ordensBancariasListRef.current, ordensBancariasFileNameRef.current, newMetrics)
+        .catch((e) => console.warn('Auto-save na nuvem alteração de notificação:', e));
+    }
 
     // Update alert status in service
     toastAlertService.updateToast(toast.id, {
@@ -339,7 +355,7 @@ export function App() {
           setOrdensBancariasFileName(obStored.fileName || '');
         }
 
-        const realFiles = (stored?.files || []).filter(
+        const rawRealFiles = (stored?.files || []).filter(
           (f: any) => {
             if (!f || f.id === 'sample_file_1' || f.fileName?.includes('Relatorio_Credores_Valor_Total.xlsx')) return false;
             // Purge extraneous auxiliary tabs from "Processamento de dados": only keep 'obedece' and 'nao_obedece'
@@ -352,6 +368,7 @@ export function App() {
             return true;
           }
         );
+        const realFiles = pruneSupersededRelatorioFiles(rawRealFiles);
 
         // Auto-extract OBs EXCLUSIVAMENTE de planilhas de Ordem Bancária se ordensBancariasList não tiver fontes válidas
         if ((!obStored?.items || obStored.items.length === 0 || !storedHasValidFonte) && realFiles.length > 0) {
@@ -513,8 +530,12 @@ export function App() {
   };
 
   // Run final dashboard consolidation, indexing, alert analysis, and cloud sync once per batch
-  const finalizeDataConsolidation = (syncToCloud: boolean = true) => {
-    const finalFiles = filesRef.current;
+  const finalizeDataConsolidation = async (syncToCloud: boolean = true): Promise<boolean> => {
+    const finalFiles = pruneSupersededRelatorioFiles(filesRef.current);
+    if (finalFiles.length !== filesRef.current.length) {
+      filesRef.current = finalFiles;
+      setFiles(finalFiles);
+    }
     const finalOBs = ordensBancariasListRef.current;
     const finalMetrics = processUploadedFiles(finalFiles);
     const finalEnriched = applyEnrichment(finalMetrics, finalOBs);
@@ -532,10 +553,31 @@ export function App() {
     mlInferenceService.processFilesForInference(finalFiles, finalOBs);
     saveAppState(finalFiles, now);
     if (syncToCloud && sessionRef.current?.role === 'admin') {
-      cloudSyncService.pushToCloud(finalFiles, finalOBs, ordensBancariasFileNameRef.current, finalEnriched).catch((e) => {
+      try {
+        const ok = await cloudSyncService.pushToCloud(
+          finalFiles,
+          finalOBs,
+          ordensBancariasFileNameRef.current,
+          finalEnriched
+        );
+        if (!ok) {
+          const errDetail = cloudSyncService.getState().errorMessage;
+          toastAlertService.addToast({
+            tipo: 'aviso',
+            titulo: 'Sincronização em nuvem pendente',
+            mensagem: errDetail
+              ? `Os dados foram salvos localmente, mas não chegaram à nuvem: ${errDetail}`
+              : 'Os dados foram salvos neste dispositivo, mas não foi possível publicar na nuvem. Clique em "Salvar Dados" para tentar novamente.',
+            showPopup: true,
+          });
+        }
+        return ok;
+      } catch (e) {
         console.warn('Auto-save na nuvem pós-upload:', e);
-      });
+        return false;
+      }
     }
+    return true;
   };
 
   // Upload file action (serialized sequentially to prevent concurrent SheetJS Out-of-Memory spikes)
@@ -623,6 +665,7 @@ export function App() {
           }
         }
 
+        updated = pruneSupersededRelatorioFiles(updated);
         filesRef.current = updated;
         setFiles(updated);
       } catch (error: any) {
@@ -634,10 +677,10 @@ export function App() {
       } finally {
         queuedUploadsCountRef.current = Math.max(0, queuedUploadsCountRef.current - 1);
         if (queuedUploadsCountRef.current === 0 && !isBatchDriveSyncRef.current) {
-          setProcessingMessage('Consolidando dados...');
+          setProcessingMessage('Consolidando e publicando dados na nuvem...');
           setProcessingProgress(85);
           await backgroundDelay(30);
-          finalizeDataConsolidation(true);
+          await finalizeDataConsolidation(true);
           setProcessingProgress(100);
           scheduleBackgroundTimeout(() => {
             setIsProcessing(false);
@@ -725,8 +768,40 @@ export function App() {
       }
     });
 
+    // Auto-sincroniza alterações administrativas de preferências/filas (Para Publicar, Atendimentos, Categorias, Recorrentes)
+    let cancelPrefPushTimer: (() => void) | null = null;
+    const scheduleAdminPreferencesPush = () => {
+      if (sessionRef.current?.role !== 'admin') return;
+      if (cloudSyncService.isRestoringFromCloud()) return;
+      if (filesRef.current.length === 0) return;
+      if (cancelPrefPushTimer) cancelPrefPushTimer();
+      cancelPrefPushTimer = scheduleBackgroundTimeout(() => {
+        cancelPrefPushTimer = null;
+        if (sessionRef.current?.role !== 'admin' || cloudSyncService.isRestoringFromCloud()) return;
+        const currentFiles = filesRef.current;
+        if (currentFiles.length === 0) return;
+        const currentOBs = ordensBancariasListRef.current;
+        const currentMetrics = applyEnrichment(processUploadedFiles(currentFiles), currentOBs);
+        cloudSyncService
+          .pushToCloud(currentFiles, currentOBs, ordensBancariasFileNameRef.current, currentMetrics)
+          .catch((e) => console.warn('Auto-save na nuvem de preferências:', e));
+      }, 2000);
+    };
+
+    const unsubParaPublicar = paraPublicarService.subscribe(scheduleAdminPreferencesPush);
+    const prefEvents = [
+      'finance_atendimento_mensal_changed',
+      'sigecon_categories_changed',
+      'sigecon_category_sync_event',
+      'finance_recurring_changed',
+    ];
+    prefEvents.forEach((ev) => window.addEventListener(ev, scheduleAdminPreferencesPush));
+
     return () => {
       unsubscribe();
+      unsubParaPublicar();
+      prefEvents.forEach((ev) => window.removeEventListener(ev, scheduleAdminPreferencesPush));
+      if (cancelPrefPushTimer) cancelPrefPushTimer();
     };
   }, [applyEnrichment]);
 
@@ -786,18 +861,18 @@ export function App() {
         await uploadQueueRef.current;
 
         if (result.hasUpdate) {
-          setProcessingMessage('Consolidando dados sincronizados...');
-          setProcessingProgress(65);
+          setProcessingMessage('Consolidando e publicando dados sincronizados na nuvem...');
+          setProcessingProgress(70);
           await backgroundDelay(30);
-          finalizeDataConsolidation(true);
-        }
-
-        // Also sync Firestore cloud state across Tablet & PC
-        try {
-          setProcessingProgress(75);
-          await cloudSyncService.checkAndAutoSync();
-        } catch (cloudErr) {
-          console.warn('Sincronização em nuvem:', cloudErr);
+          await finalizeDataConsolidation(true);
+        } else {
+          // Sem novos arquivos no Drive pessoal: puxa eventuais atualizações da nuvem compartilhada
+          try {
+            setProcessingProgress(75);
+            await cloudSyncService.checkAndAutoSync();
+          } catch (cloudErr) {
+            console.warn('Sincronização em nuvem:', cloudErr);
+          }
         }
 
         setProcessingProgress(90);
