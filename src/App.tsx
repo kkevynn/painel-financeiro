@@ -44,11 +44,7 @@ import {
   isValidFonteRecursoCode,
 } from './utils/ordemBancariaParser';
 import { googleDriveService, GoogleDriveState } from './utils/googleDriveService';
-import {
-  cloudSyncService,
-  CloudSyncState,
-  pruneSupersededRelatorioFiles,
-} from './utils/cloudSyncService';
+import { cloudSyncService, CloudSyncState } from './utils/cloudSyncService';
 import { indexAppKnowledge } from './utils/appKnowledgeDirectory';
 import { paraPublicarService } from './utils/paraPublicarService';
 import { auth } from './firebase';
@@ -355,7 +351,7 @@ export function App() {
           setOrdensBancariasFileName(obStored.fileName || '');
         }
 
-        const rawRealFiles = (stored?.files || []).filter(
+        const realFiles = (stored?.files || []).filter(
           (f: any) => {
             if (!f || f.id === 'sample_file_1' || f.fileName?.includes('Relatorio_Credores_Valor_Total.xlsx')) return false;
             // Purge extraneous auxiliary tabs from "Processamento de dados": only keep 'obedece' and 'nao_obedece'
@@ -368,7 +364,6 @@ export function App() {
             return true;
           }
         );
-        const realFiles = pruneSupersededRelatorioFiles(rawRealFiles);
 
         // Auto-extract OBs EXCLUSIVAMENTE de planilhas de Ordem Bancária se ordensBancariasList não tiver fontes válidas
         if ((!obStored?.items || obStored.items.length === 0 || !storedHasValidFonte) && realFiles.length > 0) {
@@ -531,11 +526,7 @@ export function App() {
 
   // Run final dashboard consolidation, indexing, alert analysis, and cloud sync once per batch
   const finalizeDataConsolidation = async (syncToCloud: boolean = true): Promise<boolean> => {
-    const finalFiles = pruneSupersededRelatorioFiles(filesRef.current);
-    if (finalFiles.length !== filesRef.current.length) {
-      filesRef.current = finalFiles;
-      setFiles(finalFiles);
-    }
+    const finalFiles = filesRef.current;
     const finalOBs = ordensBancariasListRef.current;
     const finalMetrics = processUploadedFiles(finalFiles);
     const finalEnriched = applyEnrichment(finalMetrics, finalOBs);
@@ -665,7 +656,6 @@ export function App() {
           }
         }
 
-        updated = pruneSupersededRelatorioFiles(updated);
         filesRef.current = updated;
         setFiles(updated);
       } catch (error: any) {

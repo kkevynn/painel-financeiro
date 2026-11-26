@@ -371,6 +371,25 @@ class ToastAlertManager {
         continue;
       }
 
+      // Descarta alertas de regressão impossível no SIGEF (ex: Cancelada/Rejeitada/Confirmada -> AO/AP/Pendente)
+      const prevSitLoaded = (item.situacaoAnterior || '').trim().toUpperCase();
+      const newSitLoaded = (item.situacaoNova || '').trim().toUpperCase();
+      if (prevSitLoaded && newSitLoaded) {
+        const prevWasTerminal =
+          isSituacaoRejeitada(prevSitLoaded) ||
+          isSituacaoRejeitadaBanco(prevSitLoaded).isMatch ||
+          isSituacaoConfirmadaBanco(prevSitLoaded).isMatch;
+        const newIsOpen =
+          isSituacaoAOOuVazia(newSitLoaded) ||
+          (!isSituacaoConfirmadaBanco(newSitLoaded).isMatch &&
+            !isSituacaoRejeitadaBanco(newSitLoaded).isMatch &&
+            !isSituacaoRejeitada(newSitLoaded) &&
+            isSituacaoNaoPaga(newSitLoaded));
+        if (prevWasTerminal && newIsOpen) {
+          continue;
+        }
+      }
+
       const key = getAlertUniqueKey(item);
       if (!seen.has(key)) {
         seen.add(key);
@@ -651,10 +670,12 @@ class ToastAlertManager {
 
   public restoreAlertsHistory(alerts: ToastAlert[]) {
     if (!Array.isArray(alerts) || alerts.length === 0) return;
+    const sanitizedAlerts = this.normalizeLoadedAlerts(alerts);
+    if (sanitizedAlerts.length === 0) return;
     const existingKeys = new Set(this.alertsHistory.map((t) => getAlertUniqueKey(t)));
     const newItems: ToastAlert[] = [];
 
-    for (const a of alerts) {
+    for (const a of sanitizedAlerts) {
       if (!a || typeof a !== 'object') continue;
 
       const key = getAlertUniqueKey(a);
@@ -935,6 +956,19 @@ class ToastAlertManager {
           fileName: 'Listar Ordem Bancária',
         };
 
+        const existingObRec = records[key];
+        if (existingObRec) {
+          const existingIsTerminal = existingObRec.isConclusivo || existingObRec.isRejected;
+          const incomingIsTerminal = isConclusivo || isRejected;
+          const incomingIsOpen =
+            isSituacaoAOOuVazia(sitStr) || (!incomingIsTerminal && isSituacaoNaoPaga(sitStr));
+          if (existingIsTerminal && incomingIsOpen) {
+            return;
+          }
+          if (!incomingIsTerminal && existingIsTerminal) {
+            return;
+          }
+        }
         records[key] = itemRecord;
       });
     }
@@ -1163,7 +1197,7 @@ class ToastAlertManager {
         const resolvedIsFonte600 = isFonte600OuDerivada(rawFonte);
 
         const isRejected = isSituacaoRejeitada(rawSit) || isSituacaoRejeitadaBanco(rawSit).isMatch;
-        const isConclusivo = isSituacaoConclusivaPagamento(rawSit) || isSituacaoConfirmadaBanco(rawSit).isMatch || (!!obNum && !isRejected);
+        const isConclusivo = isSituacaoConclusivaPagamento(rawSit) || isSituacaoConfirmadaBanco(rawSit).isMatch;
 
         const rowDateInfo = extractRowDate(row);
 
@@ -1207,10 +1241,19 @@ class ToastAlertManager {
           const trueFonte = (rawFonte && rawFonte !== 'OUTRAS') ? rawFonte : (existing.fonteRecurso || 'OUTRAS');
           const trueIsF600 = resolvedIsFonte600 || existing.isFonte600;
 
+          const existingIsTerminal = existing.isConclusivo || existing.isRejected;
+          const incomingIsTerminal = isConclusivo || isRejected;
+          const incomingIsOpen =
+            isSituacaoAOOuVazia(rawSit) || (!incomingIsTerminal && isSituacaoNaoPaga(rawSit));
+
+          // Jamais permite que uma situação pendente/aberta (AO, AP, vazia) sobrescreva uma situação
+          // terminal (Cancelada/Rejeitada C/RJ/PPRJ ou Confirmada/Paga PPCB/CB/PAGO)
           const isBetterSit =
-            (isSituacaoAOOuVazia(existing.situacao) && !isSituacaoAOOuVazia(rawSit)) ||
-            (isConclusivo && !existing.isConclusivo) ||
-            (!existing.isConclusivo && Boolean(rawSit && rawSit !== existing.situacao));
+            !(existingIsTerminal && incomingIsOpen) &&
+            ((isSituacaoAOOuVazia(existing.situacao) && !isSituacaoAOOuVazia(rawSit)) ||
+              (incomingIsTerminal && !existingIsTerminal) ||
+              (!existingIsTerminal &&
+                Boolean(rawSit && rawSit !== existing.situacao && !isSituacaoAOOuVazia(rawSit))));
 
           return {
             ...existing,
@@ -1337,6 +1380,24 @@ class ToastAlertManager {
 
       // Exige mudança real da situação entre a importação anterior e a nova importação
       if (prevSituacao === currSit) continue;
+
+      // Bloqueio de regressão impossível no SIGEF:
+      // Uma OB/PP já Cancelada/Rejeitada (C, RJ, PPRJ) ou já Confirmada/Paga (PPCB, CB, CM, PAGO)
+      // jamais pode voltar para situação pendente/aberta (AO, AP, LI, PENDENTE, etc.)
+      const prevIsTerminal = prevRej.isMatch || isSituacaoRejeitada(prevSituacao) || prevConf.isMatch;
+      const currIsOpenOrPending =
+        isSituacaoAOOuVazia(currSit) ||
+        (!confInfo.isMatch && !rejInfo.isMatch && !isSituacaoRejeitada(currSit) && isSituacaoNaoPaga(currSit));
+      if (prevIsTerminal && currIsOpenOrPending) {
+        // Preserva o status terminal no snapshot para não rebaixar o baseline para AO em importações futuras
+        currentRecords[key] = {
+          ...curr,
+          situacao: prev.situacao,
+          isConclusivo: Boolean(prevConf.isMatch || prev.isConclusivo),
+          isRejected: Boolean(prevRej.isMatch || isSituacaoRejeitada(prevSituacao) || prev.isRejected),
+        };
+        continue;
+      }
 
       const situacaoNova = confInfo.isMatch
         ? currSit || confInfo.normalized
