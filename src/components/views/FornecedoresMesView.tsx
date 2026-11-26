@@ -4,7 +4,6 @@ import {
   CheckCircle2,
   Clock,
   Search,
-  Download,
   Building,
   Repeat,
   ExternalLink,
@@ -18,10 +17,17 @@ import {
   ArrowRight,
   Undo2,
   Loader2,
+  FileSpreadsheet,
+  FileText,
 } from 'lucide-react';
-import * as XLSX from 'xlsx';
 import { DashboardMetrics, FileData, ConsolidatedSupplier, CategoryDefinition } from '../../types';
 import { formatBRL } from '../../utils/excelParser';
+import { OrdemBancariaItem } from '../../utils/ordemBancariaParser';
+import {
+  collectAttendedSuppliersOBs,
+  exportAttendedSuppliersOBsToExcel,
+  exportAttendedSuppliersOBsToPdf,
+} from '../../utils/fornecedoresAtendidosObService';
 import { getManualRecurringSuppliers } from '../../utils/recorrenciaService';
 import {
   getCurrentMonthKey,
@@ -47,13 +53,15 @@ import { InfoHelpButton } from '../InfoHelpButton';
 interface FornecedoresMesViewProps {
   metrics: DashboardMetrics;
   files: FileData[];
+  ordensBancariasList?: OrdemBancariaItem[] | null;
   onOpenCompanyAudit?: (supplier: { name: string; cnpj: string }) => void;
   onNavigateToTab?: (tab: string) => void;
 }
 
 export const FornecedoresMesView: React.FC<FornecedoresMesViewProps> = ({
   metrics,
-  files: _files,
+  files,
+  ordensBancariasList,
   onOpenCompanyAudit,
   onNavigateToTab,
 }) => {
@@ -194,8 +202,10 @@ export const FornecedoresMesView: React.FC<FornecedoresMesViewProps> = ({
       }
     });
 
-    // Sort: highest value first, or newest attendance first
-    return attendedList.sort((a, b) => b.totalValue - a.totalValue);
+    // Ordenar alfabeticamente por fornecedor (A → Z)
+    return attendedList.sort((a, b) =>
+      a.name.localeCompare(b.name, 'pt-BR', { sensitivity: 'base' })
+    );
   }, [metrics.consolidatedSuppliers, allRecords, selectedMonthKey, recurringKeysSet]);
 
   // Filtered attended suppliers by search and type
@@ -289,34 +299,62 @@ export const FornecedoresMesView: React.FC<FornecedoresMesViewProps> = ({
     setAllRecords({ ...getAllAtendimentos() });
   };
 
-  const [isExporting, setIsExporting] = useState(false);
+  const [exportingFormat, setExportingFormat] = useState<'excel' | 'pdf' | null>(null);
+  const [exportNotice, setExportNotice] = useState<string | null>(null);
 
-  // Export to Excel
-  const handleExportExcel = () => {
-    if (filteredSuppliers.length === 0 || isExporting) return;
+  // Ordens Bancárias pertencentes EXCLUSIVAMENTE aos fornecedores selecionados como atendidos
+  const attendedSuppliersOBs = useMemo(
+    () => collectAttendedSuppliersOBs(filteredSuppliers, files, ordensBancariasList, metrics),
+    [filteredSuppliers, files, ordensBancariasList, metrics]
+  );
 
-    setIsExporting(true);
+  // Exportar Excel contendo apenas as Ordens Bancárias em situação AO dos fornecedores atendidos (organizado por fornecedor A-Z)
+  const handleExportExcelOBs = () => {
+    if (filteredSuppliers.length === 0 || exportingFormat) return;
+    if (attendedSuppliersOBs.length === 0) {
+      setExportNotice('Nenhuma Ordem Bancária na situação AO localizada para os fornecedores atendidos selecionados.');
+      setTimeout(() => setExportNotice(null), 5000);
+      return;
+    }
+
+    setExportNotice(null);
+    setExportingFormat('excel');
     setTimeout(() => {
       try {
-        const rows = filteredSuppliers.map((s, idx) => ({
-          '#': idx + 1,
-          'Mês de Referência': formatMonthFull(selectedMonthKey),
-          'Favorecido / Fornecedor': s.name,
-          'CNPJ': s.cnpj || 'N/I',
-          'Classificação': s.isRec ? 'Recorrente' : 'Comum',
-          'Data de Atendimento': s.dataAtendimento ? new Date(s.dataAtendimento).toLocaleDateString('pt-BR') : '-',
-          'Valor Total no Painel (R$)': s.totalValue,
-          'Anotação / PP Emitida': s.observacao || '',
-        }));
-
-        const worksheet = XLSX.utils.json_to_sheet(rows);
-        const workbook = XLSX.utils.book_new();
-        XLSX.utils.book_append_sheet(workbook, worksheet, `Atendidos_${selectedMonthKey}`);
-        XLSX.writeFile(workbook, `Fornecedores_Atendidos_${selectedMonthKey}.xlsx`);
+        exportAttendedSuppliersOBsToExcel(
+          attendedSuppliersOBs,
+          formatMonthFull(selectedMonthKey),
+          selectedMonthKey
+        );
       } finally {
-        setIsExporting(false);
+        setExportingFormat(null);
       }
-    }, 200);
+    }, 150);
+  };
+
+  // Exportar PDF contendo apenas as Ordens Bancárias em situação AO dos fornecedores atendidos (organizado por fornecedor A-Z)
+  const handleExportPdfOBs = () => {
+    if (filteredSuppliers.length === 0 || exportingFormat) return;
+    if (attendedSuppliersOBs.length === 0) {
+      setExportNotice('Nenhuma Ordem Bancária na situação AO localizada para os fornecedores atendidos selecionados.');
+      setTimeout(() => setExportNotice(null), 5000);
+      return;
+    }
+
+    setExportNotice(null);
+    setExportingFormat('pdf');
+    setTimeout(() => {
+      try {
+        exportAttendedSuppliersOBsToPdf(
+          attendedSuppliersOBs,
+          formatMonthFull(selectedMonthKey),
+          selectedMonthKey,
+          filteredSuppliers.length
+        );
+      } finally {
+        setExportingFormat(null);
+      }
+    }, 150);
   };
 
   return (
@@ -515,25 +553,58 @@ export const FornecedoresMesView: React.FC<FornecedoresMesViewProps> = ({
               </div>
 
               <button
-                onClick={handleExportExcel}
-                disabled={isExporting}
-                className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-2xs active:scale-98 disabled:opacity-75 disabled:cursor-wait"
-                title="Exportar fornecedores atendidos para Excel"
+                type="button"
+                onClick={handleExportExcelOBs}
+                disabled={exportingFormat !== null}
+                className="px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 font-bold text-xs rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-2xs active:scale-98 disabled:opacity-75 disabled:cursor-wait"
+                title="Gerar Excel apenas com as Ordens Bancárias em situação AO dos fornecedores atendidos (ordem alfabética por fornecedor)"
               >
-                {isExporting ? (
+                {exportingFormat === 'excel' ? (
                   <>
-                    <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-600" />
-                    <span>Exportando...</span>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-700" />
+                    <span>Gerando...</span>
                   </>
                 ) : (
                   <>
-                    <Download className="w-3.5 h-3.5" />
-                    <span>Exportar</span>
+                    <FileSpreadsheet className="w-3.5 h-3.5" />
+                    <span>Excel OBs AO ({attendedSuppliersOBs.length})</span>
+                  </>
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={handleExportPdfOBs}
+                disabled={exportingFormat !== null}
+                className="px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-800 border border-rose-200 font-bold text-xs rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-2xs active:scale-98 disabled:opacity-75 disabled:cursor-wait"
+                title="Gerar PDF apenas com as Ordens Bancárias em situação AO dos fornecedores atendidos (ordem alfabética por fornecedor)"
+              >
+                {exportingFormat === 'pdf' ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-rose-700" />
+                    <span>Gerando...</span>
+                  </>
+                ) : (
+                  <>
+                    <FileText className="w-3.5 h-3.5" />
+                    <span>PDF OBs AO ({attendedSuppliersOBs.length})</span>
                   </>
                 )}
               </button>
             </div>
           </div>
+          {exportNotice && (
+            <div className="px-5 py-2.5 bg-amber-50 border-b border-amber-200 text-amber-800 text-xs font-semibold flex items-center justify-between gap-2">
+              <span>{exportNotice}</span>
+              <button
+                type="button"
+                onClick={() => setExportNotice(null)}
+                className="text-amber-700 hover:text-amber-900 cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
 
           {/* Table */}
           <div className="overflow-x-auto">

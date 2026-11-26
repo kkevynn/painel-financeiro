@@ -120,9 +120,87 @@ export function invalidateAtendimentosCache(): void {
   lastRawAtendimentos = null;
 }
 
+function getRecordTimestampMs(rec?: AtendimentoMensalRecord | null): number {
+  if (!rec) return 0;
+  const raw = rec.updatedAt || rec.dataAtendimento || '';
+  const ts = Date.parse(raw);
+  return Number.isFinite(ts) ? ts : 0;
+}
+
 /**
- * Load all records from localStorage with ultra fast in-memory cache
- * Automatically searches and restores from backup and legacy keys to guarantee ZERO DATA LOSS.
+ * Faz o merge seguro de dois mapas de atendimento mensal registro a registro,
+ * mantendo sempre a alteração mais recente (updatedAt) por fornecedor/mês.
+ */
+export function mergeAtendimentosMaps(
+  localMap: Record<string, AtendimentoMensalRecord> | null | undefined,
+  incomingMap: Record<string, AtendimentoMensalRecord> | null | undefined
+): { merged: Record<string, AtendimentoMensalRecord>; localHadNewer: boolean; changedFromLocal: boolean } {
+  const merged: Record<string, AtendimentoMensalRecord> = {};
+  const safeLocal = localMap && typeof localMap === 'object' ? localMap : {};
+  const safeIncoming = incomingMap && typeof incomingMap === 'object' ? incomingMap : {};
+
+  let localHadNewer = false;
+  let changedFromLocal = false;
+
+  for (const [id, rec] of Object.entries(safeLocal)) {
+    if (rec && typeof rec === 'object') {
+      merged[id] = rec;
+    }
+  }
+
+  for (const id of Object.keys(safeLocal)) {
+    if (!(id in safeIncoming)) {
+      localHadNewer = true;
+    }
+  }
+
+  for (const [id, incRec] of Object.entries(safeIncoming)) {
+    if (!incRec || typeof incRec !== 'object') continue;
+    const locRec = merged[id];
+    if (!locRec) {
+      merged[id] = incRec;
+      changedFromLocal = true;
+      continue;
+    }
+
+    const locTs = getRecordTimestampMs(locRec);
+    const incTs = getRecordTimestampMs(incRec);
+
+    if (incTs > locTs) {
+      merged[id] = {
+        ...incRec,
+        observacao: incRec.observacao !== undefined ? incRec.observacao : locRec.observacao,
+      };
+      changedFromLocal = true;
+    } else if (locTs > incTs) {
+      localHadNewer = true;
+    } else if (!locRec.atendido && incRec.atendido) {
+      merged[id] = incRec;
+      changedFromLocal = true;
+    } else if (locRec.atendido && !incRec.atendido) {
+      localHadNewer = true;
+    }
+  }
+
+  return { merged, localHadNewer, changedFromLocal };
+}
+
+function parseAtendimentosJson(raw: string | null): Record<string, AtendimentoMensalRecord> | null {
+  if (!raw) return null;
+  try {
+    const candidate = JSON.parse(raw);
+    if (candidate && typeof candidate === 'object' && !Array.isArray(candidate) && Object.keys(candidate).length > 0) {
+      return candidate;
+    }
+  } catch (e) {
+    console.warn('Erro ao decodificar JSON de atendimentos:', e);
+  }
+  return null;
+}
+
+/**
+ * Load all records from localStorage with ultra fast in-memory cache.
+ * Automatically merges STORAGE_KEY with BACKUP_STORAGE_KEY by updatedAt and searches fallback keys to guarantee ZERO DATA LOSS.
  */
 export function getAllAtendimentos(): Record<string, AtendimentoMensalRecord> {
   try {
@@ -132,32 +210,39 @@ export function getAllAtendimentos(): Record<string, AtendimentoMensalRecord> {
     }
     lastRawAtendimentos = raw;
 
-    let parsed: Record<string, AtendimentoMensalRecord> | null = null;
+    let parsed = parseAtendimentosJson(raw);
+    const backupParsed = parseAtendimentosJson(localStorage.getItem(BACKUP_STORAGE_KEY));
 
-    if (raw) {
-      try {
-        const candidate = JSON.parse(raw);
-        if (candidate && typeof candidate === 'object' && Object.keys(candidate).length > 0) {
-          parsed = candidate;
-        }
-      } catch (e) {
-        console.warn('Erro ao decodificar JSON primário de atendimentos:', e);
+    // Se o backup possuir marcações mais recentes ou ausentes na chave primária, recupera automaticamente
+    if (parsed && backupParsed) {
+      const { merged, changedFromLocal } = mergeAtendimentosMaps(parsed, backupParsed);
+      if (changedFromLocal) {
+        parsed = merged;
+        const mergedStr = JSON.stringify(merged);
+        lastRawAtendimentos = mergedStr;
+        try {
+          localStorage.setItem(STORAGE_KEY, mergedStr);
+          localStorage.setItem(BACKUP_STORAGE_KEY, mergedStr);
+        } catch (_) {}
       }
+    } else if (!parsed && backupParsed) {
+      parsed = backupParsed;
+      const mergedStr = JSON.stringify(backupParsed);
+      lastRawAtendimentos = mergedStr;
+      try {
+        localStorage.setItem(STORAGE_KEY, mergedStr);
+      } catch (_) {}
     }
 
-    // If primary storage was empty or had 0 records, actively search fallback and backup keys!
+    // If primary & backup storage were empty, actively search other fallback/legacy keys
     if (!parsed || Object.keys(parsed).length === 0) {
       for (const fallbackKey of FALLBACK_KEYS) {
         try {
-          const fallbackRaw = localStorage.getItem(fallbackKey);
-          if (fallbackRaw) {
-            const candidate = JSON.parse(fallbackRaw);
-            if (candidate && typeof candidate === 'object' && Object.keys(candidate).length > 0) {
-              parsed = candidate;
-              // Restore immediately to primary and backup
-              saveAll(candidate);
-              break;
-            }
+          const candidate = parseAtendimentosJson(localStorage.getItem(fallbackKey));
+          if (candidate) {
+            parsed = candidate;
+            saveAll(candidate);
+            break;
           }
         } catch (_) {}
       }
@@ -168,14 +253,11 @@ export function getAllAtendimentos(): Record<string, AtendimentoMensalRecord> {
           const key = localStorage.key(i);
           if (key && key.includes('atendimento') && !FALLBACK_KEYS.includes(key)) {
             try {
-              const val = localStorage.getItem(key);
-              if (val) {
-                const candidate = JSON.parse(val);
-                if (candidate && typeof candidate === 'object' && Object.keys(candidate).length > 0) {
-                  parsed = candidate;
-                  saveAll(candidate);
-                  break;
-                }
+              const candidate = parseAtendimentosJson(localStorage.getItem(key));
+              if (candidate) {
+                parsed = candidate;
+                saveAll(candidate);
+                break;
               }
             } catch (_) {}
           }
@@ -192,6 +274,30 @@ export function getAllAtendimentos(): Record<string, AtendimentoMensalRecord> {
   }
   cachedAtendimentos = {};
   return cachedAtendimentos;
+}
+
+/**
+ * Mescla atendimentos vindos da nuvem com os registros locais (e backup) usando updatedAt,
+ * evitando que um pull atrasado apague fornecedores recém-marcados localmente.
+ */
+export function mergeAtendimentosFromCloud(remoteRawJson: string): {
+  mergedJson: string;
+  localHadNewer: boolean;
+} {
+  const remoteMap = parseAtendimentosJson(remoteRawJson) || {};
+  invalidateAtendimentosCache();
+  const localMap = getAllAtendimentos();
+  const { merged, localHadNewer } = mergeAtendimentosMaps(localMap, remoteMap);
+  const mergedJson = JSON.stringify(merged);
+  cachedAtendimentos = merged;
+  lastRawAtendimentos = mergedJson;
+  try {
+    localStorage.setItem(STORAGE_KEY, mergedJson);
+    localStorage.setItem(BACKUP_STORAGE_KEY, mergedJson);
+  } catch (err) {
+    console.error('Erro ao salvar merge de atendimentos da nuvem:', err);
+  }
+  return { mergedJson, localHadNewer };
 }
 
 /**

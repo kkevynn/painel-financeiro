@@ -27,6 +27,7 @@ import { mlInferenceService } from './machineLearningInferenceService';
 import { toastAlertService } from './toastAlertService';
 import { isAdmin } from './authService';
 import { googleDriveService } from './googleDriveService';
+import { getAllAtendimentos, mergeAtendimentosFromCloud } from './atendimentoMensalService';
 import {
   scheduleBackgroundInterval,
   scheduleBackgroundTimeout,
@@ -43,17 +44,95 @@ const METRICS_CACHE_STORAGE_KEY = 'painel_fes_metrics_cache_v1';
 const LAST_PUSHED_VERSION_KEY = 'painel_fes_last_pushed_version_v1';
 const MAX_SAFE_PAYLOAD_BYTES = 38 * 1024 * 1024; // Margem segura abaixo do limite de ~50MB do Google Apps Script
 
-/**
- * Codifica todas as planilhas em formato colunar + dicionário de strings 100% sem perdas.
- * Preserva TODAS as importações do usuário e reduz o JSON em ~80% para sincronização rápida e segura.
- */
-function encodeFilesForCloudWithPool(
-  files: FileData[],
-  maxRowsPerHugeFile?: number
-): { filesSummary: any[]; stringPool: string[] } {
-  const stringCounts = new Map<string, number>();
+const TILDE_TOKEN_REGEX = /^~{1,2}\d+$/;
 
-  const prepared = files.map((f) => {
+export function isTildeTokenString(val: unknown): boolean {
+  return typeof val === 'string' && TILDE_TOKEN_REGEX.test(val.trim());
+}
+
+/**
+ * Detecta se um FileData contém tokens corrompidos (~3396 / ~~3396) deixados por dicionário de compressão legado.
+ */
+export function isFileCorruptedWithTildeTokens(file: FileData | null | undefined): boolean {
+  if (!file || !Array.isArray(file.rows) || file.rows.length === 0) return false;
+  const rows = file.rows;
+  const total = rows.length;
+  const sampleLimit = Math.min(total, 300);
+  const step = total > sampleLimit ? Math.max(1, Math.floor(total / sampleLimit)) : 1;
+  const favCol = file.detectedFavorecidoCol || '';
+  let favHits = 0;
+  let totalHits = 0;
+
+  for (let i = 0; i < total; i += step) {
+    const r = rows[i];
+    if (!r || typeof r !== 'object') continue;
+    if (favCol && isTildeTokenString(r[favCol])) {
+      favHits++;
+      if (favHits >= 1) return true;
+    }
+    for (const k of Object.keys(r)) {
+      if (isTildeTokenString(r[k])) {
+        totalHits++;
+        if (totalHits >= 3) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Detecta se um objeto DashboardMetrics contém fornecedores corrompidos (~3396 / ~~3396).
+ */
+export function isMetricsCorruptedWithTildeTokens(metrics: DashboardMetrics | null | undefined): boolean {
+  if (!metrics || !Array.isArray(metrics.consolidatedSuppliers)) return false;
+  return metrics.consolidatedSuppliers.some(
+    (s) => isTildeTokenString(s?.name) || isTildeTokenString(s?.cnpj)
+  );
+}
+
+/**
+ * Detecta se um conjunto de arquivos ou métricas contém tokens corrompidos (~3396 / ~~3396).
+ */
+export function isDatasetCorruptedWithTildeTokens(
+  files?: FileData[] | null,
+  metrics?: DashboardMetrics | null
+): boolean {
+  if (isMetricsCorruptedWithTildeTokens(metrics)) return true;
+  if (Array.isArray(files) && files.some((f) => isFileCorruptedWithTildeTokens(f))) return true;
+  return false;
+}
+
+/**
+ * Separa arquivos limpos de arquivos que contenham tokens corrompidos (~3396 / ~~3396).
+ */
+export function filterCleanFiles(files: FileData[]): { cleanFiles: FileData[]; corruptedCount: number } {
+  const cleanFiles: FileData[] = [];
+  let corruptedCount = 0;
+  for (const f of files) {
+    if (isFileCorruptedWithTildeTokens(f)) {
+      corruptedCount++;
+    } else {
+      cleanFiles.push(f);
+    }
+  }
+  return { cleanFiles, corruptedCount };
+}
+
+const ESSENTIAL_COL_HINT_REGEX =
+  /favorec|credor|fornec|cnpj|cpf|valor|data|fonte|natureza|empenho|processo|situa|status|observ|historic|descr|motivo|liquida|\bnl\b|\bpp\b|\bob\b|ordem|banco|sigef|tipo|unidade|gest/i;
+
+/**
+ * Codifica todas as planilhas em formato colunar PURO e autossuficiente (sem dicionário de strings nem tokens ~).
+ * Preserva 100% dos textos originais em todas as sessões/versões e reduz significativamente o tamanho do JSON.
+ */
+export function encodeFilesForCloud(
+  files: FileData[],
+  options?: { maxRowsPerHugeFile?: number; keepOnlyEssentialColsOnHugeFiles?: boolean }
+): any[] {
+  const maxRowsPerHugeFile = options?.maxRowsPerHugeFile;
+  const keepOnlyEssentialColsOnHugeFiles = options?.keepOnlyEssentialColsOnHugeFiles === true;
+
+  return files.map((f) => {
     const allRows = f.rows || [];
     const isRawObLarge = f.stage === 'ordem_bancaria' && allRows.length > 5000;
     const effectiveLimit =
@@ -64,13 +143,40 @@ function encodeFilesForCloudWithPool(
         : allRows.length;
     const sourceRows = effectiveLimit < allRows.length ? allRows.slice(0, effectiveLimit) : allRows;
 
+    const detectedCols = new Set<string>(
+      [
+        f.detectedFavorecidoCol,
+        f.detectedValorCol,
+        f.detectedNumeroCol,
+        f.detectedPpCol,
+        f.detectedObCol,
+        f.detectedCnpjCol,
+        f.detectedSituacaoCol,
+        f.detectedSituacaoObCol,
+        f.detectedNotaEmpenhoCol,
+        f.detectedFavorecidoNECol,
+        f.detectedProcessoCol,
+        f.detectedFonteCol,
+        f.detectedNaturezaCol,
+        f.detectedDataCol,
+      ].filter((c): c is string => Boolean(c))
+    );
+
+    const trimUnusedCols = keepOnlyEssentialColsOnHugeFiles && sourceRows.length > 20000;
     const headerSet = new Set<string>();
     const compactHeaders: string[] = [];
-    for (const h of f.headers || []) {
-      if (h && !headerSet.has(h)) {
-        headerSet.add(h);
-        compactHeaders.push(h);
+
+    const considerHeader = (colName: string) => {
+      if (!colName || headerSet.has(colName)) return;
+      if (trimUnusedCols && !detectedCols.has(colName) && !ESSENTIAL_COL_HINT_REGEX.test(colName)) {
+        return;
       }
+      headerSet.add(colName);
+      compactHeaders.push(colName);
+    };
+
+    for (const h of f.headers || []) {
+      considerHeader(h);
     }
     for (let i = 0; i < sourceRows.length; i++) {
       const r = sourceRows[i];
@@ -78,32 +184,11 @@ function encodeFilesForCloudWithPool(
       for (const k of Object.keys(r)) {
         const v = r[k];
         if (v !== '' && v !== null && v !== undefined && v !== '-') {
-          if (!headerSet.has(k)) {
-            headerSet.add(k);
-            compactHeaders.push(k);
-          }
-          if (typeof v === 'string' && v.length >= 6) {
-            stringCounts.set(v, (stringCounts.get(v) || 0) + 1);
-          }
+          considerHeader(k);
         }
       }
     }
 
-    return { f, allRows, sourceRows, compactHeaders, isRawObLarge, effectiveLimit };
-  });
-
-  // Dicionário de strings repetidas (>= 2 ocorrências e tamanho >= 6)
-  const stringPool: string[] = [];
-  const poolIndexMap = new Map<string, string>();
-  for (const [str, count] of stringCounts.entries()) {
-    if (count >= 2) {
-      const idx = stringPool.length;
-      stringPool.push(str);
-      poolIndexMap.set(str, `~${idx}`);
-    }
-  }
-
-  const filesSummary = prepared.map(({ f, allRows, sourceRows, compactHeaders, isRawObLarge, effectiveLimit }) => {
     const rowsCompact: any[][] = new Array(sourceRows.length);
     for (let i = 0; i < sourceRows.length; i++) {
       const r = sourceRows[i] || {};
@@ -112,18 +197,7 @@ function encodeFilesForCloudWithPool(
       for (let c = 0; c < compactHeaders.length; c++) {
         const v = r[compactHeaders[c]];
         if (v !== '' && v !== null && v !== undefined && v !== '-') {
-          if (typeof v === 'string') {
-            const pooled = poolIndexMap.get(v);
-            if (pooled !== undefined) {
-              arr.push(pooled);
-            } else if (v.startsWith('~')) {
-              arr.push(`~${v}`);
-            } else {
-              arr.push(v);
-            }
-          } else {
-            arr.push(v);
-          }
+          arr.push(v);
           lastNonEmpty = c;
         } else {
           arr.push(null);
@@ -159,15 +233,14 @@ function encodeFilesForCloudWithPool(
       rows: [],
     };
   });
-
-  return { filesSummary, stringPool };
 }
 
-function decodeFileFromCloud(rawFile: any, stringPool?: string[]): FileData {
+export function decodeFileFromCloud(rawFile: any, stringPool?: string[]): FileData {
   if (!rawFile || typeof rawFile !== 'object') return rawFile;
   if (Array.isArray(rawFile.rowsCompact) && Array.isArray(rawFile.compactHeaders)) {
     const headers: string[] = rawFile.compactHeaders;
     const rowsCompact: any[][] = rawFile.rowsCompact;
+    // Só aplica decodificação legada de stringPool se houver um dicionário válido e não vazio
     const hasPool = Array.isArray(stringPool) && stringPool.length > 0;
     const restoredRows: Record<string, any>[] = new Array(rowsCompact.length);
     for (let i = 0; i < rowsCompact.length; i++) {
@@ -177,10 +250,10 @@ function decodeFileFromCloud(rawFile: any, stringPool?: string[]): FileData {
         for (let c = 0; c < arr.length && c < headers.length; c++) {
           let v = arr[c];
           if (v !== null && v !== undefined && v !== '') {
-            if (typeof v === 'string' && v.length >= 2 && v.charCodeAt(0) === 126 /* ~ */) {
+            if (hasPool && typeof v === 'string' && v.length >= 2 && v.charCodeAt(0) === 126 /* ~ */) {
               if (v.charCodeAt(1) === 126) {
                 v = v.slice(1);
-              } else if (hasPool) {
+              } else {
                 const poolIdx = Number(v.slice(1));
                 if (Number.isInteger(poolIdx) && poolIdx >= 0 && poolIdx < stringPool!.length) {
                   v = stringPool![poolIdx];
@@ -243,6 +316,7 @@ class CloudSyncService {
   private pullInFlight: Promise<boolean> | null = null;
   private pullInFlightOnlyIfNewer = false;
   private lastPullHadNetworkError = false;
+  private lastPullDetectedCorruption = false;
   private consecutivePollFailures = 0;
   private pollTickCounter = 0;
   private lastRemoteVersion: number | null = null;
@@ -455,6 +529,12 @@ class CloudSyncService {
 
   private saveMetricsCache(metrics: DashboardMetrics | null, syncDate: Date, obFileName: string) {
     if (!metrics || !metrics.isProcessed) return;
+    if (isMetricsCorruptedWithTildeTokens(metrics)) {
+      try {
+        localStorage.removeItem(METRICS_CACHE_STORAGE_KEY);
+      } catch (_) {}
+      return;
+    }
     try {
       localStorage.setItem(
         METRICS_CACHE_STORAGE_KEY,
@@ -629,6 +709,19 @@ class CloudSyncService {
         activeMetrics = base;
       }
 
+      // Bloqueio de segurança: jamais publicar na nuvem planilhas ou métricas contendo códigos corrompidos (~3396 / ~~3396)
+      if (isDatasetCorruptedWithTildeTokens(files, activeMetrics)) {
+        const msg =
+          'Foram detectados dados corrompidos no cache local (códigos ~). Clique em "Sincronizar" com o Google Drive para restaurar as planilhas originais.';
+        console.warn('[CloudSync] Envio bloqueado para proteger a nuvem contra dados corrompidos:', msg);
+        this.updateState({
+          isSyncing: false,
+          syncStatus: 'error',
+          errorMessage: msg,
+        });
+        return false;
+      }
+
       // 2. Versão compacta de consolidatedSuppliers
       const compactSuppliers: ConsolidatedSupplier[] = (activeMetrics.consolidatedSuppliers || []).map(
         (s) => ({
@@ -652,8 +745,8 @@ class CloudSyncService {
         })
       );
 
-      // 3. Codificação colunar + dicionário de strings 100% sem perdas (preserva todas as importações do usuário)
-      let { filesSummary, stringPool } = encodeFilesForCloudWithPool(files);
+      // 3. Codificação colunar PURA e autossuficiente (sem stringPool nem tokens ~)
+      const filesSummary = encodeFilesForCloud(files);
 
       // 4. Lista compacta das Ordens Bancárias agrupadas por favorecidoCnpj + fonteRecurso + mesAnoKey
       const compactOBsMap = new Map<string, OrdemBancariaItem>();
@@ -717,7 +810,6 @@ class CloudSyncService {
         version,
         obFileName: effectiveOBFileName,
         metrics: metricsPayload,
-        stringPool,
         filesSummary,
         compactOBs,
         alerts: toastAlertService.getAlertsHistory(),
@@ -726,7 +818,7 @@ class CloudSyncService {
         mlExactMappings,
         localPreferences: {
           recurring: localStorage.getItem('finance_manual_recurring_suppliers'),
-          atendimentos: localStorage.getItem('finance_fornecedores_atendimento_mensal_v1'),
+          atendimentos: JSON.stringify(getAllAtendimentos()),
           categories:
             localStorage.getItem('sigecon_categories_config') ||
             localStorage.getItem('sigecon_categories_v1'),
@@ -736,14 +828,27 @@ class CloudSyncService {
 
       let serializedPayload = JSON.stringify(drivePayload);
 
-      // Guarda de segurança caso o conjunto de dados ainda ultrapasse 38MB após compactação colunar + dicionário
+      // Guarda de segurança caso o payload puro ultrapasse 38MB:
+      // 1º remove apenas colunas auxiliares não essenciais de planilhas muito grandes (preservando 100% das linhas)
       if (serializedPayload.length > MAX_SAFE_PAYLOAD_BYTES) {
         console.warn(
-          `[CloudSync] Payload de ${(serializedPayload.length / (1024 * 1024)).toFixed(1)}MB acima do limite seguro; aplicando compactação adicional preservando todas as importações, métricas e OBs.`
+          `[CloudSync] Payload de ${(serializedPayload.length / (1024 * 1024)).toFixed(1)}MB acima do limite seguro; mantendo apenas colunas essenciais nas planilhas grandes.`
         );
-        const reduced = encodeFilesForCloudWithPool(files, 15000);
-        drivePayload.filesSummary = reduced.filesSummary;
-        drivePayload.stringPool = reduced.stringPool;
+        drivePayload.filesSummary = encodeFilesForCloud(files, {
+          keepOnlyEssentialColsOnHugeFiles: true,
+        });
+        serializedPayload = JSON.stringify(drivePayload);
+      }
+
+      // 2º se ainda assim exceder 38MB, limita linhas apenas das planilhas gigantes (mantendo métricas e OBs 100% íntegros)
+      if (serializedPayload.length > MAX_SAFE_PAYLOAD_BYTES) {
+        console.warn(
+          `[CloudSync] Payload ainda com ${(serializedPayload.length / (1024 * 1024)).toFixed(1)}MB; aplicando limite seguro de linhas mantendo métricas e OBs completos.`
+        );
+        drivePayload.filesSummary = encodeFilesForCloud(files, {
+          keepOnlyEssentialColsOnHugeFiles: true,
+          maxRowsPerHugeFile: 25000,
+        });
         serializedPayload = JSON.stringify(drivePayload);
       }
 
@@ -889,6 +994,7 @@ class CloudSyncService {
 
       this.isProcessingSync = true;
       this.lastPullHadNetworkError = false;
+      this.lastPullDetectedCorruption = false;
       if (!onlyIfNewer) {
         // Ignora cache em memória quando usuário abre o app ou solicita sincronização manual
         this.lastRemoteVersion = null;
@@ -1046,6 +1152,7 @@ class CloudSyncService {
         }
 
         // 7. Restaurar preferências locais (Recorrentes, Atendimentos no Mês, Categorias e Overrides)
+        let localAtendimentosHadNewer = false;
         if (data.localPreferences && typeof data.localPreferences === 'object') {
           try {
             const prefs = data.localPreferences;
@@ -1053,7 +1160,10 @@ class CloudSyncService {
               localStorage.setItem('finance_manual_recurring_suppliers', prefs.recurring);
             }
             if (typeof prefs.atendimentos === 'string') {
-              localStorage.setItem('finance_fornecedores_atendimento_mensal_v1', prefs.atendimentos);
+              const mergeRes = mergeAtendimentosFromCloud(prefs.atendimentos);
+              if (mergeRes.localHadNewer) {
+                localAtendimentosHadNewer = true;
+              }
             }
             if (typeof prefs.categories === 'string') {
               localStorage.setItem('sigecon_categories_config', prefs.categories);
@@ -1072,6 +1182,19 @@ class CloudSyncService {
             console.warn('Erro ao restaurar localPreferences:', e);
           }
         }
+        if (localAtendimentosHadNewer && isAdmin()) {
+          // Agenda reenvio automático para publicar na nuvem as marcações locais mais recentes/recuperadas
+          scheduleBackgroundTimeout(() => {
+            if (!this.isApplyingCloudPull && this.lastPulledData && this.lastPulledData.files.length > 0) {
+              this.pushToCloud(
+                this.lastPulledData.files,
+                this.lastPulledData.obs,
+                obFileName,
+                this.lastPulledData.metrics
+              ).catch((e) => console.warn('Reenvio automático de atendimentos mesclados:', e));
+            }
+          }, 2500);
+        }
       } finally {
         this.isApplyingCloudPull = false;
       }
@@ -1080,7 +1203,60 @@ class CloudSyncService {
       // Para qualquer outro login/dispositivo ou versão remota diferente, aplica sempre os dados atualizados da nuvem.
       const localState = await loadAppState();
       const localFiles = localState?.files || [];
-      const localTotalRows = localFiles.reduce((acc, f) => acc + (f.rows?.length || 0), 0);
+      const { cleanFiles: cleanLocalFiles } = filterCleanFiles(localFiles);
+      const localOBState = await loadOrdensBancariasAsync();
+      const localOBs = localOBState?.items || [];
+
+      // Proteção contra snapshot remoto corrompido por tokens legados (~3396 / ~~3396):
+      // Preserva OBs e preferências válidas, mas NUNCA sobrescreve planilhas/métricas locais com dados corrompidos.
+      const remoteCorrupted = isDatasetCorruptedWithTildeTokens(parsedFilesSummary, parsedMetrics);
+      if (remoteCorrupted) {
+        this.lastPullDetectedCorruption = true;
+        console.warn(
+          '[CloudSync] Snapshot remoto contém tokens corrompidos (~). Protegendo dados locais e solicitando ressincronização limpa do Google Drive.'
+        );
+
+        // Salva OBs limpas vindas da nuvem caso ainda não existam localmente
+        if (parsedCompactOBs.length > 0 && localOBs.length === 0) {
+          try {
+            saveStoredOrdensBancarias(parsedCompactOBs, obFileName);
+          } catch (_) {}
+        }
+
+        // Remove cache local corrompido de métricas
+        try {
+          const cachedRaw = localStorage.getItem(METRICS_CACHE_STORAGE_KEY);
+          if (cachedRaw) {
+            const cached = JSON.parse(cachedRaw);
+            if (isMetricsCorruptedWithTildeTokens(cached?.metrics)) {
+              localStorage.removeItem(METRICS_CACHE_STORAGE_KEY);
+            }
+          }
+        } catch (_) {}
+
+        this.lastRemoteVersion = remoteVersion || validSyncDate.getTime();
+        this.updateState({
+          isSyncing: false,
+          syncStatus: 'idle',
+          errorMessage:
+            'A nuvem ainda contém um arquivo anterior com códigos corrompidos (~). Clique em "Sincronizar" com o Google Drive para restaurar as planilhas originais.',
+        });
+
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(
+            new CustomEvent('finance_cloud_corrupted_detected', {
+              detail: {
+                hasCleanLocalFiles: cleanLocalFiles.length > 0,
+                restoredOBs: parsedCompactOBs.length > 0 ? parsedCompactOBs : null,
+                obFileName,
+              },
+            })
+          );
+        }
+        return false;
+      }
+
+      const localTotalRows = cleanLocalFiles.reduce((acc, f) => acc + (f.rows?.length || 0), 0);
       const remoteTotalRows = parsedFilesSummary.reduce((acc, f) => acc + (f.rows?.length || 0), 0);
 
       let lastPushedVersion: string | null = null;
@@ -1092,13 +1268,11 @@ class CloudSyncService {
 
       const preserveLocalFiles =
         isSameLocalPushedVersion &&
-        localFiles.length > 0 &&
+        cleanLocalFiles.length > 0 &&
         localTotalRows > remoteTotalRows;
 
-      const effectiveFiles = preserveLocalFiles ? localFiles : parsedFilesSummary;
+      const effectiveFiles = preserveLocalFiles ? cleanLocalFiles : parsedFilesSummary;
 
-      const localOBState = await loadOrdensBancariasAsync();
-      const localOBs = localOBState?.items || [];
       const preserveLocalOBs =
         isSameLocalPushedVersion &&
         localOBs.length > 0 &&
@@ -1199,11 +1373,16 @@ class CloudSyncService {
       if (!pulled && !this.lastPullHadNetworkError && isAdmin()) {
         const localState = await loadAppState();
         const localFiles = localState?.files || [];
-        if (localFiles.length > 0) {
+        const { cleanFiles, corruptedCount } = filterCleanFiles(localFiles);
+        if (cleanFiles.length > 0 && corruptedCount === 0) {
           const asyncOB = await loadOrdensBancariasAsync();
           const localOBs = asyncOB.items || getStoredOrdensBancarias().items || [];
-          console.log('Google Drive vazio; enviando estado local do Administrador...');
-          await this.pushToCloud(localFiles, localOBs, asyncOB.fileName);
+          console.log(
+            this.lastPullDetectedCorruption
+              ? 'Nuvem continha snapshot corrompido; republicando estado local limpo do Administrador...'
+              : 'Google Drive vazio; enviando estado local do Administrador...'
+          );
+          await this.pushToCloud(cleanFiles, localOBs, asyncOB.fileName);
         }
       }
     } catch (err) {

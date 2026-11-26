@@ -44,7 +44,13 @@ import {
   isValidFonteRecursoCode,
 } from './utils/ordemBancariaParser';
 import { googleDriveService, GoogleDriveState } from './utils/googleDriveService';
-import { cloudSyncService, CloudSyncState } from './utils/cloudSyncService';
+import {
+  cloudSyncService,
+  CloudSyncState,
+  filterCleanFiles,
+  isMetricsCorruptedWithTildeTokens,
+  isDatasetCorruptedWithTildeTokens,
+} from './utils/cloudSyncService';
 import { indexAppKnowledge } from './utils/appKnowledgeDirectory';
 import { paraPublicarService } from './utils/paraPublicarService';
 import { auth } from './firebase';
@@ -351,7 +357,7 @@ export function App() {
           setOrdensBancariasFileName(obStored.fileName || '');
         }
 
-        const realFiles = (stored?.files || []).filter(
+        const rawRealFiles = (stored?.files || []).filter(
           (f: any) => {
             if (!f || f.id === 'sample_file_1' || f.fileName?.includes('Relatorio_Credores_Valor_Total.xlsx')) return false;
             // Purge extraneous auxiliary tabs from "Processamento de dados": only keep 'obedece' and 'nao_obedece'
@@ -364,6 +370,24 @@ export function App() {
             return true;
           }
         );
+
+        const { cleanFiles: realFiles, corruptedCount: localCorruptedCount } = filterCleanFiles(rawRealFiles);
+        let hadCorruptedCache = localCorruptedCount > 0;
+        if (localCorruptedCount > 0) {
+          console.warn(
+            `[InitStorage] Removidos ${localCorruptedCount} arquivo(s) corrompido(s) do cache local (códigos ~).`
+          );
+          try {
+            localStorage.removeItem('painel_fes_metrics_cache_v1');
+          } catch (_) {}
+          try {
+            if (realFiles.length > 0) {
+              await saveAppState(realFiles, stored?.lastProcessedAt ? new Date(stored.lastProcessedAt) : new Date());
+            } else {
+              await clearAppState();
+            }
+          } catch (_) {}
+        }
 
         // Auto-extract OBs EXCLUSIVAMENTE de planilhas de Ordem Bancária se ordensBancariasList não tiver fontes válidas
         if ((!obStored?.items || obStored.items.length === 0 || !storedHasValidFonte) && realFiles.length > 0) {
@@ -416,9 +440,12 @@ export function App() {
                 const cachedRaw = localStorage.getItem('painel_fes_metrics_cache_v1');
                 if (cachedRaw) {
                   const cached = JSON.parse(cachedRaw);
-                  if (cached?.metrics?.isProcessed) {
+                  if (cached?.metrics?.isProcessed && !isMetricsCorruptedWithTildeTokens(cached.metrics)) {
                     setMetrics(cached.metrics);
                     restoredMetricsFromCache = true;
+                  } else if (cached?.metrics && isMetricsCorruptedWithTildeTokens(cached.metrics)) {
+                    hadCorruptedCache = true;
+                    localStorage.removeItem('painel_fes_metrics_cache_v1');
                   }
                 }
               } catch (_) {}
@@ -448,13 +475,23 @@ export function App() {
             toastAlertService.forceUpdateBaseline([], obStored.items);
             mlInferenceService.processFilesForInference([], obStored.items);
           } catch (_) {}
+          try {
+            const cachedRaw = localStorage.getItem('painel_fes_metrics_cache_v1');
+            if (cachedRaw) {
+              const cached = JSON.parse(cachedRaw);
+              if (cached?.metrics && isMetricsCorruptedWithTildeTokens(cached.metrics)) {
+                hadCorruptedCache = true;
+                localStorage.removeItem('painel_fes_metrics_cache_v1');
+              }
+            }
+          } catch (_) {}
         } else {
           let restoredFromCache = false;
           try {
             const cachedRaw = localStorage.getItem('painel_fes_metrics_cache_v1');
             if (cachedRaw) {
               const cached = JSON.parse(cachedRaw);
-              if (cached?.metrics?.isProcessed) {
+              if (cached?.metrics?.isProcessed && !isMetricsCorruptedWithTildeTokens(cached.metrics)) {
                 setMetrics(cached.metrics);
                 if (cached.lastSyncAt) {
                   setLastProcessedAt(new Date(cached.lastSyncAt));
@@ -464,6 +501,9 @@ export function App() {
                   setOrdensBancariasFileName(cached.obFileName);
                 }
                 restoredFromCache = true;
+              } else if (cached?.metrics && isMetricsCorruptedWithTildeTokens(cached.metrics)) {
+                hadCorruptedCache = true;
+                localStorage.removeItem('painel_fes_metrics_cache_v1');
               }
             }
           } catch (_) {}
@@ -472,13 +512,34 @@ export function App() {
             setMetrics(initialMetrics);
           }
         }
+
+        if (hadCorruptedCache && sessionRef.current?.role === 'admin') {
+          if (googleDriveService.isConnected() && !hasAutoHealedCorruptionRef.current) {
+            hasAutoHealedCorruptionRef.current = true;
+            scheduleBackgroundTimeout(() => {
+              handleSyncDriveNowRef.current().catch((e) =>
+                console.warn('Ressincronização automática pós-limpeza de cache:', e)
+              );
+            }, 400);
+          } else if (!hasShownCorruptionToastRef.current) {
+            hasShownCorruptionToastRef.current = true;
+            toastAlertService.addToast({
+              tipo: 'aviso',
+              titulo: 'Cache corrompido limpo automaticamente',
+              mensagem:
+                'Os registros com códigos inválidos (ex: ~~3396) foram removidos. Clique em "Sincronizar" com o Google Drive para recarregar as planilhas originais.',
+              showPopup: true,
+            });
+          }
+        }
       } catch (err) {
         console.error('Erro ao carregar do armazenamento:', err);
       } finally {
         setIsStorageLoaded(true);
         // Index app knowledge across loaded files and OBs
         try {
-          indexAppKnowledge(stored?.files || [], obStored?.items || null);
+          const { cleanFiles: cleanForIndex } = filterCleanFiles(stored?.files || []);
+          indexAppKnowledge(cleanForIndex, obStored?.items || null);
         } catch (_) {}
         // Automatic cloud sync verification: pulls updates directly from the cloud on startup
         cloudSyncService.checkAndAutoSync().catch((e) => {
@@ -508,6 +569,10 @@ export function App() {
   const queuedUploadsCountRef = useRef(0);
   const uploadQueueRef = useRef<Promise<void>>(Promise.resolve());
   const isBatchDriveSyncRef = useRef(false);
+  const isDriveSyncingRef = useRef(false);
+  const hasAutoHealedCorruptionRef = useRef(false);
+  const hasShownCorruptionToastRef = useRef(false);
+  const handleSyncDriveNowRef = useRef<() => Promise<void>>(async () => {});
 
   // Trigger alert and analysis whenever files are uploaded, changed, or processed
   const alertAnalysisTimeoutRef = useRef<(() => void) | null>(null);
@@ -605,7 +670,8 @@ export function App() {
           toastAlertService.ensureBaseline(filesRef.current, ordensBancariasListRef.current);
         }
 
-        let updated = [...filesRef.current];
+        const { cleanFiles: baseCleanFiles } = filterCleanFiles(filesRef.current);
+        let updated = [...baseCleanFiles];
 
         for (const parsedFileData of parsedFiles) {
           const parsedLower = (parsedFileData.fileName || '').toLowerCase();
@@ -716,6 +782,11 @@ export function App() {
     });
 
     cloudSyncService.registerDatasetReloadCallback((reloadedFiles, reloadedOBs, syncDate, reloadedMetrics) => {
+      if (isDatasetCorruptedWithTildeTokens(reloadedFiles, reloadedMetrics)) {
+        console.warn('[App] Bloqueada aplicação de dataset corrompido com tokens (~).');
+        return;
+      }
+
       if (reloadedFiles && reloadedFiles.length > 0) {
         filesRef.current = reloadedFiles;
         setFiles(reloadedFiles);
@@ -758,6 +829,50 @@ export function App() {
       }
     });
 
+    const handleCloudCorruptedDetected = (ev: Event) => {
+      const detail = (ev as CustomEvent)?.detail || {};
+      if (
+        Array.isArray(detail.restoredOBs) &&
+        detail.restoredOBs.length > 0 &&
+        (!ordensBancariasListRef.current || ordensBancariasListRef.current.length === 0)
+      ) {
+        ordensBancariasListRef.current = detail.restoredOBs;
+        setOrdensBancariasList(detail.restoredOBs);
+        if (detail.obFileName) {
+          ordensBancariasFileNameRef.current = detail.obFileName;
+          setOrdensBancariasFileName(detail.obFileName);
+        }
+      }
+
+      if (sessionRef.current?.role === 'admin') {
+        if (googleDriveService.isConnected() && !hasAutoHealedCorruptionRef.current && !isDriveSyncingRef.current) {
+          hasAutoHealedCorruptionRef.current = true;
+          handleSyncDriveNowRef.current().catch((e) =>
+            console.warn('Ressincronização automática para corrigir snapshot na nuvem:', e)
+          );
+        } else if (!hasShownCorruptionToastRef.current) {
+          hasShownCorruptionToastRef.current = true;
+          toastAlertService.addToast({
+            tipo: 'aviso',
+            titulo: 'Ressincronização Necessária',
+            mensagem:
+              'A cópia anterior na nuvem contém nomes corrompidos (ex: ~~3396). Clique em "Sincronizar" com o Google Drive para restaurar todas as planilhas originais e atualizar a nuvem.',
+            showPopup: true,
+          });
+        }
+      } else if (!hasShownCorruptionToastRef.current) {
+        hasShownCorruptionToastRef.current = true;
+        toastAlertService.addToast({
+          tipo: 'aviso',
+          titulo: 'Aguardando atualização do Administrador',
+          mensagem:
+            'A última cópia na nuvem precisa ser ressincronizada pelo Administrador no Google Drive para restaurar os nomes corretos dos fornecedores.',
+          showPopup: true,
+        });
+      }
+    };
+    window.addEventListener('finance_cloud_corrupted_detected', handleCloudCorruptedDetected);
+
     // Auto-sincroniza alterações administrativas de preferências/filas (Para Publicar, Atendimentos, Categorias, Recorrentes)
     let cancelPrefPushTimer: (() => void) | null = null;
     const scheduleAdminPreferencesPush = () => {
@@ -790,6 +905,7 @@ export function App() {
     return () => {
       unsubscribe();
       unsubParaPublicar();
+      window.removeEventListener('finance_cloud_corrupted_detected', handleCloudCorruptedDetected);
       prefEvents.forEach((ev) => window.removeEventListener(ev, scheduleAdminPreferencesPush));
       if (cancelPrefPushTimer) cancelPrefPushTimer();
     };
@@ -838,13 +954,24 @@ export function App() {
   };
 
   const handleSyncDriveNow = async () => {
-    if (isDriveSyncing) return;
+    if (isDriveSyncing || isDriveSyncingRef.current) return;
+    isDriveSyncingRef.current = true;
     setIsDriveSyncing(true);
     setIsProcessing(true);
     setProcessingProgress(20);
     setProcessingMessage('Sincronizando com Google Drive e Nuvem...');
     isBatchDriveSyncRef.current = true;
     try {
+      // Remove eventuais planilhas corrompidas com tokens (~) antes de baixar os arquivos originais do Drive
+      const { cleanFiles, corruptedCount } = filterCleanFiles(filesRef.current);
+      if (corruptedCount > 0) {
+        filesRef.current = cleanFiles;
+        setFiles(cleanFiles);
+        try {
+          localStorage.removeItem('painel_fes_metrics_cache_v1');
+        } catch (_) {}
+      }
+
       await withActiveProcessingLock('drive-sync-batch', async () => {
         setProcessingProgress(40);
         const result = await googleDriveService.syncNow(true);
@@ -888,6 +1015,7 @@ export function App() {
       });
     } finally {
       isBatchDriveSyncRef.current = false;
+      isDriveSyncingRef.current = false;
       setIsDriveSyncing(false);
       setProcessingProgress(100);
       scheduleBackgroundTimeout(() => {
@@ -896,6 +1024,7 @@ export function App() {
       }, 400);
     }
   };
+  handleSyncDriveNowRef.current = handleSyncDriveNow;
 
   // Change file stage tag
   const handleChangeFileStage = (fileId: string, stage: StageKey) => {
@@ -1353,6 +1482,7 @@ export function App() {
                   <FornecedoresMesView
                     metrics={metrics}
                     files={files}
+                    ordensBancariasList={ordensBancariasList}
                     onOpenCompanyAudit={(s) => setAuditedSupplier(s)}
                     onNavigateToTab={(tab) => handleTabChange(tab)}
                   />
